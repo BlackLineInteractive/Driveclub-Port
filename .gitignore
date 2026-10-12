@@ -1,0 +1,160 @@
+# ==============================================================================
+# Driveclub (PS4 PC Port / Reverse Engineering) - .gitignore
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. PS4 Game Dumps, Packages & Proprietary Assets (Copyright / DMCA)
+# ------------------------------------------------------------------------------
+# Disc & PKG dumps
+/pkg/
+*.pkg
+*.iso
+*.img
+
+# Extracted game filesystem and assets
+/extracted/
+/extracted*/
+/rom/
+/dump/
+/assets/
+
+# PS4 Executables and system binaries
+eboot.bin
+*.elf
+*.self
+*.prx
+*.sprx
+param.sfo
+*.sfo
+
+# Video, audio and container archives
+*.at9
+*.vag
+*.bik
+*.mp4
+*.pck
+*.bank
+
+# ------------------------------------------------------------------------------
+# 2. Reverse Engineering Databases & Tooling (Ghidra, IDA, Radare2)
+# ------------------------------------------------------------------------------
+/ghidra/
+/ghidra_projects/
+*.gpr
+*.rep/
+*.idb
+*.i64
+*.nam
+*.til
+*.id0
+*.id1
+*.id2
+*.nam
+*.r2
+
+# Disassembly & export logs
+*.log
+codegen-warnings.log
+
+# ------------------------------------------------------------------------------
+# 3. Emulator Dumps, Caches & Submodules
+# ------------------------------------------------------------------------------
+# Shader dumps and pipeline caches
+/shaders/
+/shader_cache/
+*.spv
+*.dxbc
+*.metal
+
+# Emulator user data, saves, and dumps
+/user/
+/savedata/
+/captures/
+/screenshots/
+
+# ------------------------------------------------------------------------------
+# 4. Build & Compiler Artifacts (C/C++ / CMake / Clang / Ninja)
+# ------------------------------------------------------------------------------
+/build/
+/build-*/
+/cmake-build-*/
+/bin/
+/out/
+/dist/
+
+# Compiled object files and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# LSP & tooling cache
+compile_commands.json
+/.cache/
+.cache/
+CMakeUserPresets.json
+
+# ------------------------------------------------------------------------------
+# 5. Scripting & Environment
+# ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+.env
+
+# ------------------------------------------------------------------------------
+# 6. OS & System Specific Files
+# ------------------------------------------------------------------------------
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Local UI configs
+imgui.ini
+*.ini
+
+# ------------------------------------------------------------------------------
+# 7. IDEs & Editors
+# ------------------------------------------------------------------------------
+.idea/
+*.iml
+
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+*.swp
+*.swo
+*~
+\#*\#
+
+# ------------------------------------------------------------------------------
+# 8. Temporary & Crash Dumps
+# ------------------------------------------------------------------------------
+/tmp/
+/temp/
+*.tmp
+*.bak
+*.dmp
+*.core
