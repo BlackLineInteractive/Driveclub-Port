@@ -59,6 +59,8 @@ codegen-warnings.log
 # ------------------------------------------------------------------------------
 # 3. Emulator Dumps, Caches & Submodules
 # ------------------------------------------------------------------------------
+/shadps4/
+
 # Shader dumps and pipeline caches
 /shaders/
 /shader_cache/
