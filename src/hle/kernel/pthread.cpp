@@ -332,7 +332,14 @@ struct Thread {
 };
 
 std::atomic<int> g_next_thread_id{1};
-thread_local Thread* t_self = nullptr;
+pthread_key_t g_self_key;
+std::once_flag g_self_key_once;
+
+void InitSelfKey() {
+    std::call_once(g_self_key_once, [] {
+        pthread_key_create(&g_self_key, nullptr);
+    });
+}
 
 struct KeySlot {
     std::atomic<bool> used{false};
@@ -341,14 +348,17 @@ struct KeySlot {
 KeySlot g_keys[kMaxKeys];
 
 Thread* Self() {
-    if (!t_self) {
+    InitSelfKey();
+    auto* t = static_cast<Thread*>(pthread_getspecific(g_self_key));
+    if (!t) {
         // A thread we did not create (the guest main thread).
-        t_self = new Thread();
-        t_self->host = pthread_self();
-        t_self->name = "main";
-        t_self->id = g_next_thread_id++;
+        t = new Thread();
+        t->host = pthread_self();
+        t->name = "main";
+        t->id = g_next_thread_id++;
+        pthread_setspecific(g_self_key, t);
     }
-    return t_self;
+    return t;
 }
 
 // POSIX key destructors, run while guest TLS is still alive.
@@ -370,8 +380,9 @@ void RunKeyDestructors(Thread* t) {
 }
 
 void* HostThreadStart(void* raw) {
+    InitSelfKey();
     auto* t = static_cast<Thread*>(raw);
-    t_self = t;
+    pthread_setspecific(g_self_key, t);
     t->host = pthread_self();
     pthread_setname_np(t->name.c_str());
     Core::Tls::Tcb* tcb = Core::Tls::SetupThread();

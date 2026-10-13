@@ -28,9 +28,12 @@ public:
     void Resize(int width_px, int height_px);
     void SetVsync(bool enabled);
 
-    // Placeholder frame: clears the drawable. The guest framebuffer blit
-    // replaces this once the renderer exists.
+    // Placeholder frame: clears the drawable.
     void PresentClear(float r, float g, float b);
+
+    // Presents the guest framebuffer by uploading to a Metal texture and
+    // rendering a fullscreen triangle onto the CAMetalLayer drawable.
+    void PresentFramebuffer(const void* pixels, int width, int height, int pitch_pixels);
 
 private:
     struct Impl;

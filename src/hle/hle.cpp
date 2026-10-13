@@ -18,6 +18,9 @@ namespace Pad { void RegisterPad(); }
 namespace Rtc { void RegisterRtc(); }
 namespace Sysmodule { void RegisterSysmodule(); }
 namespace Net { void RegisterNet(); }
+namespace Np { void RegisterNp(); }
+namespace Font { void RegisterFont(); }
+namespace AvPlayer { void RegisterAvPlayer(); }
 namespace MiscServices { void RegisterMiscServices(); }
 
 namespace {
@@ -103,6 +106,9 @@ void RegisterAll() {
     Rtc::RegisterRtc();
     Sysmodule::RegisterSysmodule();
     Net::RegisterNet();
+    Np::RegisterNp();
+    Font::RegisterFont();
+    AvPlayer::RegisterAvPlayer();
     MiscServices::RegisterMiscServices();
 }
 

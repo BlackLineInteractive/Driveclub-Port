@@ -318,6 +318,10 @@ s32 sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_ptrs[], const u32 dcb_s
                                const u32* ccb_ptrs[], const u32 ccb_sizes[]) {
     (void)ccb_ptrs;
     (void)ccb_sizes;
+    static u64 submit_count = 0;
+    if (++submit_count % 60 == 1) {
+        DC_INFO("gnm: submit #%llu (count=%u)", submit_count, count);
+    }
     std::vector<std::span<const u32>> dcbs;
     dcbs.reserve(count);
     for (u32 i = 0; i < count; ++i) {
@@ -335,6 +339,11 @@ s32 sceGnmSubmitAndFlipCommandBuffers(u32 count, const u32* dcb_ptrs[], const u3
     (void)ccb_ptrs;
     (void)ccb_sizes;
     (void)flip_mode;
+    static u64 flip_count = 0;
+    if (++flip_count % 60 == 1) {
+        DC_INFO("gnm: submit and flip #%llu (count=%u, vo=%u, buf=%u, arg=%lld)",
+                flip_count, count, vo_handle, buf_idx, flip_arg);
+    }
     VideoOut::Driver::Instance().MarkFlipPending(vo_handle, buf_idx);
 
     std::vector<std::span<const u32>> dcbs;

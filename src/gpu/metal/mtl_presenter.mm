@@ -7,25 +7,81 @@
 
 namespace Gpu::Metal {
 
+namespace {
+
+constexpr const char* kPresentShaderSrc = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct VertexOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex VertexOut vs_present(uint vid [[vertex_id]]) {
+    VertexOut out;
+    out.uv = float2((vid << 1) & 2, vid & 2);
+    out.position = float4(out.uv * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+
+fragment float4 fs_present(VertexOut in [[stage_in]],
+                           texture2d<float> tex [[texture(0)]],
+                           sampler smp [[sampler(0)]]) {
+    return tex.sample(smp, in.uv);
+}
+)";
+
+} // namespace
+
 struct Presenter::Impl {
+    id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     CAMetalLayer* layer;
+    id<MTLRenderPipelineState> pipeline;
+    id<MTLSamplerState> sampler;
+    id<MTLTexture> fb_texture;
     dispatch_semaphore_t frames_in_flight;
 };
 
 Presenter::Presenter(Device& device, void* layer, const PresenterConfig& config)
     : impl(std::make_unique<Impl>()) {
+    impl->device = (__bridge id<MTLDevice>)device.Handle();
     impl->queue = (__bridge id<MTLCommandQueue>)device.Queue();
     impl->layer = (__bridge CAMetalLayer*)layer;
     impl->frames_in_flight = dispatch_semaphore_create(kFramesInFlight);
 
     CAMetalLayer* l = impl->layer;
-    l.device = (__bridge id<MTLDevice>)device.Handle();
+    l.device = impl->device;
     l.pixelFormat = MTLPixelFormatBGRA8Unorm;
     // Only ever rendered to, never sampled: lets the driver skip extra copies.
     l.framebufferOnly = YES;
     l.maximumDrawableCount = kFramesInFlight;
     l.displaySyncEnabled = config.vsync;
+
+    // Create fullscreen present pipeline
+    NSError* err = nil;
+    NSString* src = [NSString stringWithUTF8String:kPresentShaderSrc];
+    id<MTLLibrary> lib = [impl->device newLibraryWithSource:src options:nil error:&err];
+    if (err) {
+        NSLog(@"Presenter shader compilation failed: %@", err);
+    }
+    id<MTLFunction> vs = [lib newFunctionWithName:@"vs_present"];
+    id<MTLFunction> fs = [lib newFunctionWithName:@"fs_present"];
+
+    MTLRenderPipelineDescriptor* pDesc = [MTLRenderPipelineDescriptor new];
+    pDesc.vertexFunction = vs;
+    pDesc.fragmentFunction = fs;
+    pDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    impl->pipeline = [impl->device newRenderPipelineStateWithDescriptor:pDesc error:&err];
+    if (err) {
+        NSLog(@"Presenter pipeline creation failed: %@", err);
+    }
+
+    MTLSamplerDescriptor* sDesc = [MTLSamplerDescriptor new];
+    sDesc.minFilter = MTLSamplerMinMagFilterLinear;
+    sDesc.magFilter = MTLSamplerMinMagFilterLinear;
+    impl->sampler = [impl->device newSamplerStateWithDescriptor:sDesc];
 }
 
 Presenter::~Presenter() {
@@ -63,10 +119,62 @@ void Presenter::PresentClear(float r, float g, float b) {
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(r, g, b, 1.0);
 
-        // One retained command buffer per frame is negligible; the heavy guest
-        // command buffers will use unretained references instead.
         id<MTLCommandBuffer> cmd = [impl->queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+        [enc endEncoding];
+
+        dispatch_semaphore_t sem = impl->frames_in_flight;
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+          dispatch_semaphore_signal(sem);
+        }];
+        [cmd presentDrawable:drawable];
+        [cmd commit];
+    }
+}
+
+void Presenter::PresentFramebuffer(const void* pixels, int width, int height, int pitch_pixels) {
+    if (!pixels || width <= 0 || height <= 0 || !impl->pipeline) {
+        return;
+    }
+    dispatch_semaphore_wait(impl->frames_in_flight, DISPATCH_TIME_FOREVER);
+
+    @autoreleasepool {
+        id<CAMetalDrawable> drawable = [impl->layer nextDrawable];
+        if (!drawable) {
+            dispatch_semaphore_signal(impl->frames_in_flight);
+            return;
+        }
+
+        if (!impl->fb_texture || static_cast<int>(impl->fb_texture.width) != width ||
+            static_cast<int>(impl->fb_texture.height) != height) {
+            MTLTextureDescriptor* desc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                width:static_cast<NSUInteger>(width)
+                height:static_cast<NSUInteger>(height)
+                mipmapped:NO];
+            desc.usage = MTLTextureUsageShaderRead;
+            desc.storageMode = MTLStorageModeShared;
+            impl->fb_texture = [impl->device newTextureWithDescriptor:desc];
+        }
+
+        const NSUInteger bytesPerRow =
+            static_cast<NSUInteger>(pitch_pixels > 0 ? pitch_pixels * 4 : width * 4);
+        [impl->fb_texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
+                            mipmapLevel:0
+                              withBytes:pixels
+                            bytesPerRow:bytesPerRow];
+
+        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+        id<MTLCommandBuffer> cmd = [impl->queue commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+        [enc setRenderPipelineState:impl->pipeline];
+        [enc setFragmentTexture:impl->fb_texture atIndex:0];
+        [enc setFragmentSamplerState:impl->sampler atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [enc endEncoding];
 
         dispatch_semaphore_t sem = impl->frames_in_flight;

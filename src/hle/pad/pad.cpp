@@ -12,6 +12,7 @@ namespace Hle::Pad {
 namespace {
 
 constexpr s32 kPadHandle = 1;
+constexpr s32 kErrorInvalidPortType = -2137980926; // 0x80920002
 
 s32 scePadInit() {
     DC_INFO("scePadInit()");
@@ -19,11 +20,17 @@ s32 scePadInit() {
 }
 
 s32 scePadOpen(s32 userId, s32 type, s32 index, const void* param) {
+    if (type != 0) {
+        return kErrorInvalidPortType;
+    }
     DC_INFO("scePadOpen(userId=%#x, type=%d, index=%d) -> handle %d", userId, type, index, kPadHandle);
     return kPadHandle;
 }
 
 s32 scePadOpenExt(s32 userId, s32 type, s32 index, const void* param) {
+    if (type != 0) {
+        return kErrorInvalidPortType;
+    }
     DC_INFO("scePadOpenExt(userId=%#x, type=%d, index=%d) -> handle %d", userId, type, index, kPadHandle);
     return kPadHandle;
 }
@@ -73,6 +80,14 @@ s32 scePadGetControllerInformation(s32 handle, OrbisPadControllerInformation* in
     return 0;
 }
 
+s32 scePadGetExtControllerInformation(s32 handle, void* pInfo) {
+    return scePadGetControllerInformation(handle, reinterpret_cast<OrbisPadControllerInformation*>(pInfo));
+}
+
+s32 scePadSetTiltCorrectionState(s32 handle, bool bEnable) {
+    return 0;
+}
+
 s32 scePadSetVibration(s32 handle, const void* param) {
     return 0;
 }
@@ -92,6 +107,8 @@ void RegisterPad() {
     DC_HLE(lib, scePadReadState);
     DC_HLE(lib, scePadRead);
     DC_HLE(lib, scePadGetControllerInformation);
+    DC_HLE(lib, scePadGetExtControllerInformation);
+    DC_HLE(lib, scePadSetTiltCorrectionState);
     DC_HLE(lib, scePadSetVibration);
     DC_HLE(lib, scePadResetOrientation);
 }

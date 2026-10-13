@@ -81,6 +81,12 @@ add_executable(driveclub
     src/hle/sysmodule/sysmodule.cpp
     src/hle/net/net.h
     src/hle/net/net.cpp
+    src/hle/np/np.h
+    src/hle/np/np.cpp
+    src/hle/font/font.h
+    src/hle/font/font.cpp
+    src/hle/avplayer/avplayer.h
+    src/hle/avplayer/avplayer.cpp
     src/hle/services/misc_services.h
     src/hle/services/misc_services.cpp
     src/hle/nid_db.inc

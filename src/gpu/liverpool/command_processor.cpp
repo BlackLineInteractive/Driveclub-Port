@@ -260,7 +260,13 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             const u32 mask = body[4];
             if (memory) {
                 const volatile u32* addr = Ptr<const u32>(body[1] & ~3u, body[2]);
+                u32 iters = 0;
                 while (!Compare(func, *addr & mask, ref)) {
+                    if (++iters > 1000000) {
+                        DC_WARN("gpu: WaitRegMem timeout (addr=%p val=%#x ref=%#x mask=%#x func=%u)",
+                                addr, *addr, ref, mask, func);
+                        break;
+                    }
                     sched_yield();
                 }
             }

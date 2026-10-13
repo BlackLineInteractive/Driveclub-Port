@@ -21,6 +21,7 @@
 #include "core/signals.h"
 #include "hle/hle.h"
 #include "hle/kernel/kernel.h"
+#include "hle/video_out/video_out.h"
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_presenter.h"
 
@@ -108,8 +109,13 @@ int Run(int argc, char** argv) {
             }
         }
 
-        const float t = std::chrono::duration<float>(Clock::now() - start).count();
-        presenter.PresentClear(0.5f + 0.5f * std::sin(t), 0.2f, 0.3f);
+        const auto fb = Hle::VideoOut::Driver::Instance().GetLatestFramebuffer();
+        if (fb.ptr && fb.width > 0 && fb.height > 0) {
+            presenter.PresentFramebuffer(fb.ptr, fb.width, fb.height, fb.pitch);
+        } else {
+            const float t = std::chrono::duration<float>(Clock::now() - start).count();
+            presenter.PresentClear(0.5f + 0.5f * std::sin(t), 0.2f, 0.3f);
+        }
 
         ++frames;
         const auto now = Clock::now();

@@ -105,6 +105,15 @@ s32 sceKernelIsNeoMode() {
     return 0; // base PS4
 }
 
+s32 sceKernelGetOpenPsId(void* psid) {
+    if (!psid) {
+        return FailErrno(EINVAL);
+    }
+    static constexpr u8 default_psid[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    std::memcpy(psid, default_psid, sizeof(default_psid));
+    return ORBIS_OK;
+}
+
 // libSceLibcInternal: plain C library functions, served by the host libc.
 // Format strings and va_lists are ABI-compatible (both x86-64 System V).
 void* lci_malloc(size_t size) { return std::malloc(size); }
@@ -151,6 +160,8 @@ void RegisterMisc() {
     DC_HLE(k, sceKernelDebugRaiseExceptionOnReleaseMode);
     DC_HLE(k, sceKernelStopUnloadModule);
     DC_HLE(k, sceKernelIsNeoMode);
+    DC_HLE(k, sceKernelGetOpenPsId);
+    DC_HLE("libSceOpenPsId", sceKernelGetOpenPsId);
     for (const char* lib : {"libkernel", "libScePosix"}) {
         DC_HLE_AS(lib, "signal", posix_signal);
         DC_HLE_AS(lib, "sigprocmask", posix_sigprocmask);

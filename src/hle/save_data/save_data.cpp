@@ -64,6 +64,16 @@ s32 sceSaveDataDelete(const void* del) {
     return 0;
 }
 
+s32 sceSaveDataSaveIcon(const void* mountPoint, const void* icon) {
+    DC_INFO("sceSaveDataSaveIcon()");
+    return 0;
+}
+
+s32 sceSaveDataSaveIconByPath(const void* mountPoint, const void* iconPath) {
+    DC_INFO("sceSaveDataSaveIconByPath()");
+    return 0;
+}
+
 } // namespace
 
 void RegisterSaveData() {
@@ -77,6 +87,8 @@ void RegisterSaveData() {
     DC_HLE(lib, sceSaveDataSetParam);
     DC_HLE(lib, sceSaveDataGetMountInfo);
     DC_HLE(lib, sceSaveDataDelete);
+    DC_HLE(lib, sceSaveDataSaveIcon);
+    DC_HLE(lib, sceSaveDataSaveIconByPath);
 }
 
 } // namespace Hle::SaveData
