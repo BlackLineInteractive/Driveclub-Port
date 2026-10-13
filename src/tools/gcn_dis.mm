@@ -82,6 +82,11 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::printf("MSL compiled OK (%zu bytes of source)\n", src.size());
+        id<MTLFunction> fn = [lib newFunctionWithName:@"main0"];
+        if (cs) {
+            id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:fn error:&err];
+            std::printf("compute pipeline: %s\n", pso ? "OK" : err.localizedDescription.UTF8String);
+        }
     }
     return 0;
 }

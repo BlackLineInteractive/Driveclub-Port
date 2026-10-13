@@ -37,12 +37,17 @@ static inline void dc_st(thread const DcMem& m, ulong va, uint v) {
     device uint* p = dc_ptr(m, va & ~3ul);
     if (p) *p = v;
 }
+// Byte / short stores: atomic and+or, since neighbouring lanes may write the
+// other bytes of the same dword (a plain read-modify-write also trips the
+// AMD Metal compiler).
 static inline void dc_st_part(thread const DcMem& m, ulong va, uint v, uint bytes) {
     device uint* p = dc_ptr(m, va & ~3ul);
     if (!p) return;
     uint sh = uint(va & 3ul) * 8u;
     uint mask = (bytes == 1u ? 0xffu : 0xffffu) << sh;
-    *p = (*p & ~mask) | ((v << sh) & mask);
+    device atomic_uint* a = (device atomic_uint*)p;
+    atomic_fetch_and_explicit(a, ~mask, memory_order_relaxed);
+    atomic_fetch_or_explicit(a, (v << sh) & mask, memory_order_relaxed);
 }
 static inline ulong dc_vbase(uint a, uint b) { return ulong(a) | (ulong(b & 0xfffu) << 32); }
 static inline uint dc_vstride(uint b) { return (b >> 16) & 0x3fffu; }
