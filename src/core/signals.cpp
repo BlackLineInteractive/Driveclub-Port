@@ -7,6 +7,7 @@
 #include <mutex>
 #include <vector>
 
+#include <execinfo.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
@@ -134,6 +135,10 @@ bool PatchExtrq(VAddr site) {
 void Describe(const char* what, u64 rip, u64 fault, u64 rsp) {
     const std::string where = g_describer ? g_describer(rip) : std::string();
     DC_ERROR("%s at rip %#llx (%s), fault address %#llx", what, rip, where.c_str(), fault);
+    // Host frames (our code and system libraries).
+    void* frames[32];
+    const int n = backtrace(frames, 32);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
     if (!g_describer) {
         return;
     }
