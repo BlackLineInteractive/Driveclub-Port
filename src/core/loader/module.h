@@ -34,12 +34,22 @@ public:
     VAddr Entry() const { return base + entry; }
     bool IsExecutable() const { return type == ET_SCE_EXEC || type == ET_SCE_DYNEXEC; }
 
-    // Guest addresses of the module's init code (DT_INIT) and proc/module param.
-    VAddr InitAddr() const { return init ? base + init : 0; }
+    // Guest addresses of the module's init code (DT_INIT; may sit at offset 0)
+    // and of its proc/module param.
+    bool HasInit() const { return has_init; }
+    VAddr InitAddr() const { return base + init; }
     VAddr ProcParam() const { return proc_param ? base + proc_param : 0; }
+
+    // Executable range, for the instruction patcher.
+    VAddr CodeBegin() const { return base + code_begin; }
+    VAddr CodeEnd() const { return base + code_end; }
 
     // TLS template (PT_TLS); tls_index is assigned by the linker.
     bool HasTls() const { return tls.memsz != 0; }
+    VAddr TlsImage() const { return base + tls.vaddr; }
+    u64 TlsFileSize() const { return tls.filesz; }
+    u64 TlsMemSize() const { return tls.memsz; }
+    u64 TlsAlign() const { return tls.align; }
     u32 tls_index = 0;
 
     std::span<const Elf64_Sym> Symbols() const;
@@ -65,6 +75,9 @@ private:
     u64 size = 0;
     u64 entry = 0;
     u64 init = 0;
+    bool has_init = false;
+    u64 code_begin = 0;
+    u64 code_end = 0;
     u64 proc_param = 0;
 
     struct {

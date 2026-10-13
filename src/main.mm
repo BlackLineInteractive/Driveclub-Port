@@ -15,6 +15,9 @@
 #include "common/log.h"
 #include "core/address_space.h"
 #include "core/loader/linker.h"
+#include "core/runtime.h"
+#include "core/signals.h"
+#include "hle/hle.h"
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_presenter.h"
 
@@ -31,6 +34,7 @@ int Run(int argc, char** argv) {
     const bool load_only = argc > 2 && std::strcmp(argv[2], "--load-only") == 0;
 
     Core::AddressSpace::Init();
+    Hle::RegisterAll();
 
     Core::Loader::Linker linker;
     if (!linker.LoadGame(argv[1])) {
@@ -41,6 +45,10 @@ int Run(int argc, char** argv) {
     if (load_only) {
         return 0;
     }
+
+    Core::Signals::Install(
+        [](u64 address) { return Core::Loader::Linker::Instance()->Describe(address); });
+    Core::Runtime::StartGame(linker);
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         DC_ERROR("SDL_Init: %s", SDL_GetError());

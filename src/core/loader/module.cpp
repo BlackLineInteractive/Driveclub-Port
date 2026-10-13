@@ -81,6 +81,10 @@ bool Module::MapSegments(const ElfImage& image, std::string& error) {
             }
             std::memcpy(reinterpret_cast<void*>(base + ph.p_vaddr), data.data(), data.size());
             load_segments.push_back(ph);
+            if (ph.p_flags & PF_X) {
+                code_begin = ph.p_vaddr;
+                code_end = ph.p_vaddr + ph.p_memsz;
+            }
             break;
         }
         case PT_TLS:
@@ -147,6 +151,7 @@ bool Module::ParseDynamic(const ElfImage& image, std::string& error) {
             break;
         case DT_INIT:
             init = d.d_val;
+            has_init = true;
             break;
         case DT_SCE_IMPORT_LIB:
             import_libs.push_back(DecodeRef(*this, d.d_val));

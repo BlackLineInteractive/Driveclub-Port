@@ -29,12 +29,21 @@ public:
     void PrintReport() const;
 
     const Module* Executable() const { return modules.empty() ? nullptr : modules[0].get(); }
+    const std::vector<std::unique_ptr<Module>>& Modules() const { return modules; }
+    Module* FindModule(std::string_view name) const;
+
+    // "module+0xoffset" for an address inside a loaded module, else hex.
+    std::string Describe(u64 address) const;
+
+    // The single linker instance, for signal handlers and HLE code.
+    static Linker* Instance() { return instance; }
 
 private:
     struct Unresolved {
         std::string library;
         std::string nid;
         std::string first_user; // module that imports it
+        u32 calls = 0;
     };
 
     bool LoadModule(const std::filesystem::path& path, VAddr base);
@@ -59,6 +68,8 @@ private:
         std::map<u32, u64> by_type;
         std::map<u32, u64> unknown_types;
     } stats;
+
+    static inline Linker* instance = nullptr;
 
 public:
     // Read by the trap handler; index = stub number.

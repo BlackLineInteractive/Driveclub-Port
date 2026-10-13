@@ -24,6 +24,10 @@ constexpr VAddr kUserMax = 0x600000000000;
 
 enum class Prot : int { None = 0, Read = 1, Write = 2, Exec = 4, ReadWrite = 3 };
 
+constexpr Prot operator|(Prot a, Prot b) {
+    return static_cast<Prot>(static_cast<int>(a) | static_cast<int>(b));
+}
+
 // Releases the reservations' pages and makes them inaccessible, so stray
 // guest accesses fault instead of silently hitting zero pages.
 void Init();

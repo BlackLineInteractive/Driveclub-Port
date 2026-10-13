@@ -23,6 +23,7 @@ find_package(SDL3 REQUIRED CONFIG)
 add_executable(driveclub
     src/main.mm
     src/common/log.h
+    src/common/sha1.h
     src/common/types.h
     src/core/address_space.cpp
     src/core/address_space.h
@@ -33,6 +34,12 @@ add_executable(driveclub
     src/core/loader/module.h
     src/core/loader/self.cpp
     src/core/loader/self.h
+    src/core/runtime.cpp
+    src/core/runtime.h
+    src/core/signals.cpp
+    src/core/signals.h
+    src/core/tls.cpp
+    src/core/tls.h
     src/gpu/renderer.h
     src/gpu/metal/mtl_device.h
     src/gpu/metal/mtl_device.mm
@@ -40,12 +47,14 @@ add_executable(driveclub
     src/gpu/metal/mtl_presenter.mm
     src/hle/hle.cpp
     src/hle/hle.h
+    src/hle/kernel/kernel.cpp
+    src/hle/nid_db.inc
 )
 
 target_include_directories(driveclub PRIVATE src)
 
 target_compile_options(driveclub PRIVATE
-    -Wall -Wextra
+    -Wall -Wextra -Wno-unused-parameter
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
     $<$<CONFIG:Release>:-O3 -march=native>
 )
@@ -56,6 +65,7 @@ target_compile_options(driveclub PRIVATE
 # to the guest ranges so the kernel maps them before any library can.
 target_link_options(driveclub PRIVATE
     -Wl,-no_pie,-pagezero_size,0x4000,-image_base,0x700000000000
+    -Wl,-segaddr,GUEST_TCB,0x4000
     -Wl,-segaddr,GUEST_SYSMGD,0x400000
     -Wl,-segaddr,GUEST_SYSRSV,0x7FFFFC000
     -Wl,-segaddr,GUEST_USER,0x7000000000

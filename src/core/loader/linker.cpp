@@ -7,6 +7,9 @@
 #include <sys/mman.h>
 
 #include "common/log.h"
+#include "core/address_space.h"
+#include "core/signals.h"
+#include "core/tls.h"
 #include "hle/hle.h"
 
 namespace Core::Loader {
@@ -18,8 +21,10 @@ namespace {
 constexpr VAddr kExecutableBase = 0x400000;
 constexpr VAddr kGameModuleBase = 0x80000000;
 constexpr VAddr kSystemModuleBase = 0x800000000;
-// Room after each module for future code-patch trampolines.
+// Room after each module; its start holds the code-patch trampolines, which
+// must be within rel32 reach of the module's code.
 constexpr u64 kModuleGap = 16ull << 20;
+constexpr u64 kPatchAreaSize = 1ull << 20;
 
 constexpr size_t kStubSize = 32;
 constexpr size_t kMaxStubs = 8192;
@@ -82,14 +87,26 @@ std::vector<std::filesystem::path> ListPrx(const std::filesystem::path& dir) {
 } // namespace
 
 // Target of every trap stub: the game called a function nobody implements.
-extern "C" [[noreturn]] void DcUnresolvedImport(u32 index) {
-    const auto& u = Linker::unresolved[index];
-    DC_ERROR("unimplemented import called: %s:%s (imported by %s)", u.library.c_str(),
-             u.nid.c_str(), u.first_user.c_str());
-    std::abort();
+// By default it logs (a few times per function) and returns 0, which is what
+// most unimportant system calls need; DC_STRICT=1 stops at the first one.
+extern "C" u64 DcUnresolvedImport(u32 index) {
+    static const bool strict = std::getenv("DC_STRICT") != nullptr;
+    auto& u = Linker::unresolved[index];
+    if (u.calls++ < 3 || strict) {
+        const std::string caller =
+            Linker::Instance()->Describe(reinterpret_cast<u64>(__builtin_return_address(0)));
+        DC_WARN("unimplemented: %s %.*s (%s) from %s", u.library.c_str(),
+                static_cast<int>(Hle::NameOf(u.nid).size()), Hle::NameOf(u.nid).data(),
+                u.nid.c_str(), caller.c_str());
+    }
+    if (strict) {
+        std::abort();
+    }
+    return 0;
 }
 
 Linker::Linker() {
+    instance = this;
     stub_capacity = kMaxStubs;
     void* mem = mmap(nullptr, kStubSize * kMaxStubs, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -111,6 +128,12 @@ bool Linker::LoadModule(const std::filesystem::path& path, VAddr base) {
     }
     DC_INFO("loaded %-20s at %#011llx size %#llx", m->Name().c_str(), m->Base(), m->Size());
     CollectExports(*m);
+
+    const VAddr patch_area = AlignUp(m->Base() + m->Size(), 1 << 20);
+    if (AddressSpace::Map(patch_area, kPatchAreaSize, AddressSpace::Prot::ReadWrite |
+                                                          AddressSpace::Prot::Exec)) {
+        Signals::AddPatchArea(m->CodeBegin(), m->CodeEnd(), patch_area, kPatchAreaSize);
+    }
     modules.push_back(std::move(m));
     return true;
 }
@@ -136,11 +159,14 @@ bool Linker::LoadGame(const std::filesystem::path& game_dir) {
         next = AlignUp(modules.back()->Base() + modules.back()->Size() + kModuleGap, 1 << 20);
     }
 
-    // Module TLS indices start at 1, in load order.
+    // Module TLS indices start at 1, in load order; the executable must be 1
+    // because its block is the static one in front of the TCB.
     u32 tls_index = 1;
     for (auto& m : modules) {
         if (m->HasTls()) {
             m->tls_index = tls_index++;
+            Tls::RegisterModule(m->tls_index, {m->TlsImage(), m->TlsFileSize(), m->TlsMemSize(),
+                                               m->TlsAlign()});
         }
     }
     return true;
@@ -274,6 +300,27 @@ void Linker::Relocate() {
     if (stub_code) {
         mprotect(stub_code, kStubSize * kMaxStubs, PROT_READ | PROT_EXEC);
     }
+}
+
+Module* Linker::FindModule(std::string_view name) const {
+    for (const auto& m : modules) {
+        if (m->Name() == name) {
+            return m.get();
+        }
+    }
+    return nullptr;
+}
+
+std::string Linker::Describe(u64 address) const {
+    char buf[96];
+    for (const auto& m : modules) {
+        if (address >= m->Base() && address < m->Base() + m->Size()) {
+            std::snprintf(buf, sizeof(buf), "%s+%#llx", m->Name().c_str(), address - m->Base());
+            return buf;
+        }
+    }
+    std::snprintf(buf, sizeof(buf), "%#llx", address);
+    return buf;
 }
 
 void Linker::PrintReport() const {
