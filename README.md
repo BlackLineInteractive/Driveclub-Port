@@ -1,46 +1,41 @@
 # Driveclub Native
 
-Нативний порт **Driveclub** (PS4, CUSA00003 v1.05) на macOS з рендерингом через **Metal 3**.
+A native port of **Driveclub** (PS4, CUSA00003 v1.05) to macOS with rendering via **Metal 3**.
 
-Це не емулятор загального призначення. Код PS4 — x86‑64, тому на Intel Mac він виконується
-напряму, без перекомпіляції CPU. Ми замінюємо лише те, що є специфічним для консолі:
-системні бібліотеки Sony (HLE) і GPU AMD Liverpool (GCN) — власним рендерером на Metal,
-заточеним під одну гру.
+This is not a general-purpose emulator. PS4 code is x86-64, so on Intel Macs it executes directly without CPU recompilation. We only replace what is console-specific: Sony system libraries (HLE) and the AMD Liverpool GPU (GCN) - with a custom Metal renderer tailored specifically for this single game.
 
-## Архітектура
+## Architecture
 
 ```
-eboot.bin (x86-64, виконується нативно)
-   │  імпорти 922 функцій з 57 бібліотек
+eboot.bin (x86-64, natively executed)
+   │  imports of 922 functions from 57 libraries
    ▼
-HLE бібліотек Sony ── libkernel, libc, Pad, AudioOut, VideoOut, мережа/PSN → заглушки
+Sony HLE libraries ── libkernel, libc, Pad, AudioOut, VideoOut, Network/PSN -> stubs
    │  sceGnmSubmitCommandBuffers / sceGnmDingDong
    ▼
-GPU frontend ── розбір PM4-пакетів, стан регістрів, GCN-шейдери → IR
-   │  src/gpu/renderer.h  (спільний інтерфейс)
-   ├──► Metal 3 (macOS)  — src/gpu/metal, IR → MSL напряму
-   └──► Vulkan (Windows/Linux) — можна підключити рендерер shadPS4
+GPU frontend ── PM4 packet parsing, register state, GCN shaders -> IR
+   │  src/gpu/renderer.h  (shared interface)
+   ├──► Metal 3 (macOS)  - src/gpu/metal, IR -> MSL directly
+   └──► Vulkan (Windows/Linux) - shadPS4 renderer can be integrated
 ```
 
-Gnm/Gnmx вшиті в сам eboot: гра пише PM4-пакети в буфер команд сама, а драйверу
-віддає лише готовий буфер (`sceGnmDraw*` не імпортуються). Тому GPU‑шар працює на рівні
-PM4 + GCN‑шейдерів.
+Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the command buffer itself and passes only the finished buffer to the driver (`sceGnmDraw*` are not imported). Therefore, the GPU layer operates at the PM4 + GCN shader level.
 
-### Принципи продуктивності
+### Performance Principles
 
-- IR шейдерів → MSL напряму, без SPIR‑V/SPIRV‑Cross; кеш скомпільованих конвеєрів на диску.
-- Argument buffers Tier 2 (bindless) — мінімум викликів прив'язки ресурсів на draw.
-- До 3 кадрів у польоті; CPU чекає GPU лише коли випереджає на 3 кадри.
-- На дискретних AMD пам'ять не спільна: відстеження змінених сторінок і завантаження лише змін.
-- Явний вибір дискретної GPU на MacBook з двома відеокартами (`DC_GPU=<частина назви>` для перевизначення).
+- Shader IR -> MSL directly, without SPIR-V/SPIRV-Cross; disk cache for compiled pipelines.
+- Argument buffers Tier 2 (bindless) - minimal resource binding overhead per draw.
+- Up to 3 frames in flight; CPU waits for GPU only when running 3 frames ahead.
+- On discrete AMD GPUs, memory is not unified: dirty page tracking and uploading modified ranges only.
+- Explicit discrete GPU selection on dual-GPU MacBooks (`DC_GPU=<partial_name>` override).
 
-## Вимоги
+## Requirements
 
-- Intel Mac (x86_64), GPU з підтримкою Metal 3 (перевірено: AMD Radeon Pro 5500M)
-- Xcode, CMake ≥ 3.24, Ninja, SDL3 (`brew install cmake ninja sdl3`)
-- Власна копія гри у вигляді розшифрованого дампу (fSELF/fPKG)
+- Intel Mac (x86_64), Metal 3-capable GPU (tested: AMD Radeon Pro 5500M)
+- Xcode, CMake >= 3.24, Ninja, SDL3 (`brew install cmake ninja sdl3`)
+- Your own copy of the game as a decrypted dump (fSELF/fPKG)
 
-## Збірка
+## Build
 
 ```bash
 cmake -S . -B build -G Ninja
@@ -48,26 +43,24 @@ cmake --build build
 ./build/driveclub
 ```
 
-## Файли гри
+## Game Files
 
-Файли гри **не входять** у репозиторій і ніколи не мають туди потрапити (див. `.gitignore`).
-Розпакування PKG:
+Game files **are not included** in the repository and must never be committed (see `.gitignore`).
+Unpacking PKG:
 
 ```bash
-tools/extract.sh <шлях до .pkg> extracted
+tools/extract.sh <path_to_pkg> extracted
 ```
 
-Аналіз eboot (імпорти за бібліотеками):
+eboot analysis (imports by library):
 
 ```bash
 tools/elfinfo.py extracted/Image0/eboot.bin
 tools/elfinfo.py extracted/Image0/eboot.bin --lib libSceGnmDriver
 ```
 
-## Подяки
+## Acknowledgments
 
-- [shadPS4](https://github.com/shadps4-emu/shadPS4) — емулятор PS4, головне джерело знань про
-  завантаження ELF, HLE бібліотек, PM4 і перекомпіляцію GCN‑шейдерів. Його рендерер на Vulkan
-  може слугувати бекендом для Windows/Linux. Зверніть увагу: shadPS4 поширюється під GPL‑2.0.
-- [OpenGNM](https://ps4-opengnm.github.io/opengnm/) — документація з Gnm і GCN‑шейдерів PS4.
-- Driveclub © Sony Interactive Entertainment / Evolution Studios. Цей проєкт не пов'язаний із Sony.
+- [shadPS4](https://github.com/shadps4-emu/shadPS4) - PS4 emulator, the primary source of knowledge on ELF loading, HLE libraries, PM4, and GCN shader recompilation. Its Vulkan renderer can serve as a backend for Windows/Linux. Note: shadPS4 is distributed under GPL-2.0.
+- [OpenGNM](https://ps4-opengnm.github.io/opengnm/) - documentation on PS4 Gnm and GCN shaders.
+- Driveclub © Sony Interactive Entertainment / Evolution Studios. This project is not affiliated with Sony.
