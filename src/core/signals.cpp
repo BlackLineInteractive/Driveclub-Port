@@ -131,9 +131,23 @@ bool PatchExtrq(VAddr site) {
     return true;
 }
 
-void Describe(const char* what, u64 rip, u64 fault) {
+void Describe(const char* what, u64 rip, u64 fault, u64 rsp) {
     const std::string where = g_describer ? g_describer(rip) : std::string();
     DC_ERROR("%s at rip %#llx (%s), fault address %#llx", what, rip, where.c_str(), fault);
+    if (!g_describer) {
+        return;
+    }
+    // Guest code is usually built without frame pointers, so scan the stack
+    // for values pointing into module images: likely return addresses.
+    const u64* stack = reinterpret_cast<const u64*>(rsp);
+    int shown = 0;
+    for (int i = 0; i < 512 && shown < 16; ++i) {
+        const std::string s = g_describer(stack[i]);
+        if (s.find('+') != std::string::npos) {
+            DC_ERROR("  stack[%3d] %s", i, s.c_str());
+            ++shown;
+        }
+    }
 }
 
 [[noreturn]] void Die(int sig) {
@@ -145,6 +159,7 @@ void Describe(const char* what, u64 rip, u64 fault) {
 void Handler(int sig, siginfo_t* info, void* raw) {
     auto* uc = static_cast<ucontext_t*>(raw);
     const u64 rip = uc->uc_mcontext->__ss.__rip;
+    const u64 rsp = uc->uc_mcontext->__ss.__rsp;
 
     if (sig == SIGILL) {
         std::scoped_lock lk(g_patch_lock);
@@ -153,14 +168,14 @@ void Handler(int sig, siginfo_t* info, void* raw) {
         if (code[0] == 0xE9 || PatchExtrq(rip)) {
             return; // re-executes the now-patched site
         }
-        Describe("illegal instruction", rip, rip);
+        Describe("illegal instruction", rip, rip, rsp);
         DC_ERROR("  bytes: %02x %02x %02x %02x %02x %02x %02x %02x", code[0], code[1], code[2],
                  code[3], code[4], code[5], code[6], code[7]);
         Die(sig);
     }
 
     Describe(sig == SIGSEGV ? "segmentation fault" : "bus error", rip,
-             reinterpret_cast<u64>(info->si_addr));
+             reinterpret_cast<u64>(info->si_addr), rsp);
     Die(sig);
 }
 
