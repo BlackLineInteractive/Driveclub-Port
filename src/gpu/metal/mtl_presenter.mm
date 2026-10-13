@@ -33,6 +33,10 @@ Presenter::~Presenter() {
     for (int i = 0; i < kFramesInFlight; ++i) {
         dispatch_semaphore_wait(impl->frames_in_flight, DISPATCH_TIME_FOREVER);
     }
+    // libdispatch traps if a semaphore dies below its initial value.
+    for (int i = 0; i < kFramesInFlight; ++i) {
+        dispatch_semaphore_signal(impl->frames_in_flight);
+    }
 }
 
 void Presenter::Resize(int width_px, int height_px) {
