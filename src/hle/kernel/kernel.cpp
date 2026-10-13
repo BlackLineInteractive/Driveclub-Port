@@ -62,6 +62,11 @@ s32 _sceKernelRtldSetApplicationHeapAPI(void* api) {
 
 void RegisterKernel() {
     Kernel::RegisterPthread();
+    Kernel::RegisterMemory();
+    Kernel::RegisterTime();
+    Kernel::RegisterMisc();
+    Kernel::RegisterFile();
+    Kernel::RegisterSync();
     DC_HLE("libkernel", _sceKernelRtldSetApplicationHeapAPI);
     DC_HLE("libkernel", __tls_get_addr);
     DC_HLE("libkernel", sceKernelGetProcParam);

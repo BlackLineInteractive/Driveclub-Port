@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
@@ -15,9 +16,11 @@
 #include "common/log.h"
 #include "core/address_space.h"
 #include "core/loader/linker.h"
+#include "core/memory.h"
 #include "core/runtime.h"
 #include "core/signals.h"
 #include "hle/hle.h"
+#include "hle/kernel/kernel.h"
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_presenter.h"
 
@@ -34,7 +37,12 @@ int Run(int argc, char** argv) {
     const bool load_only = argc > 2 && std::strcmp(argv[2], "--load-only") == 0;
 
     Core::AddressSpace::Init();
+    Core::Memory::Init();
     Hle::RegisterAll();
+
+    const char* home = std::getenv("HOME");
+    Hle::Kernel::SetFileRoots(argv[1], std::filesystem::path(home ? home : "/tmp") /
+                                           "Library/Application Support/DriveclubNative");
 
     Core::Loader::Linker linker;
     if (!linker.LoadGame(argv[1])) {

@@ -34,6 +34,8 @@ add_executable(driveclub
     src/core/loader/module.h
     src/core/loader/self.cpp
     src/core/loader/self.h
+    src/core/memory.cpp
+    src/core/memory.h
     src/core/runtime.cpp
     src/core/runtime.h
     src/core/signals.cpp
@@ -49,7 +51,13 @@ add_executable(driveclub
     src/hle/hle.h
     src/hle/kernel/kernel.cpp
     src/hle/kernel/kernel.h
+    src/hle/kernel/equeue.h
+    src/hle/kernel/file.cpp
+    src/hle/kernel/memory.cpp
+    src/hle/kernel/misc.cpp
     src/hle/kernel/pthread.cpp
+    src/hle/kernel/sync.cpp
+    src/hle/kernel/time.cpp
     src/hle/nid_db.inc
 )
 

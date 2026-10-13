@@ -2,6 +2,8 @@
 
 // Shared helpers for the libkernel HLE.
 
+#include <filesystem>
+
 #include "common/types.h"
 
 namespace Hle::Kernel {
@@ -32,5 +34,8 @@ void RegisterTime();
 void RegisterMisc();
 void RegisterFile();
 void RegisterSync();
+
+// Where /app0 and the writable PS4 mount points live on the host.
+void SetFileRoots(const std::filesystem::path& game_root, const std::filesystem::path& user_root);
 
 } // namespace Hle::Kernel
