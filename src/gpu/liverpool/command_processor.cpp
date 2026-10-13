@@ -194,12 +194,15 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
             job.after();
         }
         if (flip_label.addr || flip_label.interrupt) {
-            if (flip_label.addr) {
-                *Ptr<u32>(static_cast<u32>(flip_label.addr), static_cast<u32>(flip_label.addr >> 32)) = flip_label.value;
-            }
-            if (flip_label.interrupt) {
-                Interrupt(kIrqGfxEop);
-            }
+            const FlipLabel label = flip_label;
+            AfterGpu([label, this] {
+                if (label.addr) {
+                    *Ptr<u32>(static_cast<u32>(label.addr), static_cast<u32>(label.addr >> 32)) = label.value;
+                }
+                if (label.interrupt) {
+                    Interrupt(kIrqGfxEop);
+                }
+            });
             flip_label = {};
         }
         {
@@ -219,6 +222,14 @@ void CommandProcessor::SetRegs(u32 index, const u32* values, u32 count) {
         return;
     }
     std::memcpy(CurRegs().Data() + index, values, count * 4);
+}
+
+void CommandProcessor::AfterGpu(std::function<void()> fn) {
+    if (renderer) {
+        renderer->Signal(std::move(fn));
+    } else {
+        fn();
+    }
 }
 
 void CommandProcessor::SyncRenderer() {
@@ -415,31 +426,37 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
         }
 
         case Op::EventWriteEop: {
-            SyncRenderer();
             const u32 data_control = body[2];
-            WriteFence((data_control >> 29) & 7, body[1], data_control & 0xFFFF, body[3],
-                       body[4]);
             const u32 int_sel = (data_control >> 24) & 3;
-            if (int_sel == kIntOnly || int_sel == kIntWriteConfirm) {
-                Interrupt(kIrqGfxEop);
-            }
+            const bool irq = int_sel == kIntOnly || int_sel == kIntWriteConfirm;
+            const u32 lo = body[1], d0 = body[3], d1 = body[4];
+            AfterGpu([=, this] {
+                WriteFence((data_control >> 29) & 7, lo, data_control & 0xFFFF, d0, d1);
+                if (irq) {
+                    Interrupt(kIrqGfxEop);
+                }
+            });
             break;
         }
         case Op::ReleaseMem: {
-            SyncRenderer();
             const u32 dw2 = body[1];
-            WriteFence((dw2 >> 29) & 7, body[2], body[3], body[4], body[5]);
             const u32 int_sel = (dw2 >> 24) & 7;
-            if (int_sel == kIntWriteConfirm || int_sel == kIntUndocumented) {
-                Interrupt(compute ? 0 : kIrqGfxEop);
-            }
+            const bool irq = int_sel == kIntWriteConfirm || int_sel == kIntUndocumented;
+            const u32 sel = (dw2 >> 29) & 7, lo = body[2], hi = body[3], d0 = body[4], d1 = body[5];
+            AfterGpu([=, this] {
+                WriteFence(sel, lo, hi, d0, d1);
+                if (irq) {
+                    Interrupt(compute ? 0 : kIrqGfxEop);
+                }
+            });
             break;
         }
         case Op::EventWriteEos: {
-            SyncRenderer();
             const u32 cmd = (body[2] >> 29) & 7;
             if (cmd == 2) { // signal fence
-                *Ptr<u32>(body[1], body[2] & 0xFFFF) = body[3];
+                u32* dst = Ptr<u32>(body[1], body[2] & 0xFFFF);
+                const u32 value = body[3];
+                AfterGpu([dst, value] { *dst = value; });
             }
             break;
         }

@@ -368,6 +368,17 @@ struct MetalRenderer::Impl {
         }
     }
 
+    // Command buffers on one queue complete in order, and their completion
+    // handlers run in order on Metal's serial completion queue.
+    void Signal(std::function<void()> done) {
+        EndPass();
+        EnsureCommandBuffer();
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+          done();
+        }];
+        Commit(false);
+    }
+
     // Command buffers on one queue complete in order: the last one is enough.
     void WaitLast() {
         if (last_committed) {
@@ -1494,6 +1505,13 @@ void MetalRenderer::WaitIdle() {
     std::scoped_lock lk(impl->lock);
     @autoreleasepool {
         impl->Commit(true);
+    }
+}
+
+void MetalRenderer::Signal(std::function<void()> done) {
+    std::scoped_lock lk(impl->lock);
+    @autoreleasepool {
+        impl->Signal(std::move(done));
     }
 }
 

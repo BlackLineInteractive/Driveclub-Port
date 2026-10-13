@@ -109,6 +109,8 @@ private:
     static thread_local Liverpool::RegFile* t_regs;
     const u32* IndirectArgs(u32 offset, u32 dwords);
     void SyncRenderer();
+    // Runs `fn` once the renderer has executed everything recorded so far.
+    void AfterGpu(std::function<void()> fn);
     void ClearState();
     // Runs the CE until `done()` holds, it blocks on the DE, or its CCB ends.
     void RunConstantEngine(const std::function<bool()>& done);

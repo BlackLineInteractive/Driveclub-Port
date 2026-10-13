@@ -10,6 +10,7 @@
 // the same interface later.
 
 #include <cstdint>
+#include <functional>
 
 namespace Gpu {
 
@@ -52,10 +53,14 @@ public:
     // End of one guest submission: hand recorded work to the host GPU.
     virtual void OnSubmit() = 0;
 
-    // Blocks until all recorded work has executed. Called before the guest
-    // can observe GPU progress (fences, labels), since it may then reuse the
-    // memory that work reads.
+    // Blocks until all recorded work has executed (the CP then touches
+    // memory that work uses).
     virtual void WaitIdle() = 0;
+
+    // Runs `done` on another thread once all work recorded so far has
+    // executed; calls complete in order. Fences, labels and their interrupts
+    // go through this, so the guest sees GPU progress without the CP waiting.
+    virtual void Signal(std::function<void()> done) = 0;
 
     // Called on the GPU thread once the frame's command buffers are done.
     virtual void Flip(const FlipInfo& flip) = 0;

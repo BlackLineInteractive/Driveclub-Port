@@ -21,6 +21,7 @@ public:
                   std::uint32_t z) override;
     void OnSubmit() override;
     void WaitIdle() override;
+    void Signal(std::function<void()> done) override;
     void Flip(const FlipInfo& flip) override;
     std::uint8_t* Gds() override;
 
