@@ -59,6 +59,10 @@ public:
 
     // Called on the GPU thread once the frame's command buffers are done.
     virtual void Flip(const FlipInfo& flip) = 0;
+
+    // The 64 KB global data share, shared by shaders and CP DMA (call WaitIdle
+    // before reading what shaders wrote).
+    virtual std::uint8_t* Gds() = 0;
 };
 
 } // namespace Gpu

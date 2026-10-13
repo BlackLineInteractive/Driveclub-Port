@@ -25,6 +25,7 @@ constexpr u32 Mem0 = 1;     // device uint*: direct memory [0, split)
 constexpr u32 Mem1 = 2;     // device uint*: direct memory [split, end)
 constexpr u32 MemMap = 3;   // constant DcMap
 constexpr u32 Draw = 4;     // constant DcDraw (vertex stage)
+constexpr u32 Gds = 5;      // device uint[16K]: global data share (compute stage)
 } // namespace Binding
 
 // Host-side mirrors of the MSL structs in the prelude.

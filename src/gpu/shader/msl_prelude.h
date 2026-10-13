@@ -107,6 +107,41 @@ static inline uint4 dc_load_fmt(thread const DcMem& m, ulong a, uint dfmt, uint 
     }
     return dc_fmt_convert(r, bits, nfmt, n);
 }
+// Typed buffer store: packs v (float bits or integers) into dfmt/nfmt.
+static inline uint dc_pack(uint v, uint bits, uint nfmt) {
+    uint maxu = bits >= 32u ? 0xffffffffu : ((1u << bits) - 1u);
+    float f = as_type<float>(v);
+    switch (nfmt) {
+    case 0u: return uint(rint(saturate(f) * float(maxu)));
+    case 1u: return uint(int(rint(clamp(f, -1.0f, 1.0f) * float(maxu >> 1)))) & maxu;
+    case 2u: return uint(clamp(f, 0.0f, float(maxu))) & maxu;
+    case 3u: return uint(int(f)) & maxu;
+    case 4u: return v & maxu;
+    case 5u: return v & maxu;
+    default: return bits == 32u ? v : bits == 16u ? uint(as_type<ushort>(half(f))) : 0u;
+    }
+}
+static inline void dc_store_fmt(thread const DcMem& m, ulong a, uint4 v, uint dfmt, uint nfmt) {
+    switch (dfmt) {
+    case 1u: dc_st_part(m, a, dc_pack(v.x, 8u, nfmt), 1u); break;
+    case 2u: dc_st_part(m, a, dc_pack(v.x, 16u, nfmt), 2u); break;
+    case 3u: dc_st_part(m, a, dc_pack(v.x, 8u, nfmt) | (dc_pack(v.y, 8u, nfmt) << 8), 2u); break;
+    case 4u: dc_st(m, a, v.x); break;
+    case 5u: dc_st(m, a, dc_pack(v.x, 16u, nfmt) | (dc_pack(v.y, 16u, nfmt) << 16)); break;
+    case 10u:
+        dc_st(m, a, dc_pack(v.x, 8u, nfmt) | (dc_pack(v.y, 8u, nfmt) << 8) | (dc_pack(v.z, 8u, nfmt) << 16) |
+                        (dc_pack(v.w, 8u, nfmt) << 24));
+        break;
+    case 11u: dc_st(m, a, v.x); dc_st(m, a + 4ul, v.y); break;
+    case 12u:
+        dc_st(m, a, dc_pack(v.x, 16u, nfmt) | (dc_pack(v.y, 16u, nfmt) << 16));
+        dc_st(m, a + 4ul, dc_pack(v.z, 16u, nfmt) | (dc_pack(v.w, 16u, nfmt) << 16));
+        break;
+    case 13u: dc_st(m, a, v.x); dc_st(m, a + 4ul, v.y); dc_st(m, a + 8ul, v.z); break;
+    case 14u: dc_st(m, a, v.x); dc_st(m, a + 4ul, v.y); dc_st(m, a + 8ul, v.z); dc_st(m, a + 12ul, v.w); break;
+    default: break;
+    }
+}
 static inline uint dc_sel(uint4 v, uint sel, bool is_int) {
     switch (sel & 7u) {
     case 1u: return is_int ? 1u : 0x3f800000u;

@@ -152,6 +152,7 @@ struct MetalRenderer::Impl {
     std::unordered_map<u32, id<MTLTexture>> dummy_textures;
     id<MTLSamplerState> default_sampler = nil;
     id<MTLBuffer> quad_indices = nil;
+    id<MTLBuffer> gds = nil; // 64 KB global data share
 
     // ---- presentation ----
     id<MTLRenderPipelineState> copy_pipeline = nil;
@@ -218,6 +219,9 @@ struct MetalRenderer::Impl {
         quad_indices = [device newBufferWithBytes:quads.data()
                                            length:quads.size() * 4
                                           options:MTLResourceStorageModeShared];
+
+        gds = [device newBufferWithLength:0x10000 options:MTLResourceStorageModeShared];
+        std::memset(gds.contents, 0, 0x10000);
 
         MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
         sd.minFilter = MTLSamplerMinMagFilterLinear;
@@ -1232,6 +1236,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
     [e setBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
     [e setBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
     [e setBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
+    [e setBuffer:gds offset:0 atIndex:Shader::Binding::Gds];
     for (u32 k = 0; k < res.size(); ++k) {
         [e setTexture:res[k].tex atIndex:k];
         if (res[k].smp) {
@@ -1367,6 +1372,10 @@ void MetalRenderer::Flip(const FlipInfo& flip) {
     @autoreleasepool {
         impl->Flip(flip);
     }
+}
+
+std::uint8_t* MetalRenderer::Gds() {
+    return static_cast<std::uint8_t*>(impl->gds.contents);
 }
 
 void* MetalRenderer::LatestFrame() const {

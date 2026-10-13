@@ -581,11 +581,16 @@ void Emitter::EmitVop(const Inst& i) {
     // Lane counting needs the real wave; per-lane execution sees itself as lane 0.
     // Counting active lanes below this one. Masks are per-lane here, so
     // assume a full mask (the common "lane id" idiom); compute knows its lane.
+    // Active lanes below this one. Each lane holds its own bit of the mask,
+    // so a SIMD-group prefix sum counts them (the SIMD group stands in for
+    // the wave); the low half already counts every lane, the high half adds 0.
     case Vop::V_MBCNT_LO_U32_B32:
-        SetV(i.dst, p.stage == Stage::Compute ? "min(dc_lane, 32u) + " + u(1) : u(1));
+        SetV(i.dst, p.stage == Stage::Compute
+                        ? "simd_prefix_exclusive_sum(" + Mask(i.src[0]) + " ? 1u : 0u) + " + u(1)
+                        : u(1));
         break;
     case Vop::V_MBCNT_HI_U32_B32:
-        SetV(i.dst, p.stage == Stage::Compute ? "(max(dc_lane, 32u) - 32u) + " + u(1) : u(1));
+        SetV(i.dst, u(1));
         break;
     case Vop::V_ADD_I32: carry_add(u(0), u(1), ""); break;
     case Vop::V_SUB_I32: borrow_sub(u(0), u(1), ""); break;
@@ -872,6 +877,23 @@ void Emitter::EmitDs(const Inst& i) {
     case Ds::DS_READ_I16:
         SetV(i.dst, "uint(int(((threadgroup short*)lds)[(" + a + " + " + N(off16) + "u) >> 1]))");
         break;
+    case Ds::DS_APPEND:
+    case Ds::DS_CONSUME: {
+        // One atomic per wave (SIMD group): returns the wave's base slot;
+        // lanes add their mbcnt to it.
+        const bool append = static_cast<Ds>(i.op) == Ds::DS_APPEND;
+        const std::string idx = "(((m0r & 0xffffu) + " + N(off16) + "u) >> 2)";
+        const std::string target = i.gds ? "(device atomic_uint*)&gds[" + idx + "]"
+                                         : "(threadgroup atomic_uint*)&lds[" + idx + "]";
+        Line(std::string("{ uint act_ = ") + (p.writes_exec ? "exec_lo != 0u ? 1u : 0u" : "1u") +
+             "; uint cnt_ = simd_sum(act_); uint base_ = 0u;");
+        Line("  if (simd_is_first()) base_ = atomic_fetch_" + std::string(append ? "add" : "sub") + "_explicit(" +
+             target + ", cnt_, memory_order_relaxed);");
+        Line("  base_ = simd_broadcast_first(base_);");
+        SetV(i.dst, append ? "base_" : "base_ - cnt_");
+        Line("}");
+        break;
+    }
     case Ds::DS_ADD_U32: atomic("atomic_fetch_add_explicit", false, false); break;
     case Ds::DS_ADD_RTN_U32: atomic("atomic_fetch_add_explicit", true, false); break;
     case Ds::DS_SUB_U32: atomic("atomic_fetch_sub_explicit", false, false); break;
@@ -958,6 +980,19 @@ void Emitter::EmitBuffer(const Inst& i) {
         for (u32 k = 0; k < n; ++k) {
             SetV(i.vdata + k, "oob_ ? 0u : dc_ld(mem, a_ + " + N(4 * k) + "ul)");
         }
+        break;
+    }
+    case Mubuf::BUFFER_STORE_FORMAT_X:
+    case Mubuf::BUFFER_STORE_FORMAT_XY:
+    case Mubuf::BUFFER_STORE_FORMAT_XYZ:
+    case Mubuf::BUFFER_STORE_FORMAT_XYZW: {
+        const u32 n = i.op - static_cast<u32>(Mubuf::BUFFER_STORE_FORMAT_X) + 1;
+        std::string v = "uint4(";
+        for (u32 k = 0; k < 4; ++k) {
+            v += (k ? ", " : "") + (k < n ? VName(i.vdata + k) : std::string("0u"));
+        }
+        Line("  " + store_guard() + "dc_store_fmt(mem, a_, " + v + "), (" + r3 + " >> 15) & 15u, (" + r3 +
+             " >> 12) & 7u);");
         break;
     }
     case Mubuf::BUFFER_STORE_BYTE: Line("  " + store_guard() + "dc_st_part(mem, a_, " + VName(i.vdata) + ", 1u);"); break;
@@ -1409,9 +1444,10 @@ std::string Emitter::Run() {
     } else {
         src += "kernel void main0(uint3 dc_tid [[thread_position_in_threadgroup]], "
                "uint3 dc_gid [[threadgroup_position_in_grid]], uint dc_lidx [[thread_index_in_threadgroup]], " +
-               mem_params + ", threadgroup uint* lds [[threadgroup(0)]]" + TexParams(true) + ") {\n";
+               mem_params + ", device uint* gds [[buffer(5)]], threadgroup uint* lds [[threadgroup(0)]]" + TexParams(true) +
+               ") {\n";
         src += "    DcMem mem = {gm0, gm1, &gmap};\n    uint dc_lane = dc_lidx & 63u;\n";
-        src += "    (void)mem; (void)dc_lane; (void)lds;\n";
+        src += "    (void)mem; (void)dc_lane; (void)lds; (void)gds;\n";
         src += decl + wrapped + "}\n";
     }
     return src;

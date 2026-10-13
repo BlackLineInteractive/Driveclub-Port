@@ -452,6 +452,35 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             break;
         }
 
+        case Op::DmaData: {
+            // CP DMA: copies/fills between memory, GDS and immediate data.
+            const u32 ctl = body[0];
+            const u32 cmd = body[5];
+            const u32 bytes = cmd & 0x1FFFFF;
+            const u32 src_sel = (ctl >> 29) & 3; // 0/3 memory, 1 GDS, 2 data
+            const u32 dst_sel = (ctl >> 20) & 3; // 0/3 memory, 1 GDS
+            if ((cmd >> 27) & 1) {
+                break; // destination is register space: cache prefetch hints
+            }
+            u8* gds = renderer ? renderer->Gds() : nullptr;
+            u8* dst = dst_sel == 1 ? (gds ? gds + (body[3] & 0xFFFF) : nullptr) : Ptr<u8>(body[3], body[4]);
+            if (!dst || bytes == 0) {
+                break;
+            }
+            SyncRenderer(); // the GPU may still be producing what we copy
+            if (src_sel == 2) {
+                for (u32 k = 0; k + 4 <= bytes; k += 4) {
+                    std::memcpy(dst + k, &body[1], 4);
+                }
+            } else {
+                const u8* src = src_sel == 1 ? (gds ? gds + (body[1] & 0xFFFF) : nullptr) : Ptr<const u8>(body[1], body[2]);
+                if (src) {
+                    std::memmove(dst, src, bytes);
+                }
+            }
+            break;
+        }
+
         case Op::WaitRegMem: {
             const u32 func = body[0] & 7;
             const bool memory = (body[0] >> 4) & 1;

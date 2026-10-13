@@ -22,6 +22,7 @@ public:
     void OnSubmit() override;
     void WaitIdle() override;
     void Flip(const FlipInfo& flip) override;
+    std::uint8_t* Gds() override;
 
     // Main thread: the last flipped frame as id<MTLTexture> (void*), or null.
     // It stays valid until two more flips have happened.
