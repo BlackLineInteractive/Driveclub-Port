@@ -203,6 +203,7 @@ struct MetalRenderer::Impl {
     const char* dump_frames = nullptr; // DC_DUMP_FRAMES=dir: flips as PPMs
     u64 dump_every = 1;                // DC_DUMP_EVERY=n: only every n-th flip
     bool debug_clear = false;          // DC_DEBUG_CLEAR: new targets start dark blue
+    u64 dump_texture = 0;              // DC_DUMP_TEXTURE=<addr>: write its uploads next to the frame dumps
     u64 debug_vsout = 0;               // DC_DEBUG_VSOUT=<vs address>: dump its first positions
     id<MTLBuffer> debug_vs_buf = nil;
     id<MTLFunction> debug_fs = nil;    // DC_DEBUG_FLAT: every pixel shader outputs magenta
@@ -216,6 +217,7 @@ struct MetalRenderer::Impl {
     std::mutex profile_lock;
     std::unordered_map<std::string, ProfileEntry> profile_data;
     std::atomic<u64> gpu_ns{0};
+    u64 stat_hashed = 0;
     u64 stat_commits = 0, stat_waits = 0, stat_dispatches = 0, stat_draws = 0;
     double stat_wait_s = 0;
     std::chrono::steady_clock::time_point stat_t0 = std::chrono::steady_clock::now();
@@ -241,6 +243,9 @@ struct MetalRenderer::Impl {
             debug_vsout = std::strtoull(v, nullptr, 16);
         }
         trace = std::getenv("DC_GPU_TRACE") != nullptr;
+        if (const char* e = std::getenv("DC_DUMP_TEXTURE")) {
+            dump_texture = std::strtoull(e, nullptr, 16);
+        }
         sync_shaders = std::getenv("DC_SYNC_SHADERS") != nullptr;
         stats = std::getenv("DC_GPU_STATS") != nullptr;
         profile = std::getenv("DC_GPU_PROFILE") != nullptr;
@@ -671,15 +676,26 @@ struct MetalRenderer::Impl {
     }
 
     // Cheap change detection: a few dwords spread over the texture.
-    static u64 SparseChecksum(u64 addr, u64 size) {
-        u64 h = 0xcbf29ce484222325ull;
-        const u64 step = std::max<u64>(4, (size / 64) & ~3ull);
-        for (u64 off = 0; off + 4 <= size; off += step) {
-            u32 v;
-            std::memcpy(&v, reinterpret_cast<const void*>(addr + off), 4);
-            h = (h ^ v) * 0x100000001b3ull;
+    // Hash of the whole texture: games patch textures in place (glyph caches
+    // add a few glyphs to a big atlas), so sampling a few words misses edits.
+    // Four independent lanes keep it near memory speed.
+    u64 Checksum(u64 addr, u64 size) {
+        stat_hashed += size;
+        const auto* p = reinterpret_cast<const u8*>(addr);
+        u64 h[4] = {0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull};
+        u64 off = 0;
+        for (; off + 32 <= size; off += 32) {
+            for (u32 k = 0; k < 4; ++k) {
+                u64 v;
+                std::memcpy(&v, p + off + k * 8, 8);
+                h[k] = (h[k] ^ v) * 0x100000001b3ull;
+                h[k] ^= h[k] >> 29;
+            }
         }
-        return h;
+        for (; off < size; ++off) {
+            h[0] = (h[0] ^ p[off]) * 0x100000001b3ull;
+        }
+        return h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7);
     }
 
     // Decodes a T# and returns a Metal texture for it.
@@ -756,7 +772,7 @@ struct MetalRenderer::Impl {
         if (e.tex && e.frame == frame_count) {
             return e.tex;
         }
-        const u64 sum = SparseChecksum(addr, size);
+        const u64 sum = Checksum(addr, size);
         if (e.tex && sum == e.checksum) {
             e.frame = frame_count;
             return e.tex;
@@ -790,6 +806,12 @@ struct MetalRenderer::Impl {
         for (u32 l = 0; l < layers; ++l) {
             Tiling::DetileSlice(tiling, src + slice * l, linear.data(), width_el, height_el, pitch_el,
                                 fi.bytes_per_block);
+            if (dump_texture == addr && dump_frames && l == 0) { // DC_DUMP_TEXTURE=<addr>: raw linear bytes
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s/tex_%llx_%ux%u_bpe%u_f%llu.raw", dump_frames, addr, width_el,
+                              height_el, fi.bytes_per_block, frame_count);
+                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(linear.data()), image);
+            }
             const MTLRegion region = tt.dim == TexDim::Tex3D ? MTLRegionMake3D(0, 0, l, width, height, 1)
                                                              : MTLRegionMake2D(0, 0, width, height);
             [e.tex replaceRegion:region
@@ -937,6 +959,12 @@ struct MetalRenderer::Impl {
             }
             TextureType tt;
             id<MTLTexture> tex = GetTexture(t, &tt, img.storage);
+            if (trace) {
+                DC_INFO("gpu:   tex%zu addr=%#llx dfmt=%u nfmt=%u %ux%u tile=%u type=%u swz=%#x%s", out.size(),
+                        (u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8, (t[1] >> 20) & 0x3F, (t[1] >> 26) & 0xF,
+                        (t[2] & 0x3FFF) + 1, ((t[2] >> 14) & 0x3FFF) + 1, (t[3] >> 20) & 0x1F, t[3] >> 28,
+                        t[3] & 0xFFF, img.storage ? " storage" : "");
+            }
             types.push_back(tt);
             out.push_back({tex, img.has_sampler ? GetSampler(s) : nil});
         }
@@ -1548,9 +1576,11 @@ void MetalRenderer::Impl::Flip(const FlipInfo& f) {
         static u64 frames = 0;
         ++frames;
         if (dt >= 1.0) {
-            DC_INFO("gpu stats: %.1f fps, gpu busy %.0f%%, wait %.0f%%, per frame: %.0f draws %.0f dispatches %.1f commits %.1f waits",
+            DC_INFO("gpu stats: %.1f fps, gpu busy %.0f%%, wait %.0f%%, per frame: %.0f draws %.0f dispatches %.1f commits %.1f waits %.1f MB hashed",
                     frames / dt, gpu_ns.exchange(0) / 1e9 / dt * 100, stat_wait_s / dt * 100, stat_draws / double(frames),
-                    stat_dispatches / double(frames), stat_commits / double(frames), stat_waits / double(frames));
+                    stat_dispatches / double(frames), stat_commits / double(frames), stat_waits / double(frames),
+                    stat_hashed / double(frames) / (1 << 20));
+            stat_hashed = 0;
             frames = stat_commits = stat_waits = stat_draws = stat_dispatches = 0;
             if (profile) {
                 ProfileReport();

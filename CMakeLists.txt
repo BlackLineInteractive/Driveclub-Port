@@ -3,7 +3,9 @@ cmake_minimum_required(VERSION 3.24)
 project(DriveclubNative LANGUAGES C CXX OBJC OBJCXX)
 
 if (NOT APPLE)
-    message(FATAL_ERROR "Driveclub Native targets macOS + Metal only")
+    # The renderer side is ready (DC_ENABLE_VULKAN), but the loader, memory
+    # manager, signals and TLS in src/core are still macOS/Mach-O specific.
+    message(FATAL_ERROR "Driveclub Native: the core (src/core) only runs on macOS for now")
 endif()
 
 set(CMAKE_CXX_STANDARD 23)
@@ -128,11 +130,28 @@ target_link_options(driveclub PRIVATE
     -Wl,-segaddr,GUEST_USER,0x1000000000
 )
 
+# Vulkan renderer (shadPS4's, third_party/shadps4): the Windows/Linux backend,
+# selectable on macOS too through MoltenVK with DC_RENDERER=vulkan.
+find_package(Vulkan QUIET)
+option(DC_ENABLE_VULKAN "Build the Vulkan renderer (shadPS4)" ${Vulkan_FOUND})
+if (DC_ENABLE_VULKAN)
+    include(cmake/ShadPS4Vulkan.cmake)
+    target_sources(driveclub PRIVATE
+        src/gpu/vulkan/vk_renderer.h
+        src/gpu/vulkan/vk_renderer.cpp
+        src/gpu/vulkan/dc_host.cpp)
+    target_include_directories(driveclub PRIVATE src/gpu/vulkan/bridge)
+    target_compile_definitions(driveclub PRIVATE DC_HAS_VULKAN=1)
+    target_link_libraries(driveclub PRIVATE dc_shadps4_vulkan Vulkan::Vulkan)
+endif()
+
 target_link_libraries(driveclub PRIVATE
     SDL3::SDL3
     "-framework Metal"
     "-framework QuartzCore"
     "-framework Foundation"
+    "-framework CoreText"
+    "-framework CoreGraphics"
 )
 
 # Developer tool: GCN disassembler + MSL translation check (gcn_dis shader.bin [vs|ps] [--msl]).

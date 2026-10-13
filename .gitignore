@@ -30,7 +30,9 @@ eboot.bin
 param.sfo
 *.sfo
 keystone
-playgo*
+playgo.manifest
+playgo.xml
+playgo.dat
 
 # Game data containers & engine archives (Evolution Studios engine formats)
 *.dat
@@ -51,6 +53,10 @@ sce_sys/
 *.dds
 icon*.png
 pic*.png
+
+# Safeguard: Never ignore files inside source tree
+!/src/**
+!/src/hle/playgo/**
 
 # ------------------------------------------------------------------------------
 # 2. Reverse Engineering Databases & Tooling (Ghidra, IDA, Radare2)
@@ -98,6 +104,7 @@ tools/config.ini
 # 5. Emulator Dumps, Caches & Submodules
 # ------------------------------------------------------------------------------
 /shadps4/
+/third_party/
 /emulator/
 
 # Shader dumps and pipeline caches
@@ -116,7 +123,7 @@ tools/config.ini
 /screenshots/
 
 # ------------------------------------------------------------------------------
-# 6. Build & Compiler Artifacts (C/C++ / CMake / Clang / Ninja)
+# 6. Build & Compiler Artifacts (C/C++ / CMake / Clang / Ninja / Xcode)
 # ------------------------------------------------------------------------------
 /build/
 /build-*/
@@ -124,6 +131,10 @@ tools/config.ini
 /bin/
 /out/
 /dist/
+
+# Ninja build artifacts
+.ninja_deps
+.ninja_log
 
 # Compiled object files and libraries
 *.o
@@ -138,8 +149,9 @@ tools/config.ini
 
 # LSP & tooling cache
 compile_commands.json
-/.cache/
 .cache/
+/.cache/
+.clangd/
 CMakeUserPresets.json
 
 # ------------------------------------------------------------------------------
@@ -174,19 +186,33 @@ Desktop.ini
 # Local UI configs
 imgui.ini
 *.ini
+!/src/**/*.ini
 
 # ------------------------------------------------------------------------------
 # 9. IDEs & Editors
 # ------------------------------------------------------------------------------
+# JetBrains / CLion
 .idea/
 *.iml
 
+# Visual Studio Code
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
 
+# Xcode
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+*.xcworkspace/*
+!*.xcworkspace/contents.xcworkspacedata
+xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# General editor backups
 *.swp
 *.swo
 *~

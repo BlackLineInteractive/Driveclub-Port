@@ -11,6 +11,7 @@
 #include <x86intrin.h>
 
 #include "common/log.h"
+#include "core/memory.h"
 #include "gpu/renderer.h"
 
 namespace Gpu::Liverpool {
@@ -29,6 +30,14 @@ enum IntSel : u32 { kIntNone = 0, kIntOnly = 1, kIntWriteConfirm = 2, kIntUndocu
 u64 GpuClock() {
     // The GPU clock runs at 100 MHz on PS4; derive it from the host clock.
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 10;
+}
+
+// True if [addr, addr + size) is guest memory (one mapping).
+bool Mapped(const void* p, u64 size) {
+    const u64 addr = reinterpret_cast<u64>(p);
+    Core::Memory::Vma vma;
+    return addr && Core::Memory::Query(addr, false, &vma) && vma.type != Core::Memory::VmaType::Free &&
+           addr + size <= vma.start + vma.size;
 }
 
 template <typename T>
@@ -407,6 +416,9 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
 
         case Op::SetContextReg:
             SetRegs(kContextRegBase + body[0], body + 1, body_n - 1);
+            if (renderer) {
+                renderer->OnContextRegs(body, body_n);
+            }
             break;
         case Op::SetShReg:
             SetRegs(kShRegBase + body[0], body + 1, body_n - 1);
@@ -481,9 +493,23 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             if ((cmd >> 27) & 1) {
                 break; // destination is register space: cache prefetch hints
             }
+            if (renderer) {
+                const u32 dsel = dst_sel == 1 ? 1 : 0;
+                const u32 ssel = src_sel == 3 ? 0 : src_sel;
+                const u64 dst_addr = dsel ? (body[3] & 0xFFFF) : u64(body[3]) | (u64(body[4]) << 32);
+                const u64 src_addr = ssel == 2 ? body[1]
+                                   : ssel == 1 ? (body[1] & 0xFFFF) : u64(body[1]) | (u64(body[2]) << 32);
+                if (bytes && renderer->DmaData(dsel, dst_addr, ssel, src_addr, bytes)) {
+                    break;
+                }
+            }
             u8* gds = renderer ? renderer->Gds() : nullptr;
             u8* dst = dst_sel == 1 ? (gds ? gds + (body[3] & 0xFFFF) : nullptr) : Ptr<u8>(body[3], body[4]);
-            if (!dst || bytes == 0) {
+            if (!dst || bytes == 0 || (dst_sel != 1 && !Mapped(dst, bytes)) ||
+                (src_sel != 1 && src_sel != 2 && !Mapped(Ptr<const u8>(body[1], body[2]), bytes))) {
+                if (bytes) {
+                    DC_WARN("gpu: DMA_DATA to/from unmapped memory skipped (ctl %#x dst %p, %u bytes)", ctl, dst, bytes);
+                }
                 break;
             }
             SyncRenderer(); // the GPU may still be producing what we copy

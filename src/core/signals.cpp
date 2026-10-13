@@ -179,7 +179,15 @@ void DumpStackStrings(u64 rsp) {
     _exit(128 + sig);
 }
 
+std::atomic<FaultHandler> g_fault_handler{nullptr};
+
 void Handler(int sig, siginfo_t* info, void* raw) {
+    if (sig != SIGILL) {
+        const FaultHandler fault = g_fault_handler.load(std::memory_order_acquire);
+        if (fault && fault(raw, info->si_addr)) {
+            return;
+        }
+    }
     auto* uc = static_cast<ucontext_t*>(raw);
     const u64 rip = uc->uc_mcontext->__ss.__rip;
     const u64 rsp = uc->uc_mcontext->__ss.__rsp;
@@ -223,6 +231,10 @@ void Install(AddressDescriber describer) {
     sigaction(SIGILL, &sa, nullptr);
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS, &sa, nullptr);
+}
+
+void SetFaultHandler(FaultHandler handler) {
+    g_fault_handler.store(handler, std::memory_order_release);
 }
 
 void AddPatchArea(VAddr code_begin, VAddr code_end, VAddr area, u64 area_size) {

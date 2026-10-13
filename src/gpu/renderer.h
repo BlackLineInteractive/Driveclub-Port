@@ -6,8 +6,8 @@
 // The frontend decodes command buffers the game submits through
 // sceGnmSubmitCommandBuffers / sceGnmDingDong, tracks register state, and
 // calls into this interface only for work that touches the host GPU.
-// Backends: Metal (macOS). A Vulkan backend for Windows/Linux can sit behind
-// the same interface later.
+// Backends: Metal (macOS, src/gpu/metal) and Vulkan (Windows/Linux, also
+// usable on macOS through MoltenVK; src/gpu/vulkan wraps shadPS4's renderer).
 
 #include <cstdint>
 #include <functional>
@@ -69,6 +69,19 @@ public:
 
     // Called on the GPU thread once the frame's command buffers are done.
     virtual void Flip(const FlipInfo& flip) = 0;
+
+    // A SET_CONTEXT_REG packet body (`body[0]` = register offset), read in
+    // place in the command buffer: the Gnm driver puts render target size
+    // hints in the NOP packet right after it.
+    virtual void OnContextRegs(const std::uint32_t* body, std::uint32_t body_dwords) {}
+
+    // CP DMA (DMA_DATA). sel: 0 memory, 1 GDS, 2 immediate (`src` is the
+    // value; source only). Return true if the backend did the copy on the
+    // GPU; false lets the CP do it on the CPU.
+    virtual bool DmaData(std::uint32_t dst_sel, std::uint64_t dst, std::uint32_t src_sel,
+                         std::uint64_t src, std::uint32_t bytes) {
+        return false;
+    }
 
     // The 64 KB global data share, shared by shaders and CP DMA (call WaitIdle
     // before reading what shaders wrote).
