@@ -44,7 +44,7 @@ static inline void dc_st_part(thread const DcMem& m, ulong va, uint v, uint byte
     uint mask = (bytes == 1u ? 0xffu : 0xffffu) << sh;
     *p = (*p & ~mask) | ((v << sh) & mask);
 }
-static inline ulong dc_vbase(uint a, uint b) { return ulong(a) | (ulong(b & 0xffffu) << 32); }
+static inline ulong dc_vbase(uint a, uint b) { return ulong(a) | (ulong(b & 0xfffu) << 32); }
 static inline uint dc_vstride(uint b) { return (b >> 16) & 0x3fffu; }
 
 // ---- typed buffer fetch (BUF_DATA_FORMAT / BUF_NUM_FORMAT) ----

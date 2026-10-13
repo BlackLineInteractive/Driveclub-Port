@@ -350,7 +350,7 @@ u32 ResolveSgpr(const SgprSource& src, const u32* ud) {
         return v;
     }
     case SgprSource::BufferLoad: {
-        const u64 base = u64(ud[src.ud]) | (u64(ud[src.ud + 1] & 0xFFFF) << 32);
+        const u64 base = u64(ud[src.ud]) | (u64(ud[src.ud + 1] & 0xFFF) << 32);
         const u64 addr = base + src.offset;
         if (!Readable(addr, 4)) {
             return 0;
