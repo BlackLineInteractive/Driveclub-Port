@@ -21,7 +21,7 @@ struct VertexOut {
 vertex VertexOut vs_present(uint vid [[vertex_id]]) {
     VertexOut out;
     out.uv = float2((vid << 1) & 2, vid & 2);
-    out.position = float4(out.uv * 2.0 - 1.0, 0.0, 1.0);
+    out.position = float4(out.uv.x * 2.0 - 1.0, 1.0 - out.uv.y * 2.0, 0.0, 1.0);
     return out;
 }
 
@@ -173,6 +173,49 @@ void Presenter::PresentFramebuffer(const void* pixels, int width, int height, in
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
         [enc setRenderPipelineState:impl->pipeline];
         [enc setFragmentTexture:impl->fb_texture atIndex:0];
+        [enc setFragmentSamplerState:impl->sampler atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+
+        dispatch_semaphore_t sem = impl->frames_in_flight;
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+          dispatch_semaphore_signal(sem);
+        }];
+        [cmd presentDrawable:drawable];
+        [cmd commit];
+    }
+}
+
+void Presenter::PresentTexture(void* texture_handle) {
+    if (!texture_handle || !impl->pipeline) {
+        return;
+    }
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)texture_handle;
+
+    static uint64_t pres_count = 0;
+    if (++pres_count <= 5 || pres_count % 60 == 0) {
+        NSLog(@"Presenter: PresentTexture #%llu tex=%p (%lux%lu)",
+              pres_count, tex, (unsigned long)tex.width, (unsigned long)tex.height);
+    }
+
+    dispatch_semaphore_wait(impl->frames_in_flight, DISPATCH_TIME_FOREVER);
+
+    @autoreleasepool {
+        id<CAMetalDrawable> drawable = [impl->layer nextDrawable];
+        if (!drawable) {
+            dispatch_semaphore_signal(impl->frames_in_flight);
+            return;
+        }
+
+        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+        id<MTLCommandBuffer> cmd = [impl->queue commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+        [enc setRenderPipelineState:impl->pipeline];
+        [enc setFragmentTexture:tex atIndex:0];
         [enc setFragmentSamplerState:impl->sampler atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [enc endEncoding];

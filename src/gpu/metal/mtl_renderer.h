@@ -37,6 +37,9 @@ public:
     void PushMarker(const char* name) override;
     void PopMarker() override;
 
+    // Returns the latest rendered framebuffer texture as an id<MTLTexture> cast to void*.
+    void* GetLatestTexture() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

@@ -3,6 +3,7 @@
 #include "gpu/metal/mtl_renderer.h"
 
 #import <Metal/Metal.h>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -25,10 +26,13 @@ struct MetalRenderer::Impl {
 
     std::unordered_map<GuestAddr, id<MTLTexture>> target_textures;
     id<MTLTexture> last_drawn_target = nil;
+    mutable std::mutex latest_tex_mutex;
+    id<MTLTexture> latest_texture = nil;
 
     id<MTLRenderPipelineState> pipeline_ui_panel = nil;
     id<MTLRenderPipelineState> pipeline_ui_text = nil;
     id<MTLBuffer> quad_index_buffer = nil;
+    id<MTLBuffer> dynamic_vbuf = nil;
     id<MTLTexture> default_white_texture = nil;
     id<MTLSamplerState> default_sampler = nil;
     std::unordered_map<GuestAddr, id<MTLTexture>> guest_textures;
@@ -48,6 +52,7 @@ struct MetalRenderer::Impl {
         quad_index_buffer = [device newBufferWithBytes:indices.data()
                                                 length:indices.size() * sizeof(uint16_t)
                                                options:MTLResourceStorageModeShared];
+        dynamic_vbuf = [device newBufferWithLength:1024 * 1024 options:MTLResourceStorageModeShared];
 
         MTLTextureDescriptor* wDesc = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -330,9 +335,20 @@ void MetalRenderer::Draw(const Liverpool::Regs& regs, bool indexed) {
             fwrite(reinterpret_cast<const void*>(0x3000d01b0ULL), 1, 2048, fp);
             fclose(fp);
         }
-        fp = fopen("/tmp/cbuf.bin", "wb");
-        if (fp) {
-            fwrite(reinterpret_cast<const void*>(0x3000d0f90ULL), 1, 512, fp);
+    }
+
+    if (draw_counter == 8) {
+        const GuestAddr vb = ((uint64_t(regs.vs_program.user_data[5] & 0xFFFF) << 32) | regs.vs_program.user_data[4]);
+        const GuestAddr cb = ((uint64_t(regs.vs_program.user_data[1] & 0xFFFF) << 32) | regs.vs_program.user_data[0]);
+        DC_INFO("metal_renderer: draw #8 vb=%#llx cb=%#llx num_indices=%u", vb, cb, regs.num_indices);
+        FILE* fp = fopen("/tmp/vbuf_draw8.bin", "wb");
+        if (fp && vb) {
+            fwrite(reinterpret_cast<const void*>(vb), 1, regs.num_indices * 16, fp);
+            fclose(fp);
+        }
+        fp = fopen("/tmp/cbuf_draw8.bin", "wb");
+        if (fp && cb) {
+            fwrite(reinterpret_cast<const void*>(cb), 1, 512, fp);
             fclose(fp);
         }
     }
@@ -416,8 +432,8 @@ void MetalRenderer::Draw(const Liverpool::Regs& regs, bool indexed) {
             if (pipeline) {
                 [impl->current_encoder setRenderPipelineState:pipeline];
 
-                const GuestAddr vb_addr = (0x300000000ULL | regs.vs_program.user_data[4]);
-                const GuestAddr cb_addr = (0x300000000ULL | regs.vs_program.user_data[0]);
+                const GuestAddr vb_addr = ((uint64_t(regs.vs_program.user_data[5] & 0xFFFF) << 32) | regs.vs_program.user_data[4]);
+                const GuestAddr cb_addr = ((uint64_t(regs.vs_program.user_data[1] & 0xFFFF) << 32) | regs.vs_program.user_data[0]);
 
                 Core::Memory::Vma vma_b{};
                 if (cb_addr >= 0x400000 && Core::Memory::Query(cb_addr, false, &vma_b) && cb_addr + 512 <= vma_b.start + vma_b.size) {
@@ -425,13 +441,12 @@ void MetalRenderer::Draw(const Liverpool::Regs& regs, bool indexed) {
                                                    length:512
                                                   atIndex:0];
                 }
-                if (vb_addr >= 0x400000 && Core::Memory::Query(vb_addr, false, &vma_b) && vb_addr + 2048 <= vma_b.start + vma_b.size) {
-                    [impl->current_encoder setVertexBytes:reinterpret_cast<const void*>(vb_addr)
-                                                   length:2048
-                                                  atIndex:1];
-                    [impl->current_encoder setVertexBytes:reinterpret_cast<const void*>(vb_addr)
-                                                   length:2048
-                                                  atIndex:2];
+                const u32 num_quads = regs.num_indices / 4;
+                const size_t vb_size = std::min<size_t>(1024 * 1024, std::max<size_t>(num_quads * 64, 4096));
+                if (vb_addr >= 0x400000 && Core::Memory::Query(vb_addr, false, &vma_b) && vb_addr + vb_size <= vma_b.start + vma_b.size) {
+                    std::memcpy([impl->dynamic_vbuf contents], reinterpret_cast<const void*>(vb_addr), vb_size);
+                    [impl->current_encoder setVertexBuffer:impl->dynamic_vbuf offset:0 atIndex:1];
+                    [impl->current_encoder setVertexBuffer:impl->dynamic_vbuf offset:0 atIndex:2];
                 }
 
                 const GuestAddr ps_cb_addr = (0x300000000ULL | regs.ps_program.user_data[0]);
@@ -449,7 +464,6 @@ void MetalRenderer::Draw(const Liverpool::Regs& regs, bool indexed) {
                                                   atIndex:0];
                 [impl->current_encoder setFragmentSamplerState:impl->default_sampler atIndex:0];
 
-                const u32 num_quads = regs.num_indices / 4;
                 const u32 index_count = num_quads * 6;
                 [impl->current_encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                                   indexCount:index_count
@@ -528,45 +542,64 @@ void MetalRenderer::Flip(GuestAddr framebuffer, std::uint32_t width, std::uint32
     impl->CommitCommandBuffer();
 
     id<MTLTexture> src_tex = nil;
-    auto it = impl->target_textures.find(framebuffer);
-    if (it != impl->target_textures.end() && it->second) {
-        src_tex = it->second;
-    } else if (impl->last_drawn_target) {
+    if (impl->last_drawn_target) {
         src_tex = impl->last_drawn_target;
+    }
+    if (!src_tex) {
+        auto it = impl->target_textures.find(framebuffer);
+        if (it != impl->target_textures.end() && it->second) {
+            src_tex = it->second;
+        }
     }
 
     static u64 flip_count = 0;
     ++flip_count;
 
-    if (src_tex && framebuffer) {
-        const NSUInteger bytesPerRow = pitch > 0 ? (pitch * 4) : (width * 4);
-        [src_tex getBytes:reinterpret_cast<void*>(framebuffer)
-              bytesPerRow:bytesPerRow
-               fromRegion:MTLRegionMake2D(0, 0, width, height)
-              mipmapLevel:0];
+    if (src_tex) {
+        {
+            std::scoped_lock lk(impl->latest_tex_mutex);
+            impl->latest_texture = src_tex;
+        }
 
         if (flip_count <= 5 || flip_count % 60 == 0) {
-            DC_INFO("metal_renderer: Flip #%llu: copied %ux%u from src_tex=%p to fb=%#llx",
-                    flip_count, width, height, (__bridge void*)src_tex, framebuffer);
+            DC_INFO("metal_renderer: Flip #%llu: texture=%p (%ux%u) for fb=%#llx",
+                    flip_count, (__bridge void*)src_tex, width, height, framebuffer);
         }
 
         if (flip_count == 3 || flip_count == 10) {
+            id<MTLBuffer> sbuf = [impl->device newBufferWithLength:width * height * 4
+                                                           options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> scmd = [impl->queue commandBuffer];
+            id<MTLBlitCommandEncoder> sblit = [scmd blitCommandEncoder];
+            [sblit copyFromTexture:src_tex
+                       sourceSlice:0
+                       sourceLevel:0
+                      sourceOrigin:MTLOriginMake(0, 0, 0)
+                        sourceSize:MTLSizeMake(width, height, 1)
+                          toBuffer:sbuf
+                 destinationOffset:0
+            destinationBytesPerRow:width * 4
+          destinationBytesPerImage:width * height * 4];
+            [sblit endEncoding];
+            [scmd commit];
+            [scmd waitUntilCompleted];
+
+            const uint8_t* p = reinterpret_cast<const uint8_t*>([sbuf contents]);
             char path[64];
-            snprintf(path, sizeof(path), "/tmp/flip_%llu.ppm", flip_count);
+            snprintf(path, sizeof(path), "/tmp/screen_%llu.ppm", flip_count);
             FILE* f = fopen(path, "wb");
             if (f) {
                 fprintf(f, "P6\n%u %u\n255\n", width, height);
-                const uint8_t* p = reinterpret_cast<const uint8_t*>(framebuffer);
                 for (uint32_t y = 0; y < height; ++y) {
                     for (uint32_t x = 0; x < width; ++x) {
-                        uint32_t idx = y * bytesPerRow + x * 4;
+                        uint32_t idx = y * (width * 4) + x * 4;
                         // BGRA -> RGB
                         uint8_t rgb[3] = {p[idx + 2], p[idx + 1], p[idx + 0]};
                         fwrite(rgb, 1, 3, f);
                     }
                 }
                 fclose(f);
-                DC_INFO("metal_renderer: saved debug flip screenshot to %s", path);
+                DC_INFO("metal_renderer: saved hardware GPU screenshot to %s", path);
             }
         }
     } else {
@@ -575,7 +608,13 @@ void MetalRenderer::Flip(GuestAddr framebuffer, std::uint32_t width, std::uint32
                     flip_count, (__bridge void*)src_tex, framebuffer);
         }
     }
+    (void)pitch;
     (void)format;
+}
+
+void* MetalRenderer::GetLatestTexture() const {
+    std::scoped_lock lk(impl->latest_tex_mutex);
+    return (__bridge void*)impl->latest_texture;
 }
 
 void MetalRenderer::PushMarker(const char* name) {

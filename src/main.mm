@@ -206,9 +206,9 @@ int Run(int argc, char** argv) {
             }
         }
 
-        const auto fb = Hle::VideoOut::Driver::Instance().GetLatestFramebuffer();
-        if (fb.ptr && fb.width > 0 && fb.height > 0) {
-            presenter.PresentFramebuffer(fb.ptr, fb.width, fb.height, fb.pitch);
+        void* tex = renderer->GetLatestTexture();
+        if (tex) {
+            presenter.PresentTexture(tex);
         } else {
             const float t = std::chrono::duration<float>(Clock::now() - start).count();
             presenter.PresentClear(0.5f + 0.5f * std::sin(t), 0.2f, 0.3f);
@@ -218,10 +218,12 @@ int Run(int argc, char** argv) {
         const auto now = Clock::now();
         if (now - fps_window >= std::chrono::seconds(1)) {
             const double secs = std::chrono::duration<double>(now - fps_window).count();
+            const double fps = frames / secs;
             char title[96];
             std::snprintf(title, sizeof(title), "Driveclub Native | %s | %.0f FPS",
-                          device.Info().name.c_str(), frames / secs);
+                          device.Info().name.c_str(), fps);
             SDL_SetWindowTitle(window, title);
+            DC_INFO("Presenter: %.0f FPS (latest_tex=%p)", fps, tex);
             frames = 0;
             fps_window = now;
         }

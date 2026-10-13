@@ -35,6 +35,10 @@ public:
     // rendering a fullscreen triangle onto the CAMetalLayer drawable.
     void PresentFramebuffer(const void* pixels, int width, int height, int pitch_pixels);
 
+    // Presents an existing Metal texture directly (zero-copy GPU-to-GPU).
+    // `texture_handle` is an id<MTLTexture> cast to void*.
+    void PresentTexture(void* texture_handle);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

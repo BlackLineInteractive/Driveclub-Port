@@ -129,7 +129,8 @@ vertex main0_out main0(const device _58& ssbo_1 [[buffer(0)]], const device _58&
     uint _81 = 3u & gl_VertexIndex;
     float _83 = float(extract_bits(_81, 1u, 1u));
     bool _84 = 0.0 < _83;
-    uint4 _182 = uint4(ssbo_1.data[0u], ssbo_1.data[0u + 1u], ssbo_1.data[0u + 2u], ssbo_1.data[0u + 3u]);
+    uint base_offset = (gl_VertexIndex >> 2u) * 16u;
+    uint4 _182 = uint4(ssbo_2.data[base_offset + 0u], ssbo_2.data[base_offset + 1u], ssbo_2.data[base_offset + 2u], ssbo_2.data[base_offset + 3u]);
     uint _185 = _182.z;
     uint _186 = _182.w;
     float _189 = float(extract_bits(_81 - 1u, 1u, 1u));
@@ -206,11 +207,10 @@ vertex main0_out main0(const device _58& ssbo_1 [[buffer(0)]], const device _58&
     float _428 = spvFMul(2.0, _392);
     float _429 = spvFMul(2.0, _393);
     float _430 = spvFSub(1.0, fast::clamp(spvFMul(spvFSub(_373, _374), as_type<float>(_383)), 0.0, 1.0));
-    out.gl_Position.x = spvFAdd(spvFMul(as_type<float>(ssbo_1.data[0u]), _370), spvFAdd(spvFMul(as_type<float>(ssbo_1.data[4u]), _363), as_type<float>(ssbo_1.data[12u])));
-    out.gl_Position.y = spvFAdd(spvFMul(as_type<float>(ssbo_1.data[1u]), _370), spvFAdd(spvFMul(as_type<float>(ssbo_1.data[5u]), _363), as_type<float>(ssbo_1.data[13u])));
-    out.gl_Position.z = spvFAdd(spvFMul(as_type<float>(ssbo_1.data[2u]), _370), spvFAdd(spvFMul(as_type<float>(ssbo_1.data[6u]), _363), as_type<float>(ssbo_1.data[14u])));
-    out.gl_Position.w = spvFAdd(spvFMul(as_type<float>(ssbo_1.data[3u]), _370), spvFAdd(spvFMul(as_type<float>(ssbo_1.data[7u]), _363), as_type<float>(ssbo_1.data[15u])));
-    uint4 _457 = uint4(ssbo_1.data[4u], ssbo_1.data[4u + 1u], ssbo_1.data[4u + 2u], ssbo_1.data[4u + 3u]);
+    float ndc_x = (_370 / 1920.0) * 2.0 - 1.0;
+    float ndc_y = 1.0 - (_363 / 1080.0) * 2.0;
+    out.gl_Position = float4(ndc_x, ndc_y, 0.0, 1.0);
+    uint4 _457 = uint4(ssbo_2.data[base_offset + 4u], ssbo_2.data[base_offset + 5u], ssbo_2.data[base_offset + 6u], ssbo_2.data[base_offset + 7u]);
     float _465 = 1.0 / _393;
     float _470 = 1.0 / spvFMul(fma(2.0, _465, -1.0), 1.0 / spvFMul(2.0, _465));
     float _481 = as_type<float>(_457.z);
@@ -219,10 +219,10 @@ vertex main0_out main0(const device _58& ssbo_1 [[buffer(0)]], const device _58&
     out.out_attr4.y = _363;
     out.out_attr4.z = _363;
     out.out_attr4.w = _363;
-    out.out_attr3.x = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(255u & ssbo_1.data[14u]))))));
-    out.out_attr3.y = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(extract_bits(ssbo_1.data[14u], 8u, 8u)))))));
-    out.out_attr3.z = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(extract_bits(ssbo_1.data[14u], 16u, 8u)))))));
-    out.out_attr3.w = spvFMul(spvFMul(0.0039215688593685626983642578125, float(extract_bits(ssbo_1.data[14u], 24u, 8u))), _430);
+    out.out_attr3.x = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(255u & ssbo_2.data[base_offset + 14u]))))));
+    out.out_attr3.y = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(extract_bits(ssbo_2.data[base_offset + 14u], 8u, 8u)))))));
+    out.out_attr3.z = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(extract_bits(ssbo_2.data[base_offset + 14u], 16u, 8u)))))));
+    out.out_attr3.w = spvFMul(spvFMul(0.0039215688593685626983642578125, float(extract_bits(ssbo_2.data[base_offset + 14u], 24u, 8u))), _430);
     out.out_attr2.x = 1.0 / abs(spvFMul(_428, _427));
     out.out_attr2.y = 1.0 / abs(spvFMul(_429, _470));
     out.out_attr2.z = _370;
@@ -231,11 +231,9 @@ vertex main0_out main0(const device _58& ssbo_1 [[buffer(0)]], const device _58&
     out.out_attr1.y = spvFAdd(spvFMul(_393, _487), spvFAdd(spvFMul(_487, _357), spvFAdd(spvFMul(-spvFMul(spvFMul(_256, 1.0 / _386), _487), _203), as_type<float>(_457.y))));
     out.out_attr1.z = spvFAdd(spvFMul(_428, _427), _356);
     out.out_attr1.w = spvFAdd(spvFMul(_429, _470), _357);
-    out.out_attr0.x = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(255u & ssbo_1.data[12u]))))));
-    out.out_attr0.y = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(extract_bits(ssbo_1.data[12u], 8u, 8u)))))));
-    out.out_attr0.z = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(extract_bits(ssbo_1.data[12u], 16u, 8u)))))));
-    float2 test_quad[4] = { float2(-0.8, -0.8), float2(-0.8, 0.8), float2(0.8, 0.8), float2(0.8, -0.8) };
-    out.gl_Position = float4(test_quad[_81], 0.0, 1.0);
+    out.out_attr0.x = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(255u & ssbo_2.data[base_offset + 12u]))))));
+    out.out_attr0.y = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(extract_bits(ssbo_2.data[base_offset + 12u], 8u, 8u)))))));
+    out.out_attr0.z = exp2(spvFMul(2.2000000476837158203125, log2(abs(spvFMul(0.0039215688593685626983642578125, float(extract_bits(ssbo_2.data[base_offset + 12u], 16u, 8u)))))));
     return out;
 }
 
@@ -407,7 +405,10 @@ fragment main0_out main0(main0_in in [[stage_in]], const device _56& ssbo_1 [[bu
     }
     float _174 = spvFSub(1.0, fast::clamp(spvFMul(in.fs_in_attr2.y, fast::max(spvFAdd(-1.0, in.fs_in_attr1.w), -in.fs_in_attr1.w)), 0.0, 1.0));
     float _213 = spvFMul(spvFMul(spvFMul(spvFMul(spvFMul(spvFMul(in.fs_in_attr0.w, fast::clamp(spvFAdd(spvFMul(as_type<float>(ssbo_2.data[6u]), in.fs_in_attr2.w), as_type<float>(ssbo_2.data[7u])), 0.0, 1.0)), fast::clamp(spvFAdd(spvFMul(as_type<float>(ssbo_2.data[4u]), in.fs_in_attr2.w), as_type<float>(ssbo_2.data[5u])), 0.0, 1.0)), fast::clamp(spvFAdd(spvFMul(as_type<float>(ssbo_2.data[2u]), in.fs_in_attr2.z), as_type<float>(ssbo_2.data[3u])), 0.0, 1.0)), fast::clamp(spvFAdd(spvFMul(as_type<float>(ssbo_2.data[0u]), in.fs_in_attr2.z), as_type<float>(ssbo_2.data[1u])), 0.0, 1.0)), spvFAdd(spvFMul(-fast::clamp(spvFMul(in.fs_in_attr2.x, fast::max(spvFAdd(-1.0, in.fs_in_attr1.z), -in.fs_in_attr1.z)), 0.0, 1.0), _174), _174)), as_type<float>(_122));
-    out.frag_color0 = float4(1.0, 0.5, 0.0, 1.0);
+    out.frag_color0.x = spvFMul(spvFMul(in.fs_in_attr0.x, as_type<float>(_119)), _213);
+    out.frag_color0.y = spvFMul(spvFMul(in.fs_in_attr0.y, as_type<float>(_120)), _213);
+    out.frag_color0.z = spvFMul(spvFMul(in.fs_in_attr0.z, as_type<float>(_121)), _213);
+    out.frag_color0.w = _213;
     return out;
 }
 
@@ -589,7 +590,10 @@ fragment main0_out main0(main0_in in [[stage_in]], const device _56& ssbo_1 [[bu
     }
     float _328 = spvFSub(1.0, fast::clamp(spvFMul(in.fs_in_attr2.y, fast::max(spvFAdd(-1.0, in.fs_in_attr1.w), -in.fs_in_attr1.w)), 0.0, 1.0));
     float _353 = spvFMul(spvFMul(spvFMul(spvFMul(spvFMul(spvFMul(in.fs_in_attr0.w, fast::clamp(spvFAdd(spvFMul(as_type<float>(ssbo_2.data[6u]), in.fs_in_attr2.w), as_type<float>(ssbo_2.data[7u])), 0.0, 1.0)), fast::clamp(spvFAdd(spvFMul(as_type<float>(ssbo_2.data[4u]), in.fs_in_attr2.w), as_type<float>(ssbo_2.data[5u])), 0.0, 1.0)), fast::clamp(spvFAdd(spvFMul(as_type<float>(ssbo_2.data[2u]), in.fs_in_attr2.z), as_type<float>(ssbo_2.data[3u])), 0.0, 1.0)), fast::clamp(spvFAdd(spvFMul(as_type<float>(ssbo_2.data[0u]), in.fs_in_attr2.z), as_type<float>(ssbo_2.data[1u])), 0.0, 1.0)), spvFAdd(spvFMul(_328, -fast::clamp(spvFMul(in.fs_in_attr2.x, fast::max(spvFAdd(-1.0, in.fs_in_attr1.z), -in.fs_in_attr1.z)), 0.0, 1.0)), _328)), _280);
-    out.frag_color0 = float4(0.0, 1.0, 1.0, 1.0);
+    out.frag_color0.x = spvFMul(in.fs_in_attr0.x, _353);
+    out.frag_color0.y = spvFMul(in.fs_in_attr0.y, _353);
+    out.frag_color0.z = spvFMul(in.fs_in_attr0.z, _353);
+    out.frag_color0.w = _353;
     return out;
 }
 
