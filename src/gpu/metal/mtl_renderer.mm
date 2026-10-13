@@ -1598,6 +1598,15 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
 
 void MetalRenderer::Impl::Flip(const FlipInfo& f) {
     ++frame_count;
+    if (dump_texture && dump_frames && frame_count % 300 == 0) { // TMP: raw memory snapshots
+        for (u64 a : {dump_texture, u64(0x2000030d0)}) {
+            if (Readable(a, 4 << 20)) {
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s/mem_%llx_f%llu.raw", dump_frames, a, frame_count);
+                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(a), 4 << 20);
+            }
+        }
+    }
     if (stats) {
         const auto now = std::chrono::steady_clock::now();
         const double dt = std::chrono::duration<double>(now - stat_t0).count();
