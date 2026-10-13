@@ -162,7 +162,8 @@ struct MetalRenderer::Impl {
 
     // ---- diagnostics ----
     const char* dump_dir = nullptr;
-    const char* dump_frames = nullptr; // DC_DUMP_FRAMES=dir: every flip as a PPM
+    const char* dump_frames = nullptr; // DC_DUMP_FRAMES=dir: flips as PPMs
+    u64 dump_every = 1;                // DC_DUMP_EVERY=n: only every n-th flip
     bool debug_clear = false;          // DC_DEBUG_CLEAR: new targets start dark blue
     u64 debug_vsout = 0;               // DC_DEBUG_VSOUT=<vs address>: dump its first positions
     id<MTLBuffer> debug_vs_buf = nil;
@@ -182,6 +183,9 @@ struct MetalRenderer::Impl {
     void Init() {
         dump_dir = std::getenv("DC_DUMP_SHADERS");
         dump_frames = std::getenv("DC_DUMP_FRAMES");
+        if (const char* e = std::getenv("DC_DUMP_EVERY")) {
+            dump_every = std::max<u64>(1, std::strtoull(e, nullptr, 10));
+        }
         debug_clear = std::getenv("DC_DEBUG_CLEAR") != nullptr;
         if (const char* v = std::getenv("DC_DEBUG_VSOUT")) {
             debug_vsout = std::strtoull(v, nullptr, 16);
@@ -1210,7 +1214,7 @@ void MetalRenderer::Impl::Flip(const FlipInfo& f) {
         }
         debug_vsout = 0;
     }
-    if (src && dump_frames) {
+    if (src && dump_frames && frame_count % dump_every == 0) {
         DumpFrame(dst);
     }
     Commit(false);
