@@ -49,8 +49,9 @@ target_compile_options(driveclub PRIVATE
 )
 
 # Guest code is mapped at its PS4 addresses (executable at 0x400000), which
-# sit inside the default 4 GB __PAGEZERO. Shrink it to free that range.
-target_link_options(driveclub PRIVATE -Wl,-pagezero_size,0x4000)
+# sit inside the default 4 GB __PAGEZERO. Shrink it to free that range, and
+# move our own image far above every guest region so ASLR cannot slide it in.
+target_link_options(driveclub PRIVATE -Wl,-no_pie,-pagezero_size,0x4000,-image_base,0x700000000000)
 
 target_link_libraries(driveclub PRIVATE
     SDL3::SDL3
