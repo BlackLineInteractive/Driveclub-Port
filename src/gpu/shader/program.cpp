@@ -251,6 +251,7 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
     p->address = in.address;
     p->num_user_sgprs = in.num_user_sgprs;
     p->vgpr_comp_cnt = in.vgpr_comp_cnt;
+    p->compute_rsrc2 = in.compute_rsrc2;
 
     const u32* code = in.code ? in.code : reinterpret_cast<const u32*>(in.address);
     p->code = DecodeProgram(code);

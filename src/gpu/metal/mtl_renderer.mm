@@ -331,7 +331,8 @@ struct MetalRenderer::Impl {
 
     // ================= shaders =================
 
-    Program* GetProgram(Stage stage, u64 addr, const u32* ud, u32 num_user_sgprs, u32 vgpr_comp_cnt) {
+    Program* GetProgram(Stage stage, u64 addr, const u32* ud, u32 num_user_sgprs, u32 vgpr_comp_cnt,
+                        u32 compute_rsrc2 = 0) {
         if (!Readable(addr, 16)) {
             return nullptr;
         }
@@ -351,6 +352,7 @@ struct MetalRenderer::Impl {
             return e.prog.get();
         }
         Shader::BuildInput in{stage, addr, ud, num_user_sgprs, vgpr_comp_cnt};
+        in.compute_rsrc2 = compute_rsrc2;
         auto prog = Shader::BuildProgram(in);
         if (!prog) {
             ReportOnce("cannot decode shader at " + std::to_string(addr));
@@ -388,7 +390,7 @@ struct MetalRenderer::Impl {
         if (dump_dir) {
             char path[512];
             std::snprintf(path, sizeof(path), "%s/%s_%016llx_%016llx.metal", dump_dir,
-                          p.stage == Stage::Vertex ? "vs" : "ps", p.hash, key);
+                          p.stage == Stage::Vertex ? "vs" : p.stage == Stage::Fragment ? "ps" : "cs", p.hash, key);
             std::ofstream(path) << src;
         }
         id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
@@ -435,7 +437,7 @@ struct MetalRenderer::Impl {
     }
 
     // Decodes a T# and returns a Metal texture for it.
-    id<MTLTexture> GetTexture(const u32 t[8], TextureType* type_out) {
+    id<MTLTexture> GetTexture(const u32 t[8], TextureType* type_out, bool storage = false) {
         const u64 addr = (u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8;
         const u32 dfmt = (t[1] >> 20) & 0x3F;
         const u32 nfmt = (t[1] >> 26) & 0xF;
@@ -465,6 +467,18 @@ struct MetalRenderer::Impl {
         auto rt = color_targets.find(addr);
         if (rt != color_targets.end() && tt.dim == TexDim::Tex2D) {
             return rt->second.tex;
+        }
+        if (storage) {
+            // Written by shaders: keep it GPU-side like a render target, so
+            // later draws sample what the compute pass produced.
+            if (tt.dim != TexDim::Tex2D || fi.format == MTLPixelFormatInvalid || fi.compressed) {
+                ReportOnce("storage image type/format not supported");
+                return Dummy(tt);
+            }
+            const MTLPixelFormat f = fi.format == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm : fi.format;
+            RenderTarget& target = GetColorTarget(addr, f, width, height);
+            target.initialized = true;
+            return target.tex;
         }
 
         if (fi.format == MTLPixelFormatInvalid) {
@@ -584,7 +598,8 @@ struct MetalRenderer::Impl {
                                                                                          width:width
                                                                                         height:height
                                                                                      mipmapped:NO];
-            d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+            d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+                      MTLTextureUsagePixelFormatView;
             d.storageMode = MTLStorageModePrivate;
             rt = {[device newTextureWithDescriptor:d], addr, width, height, false};
             DC_INFO("gpu: render target %#llx %ux%u fmt %lu", addr, width, height, (unsigned long)fmt);
@@ -658,8 +673,33 @@ struct MetalRenderer::Impl {
         return st;
     }
 
+    struct Bound {
+        id<MTLTexture> tex;
+        id<MTLSamplerState> smp;
+    };
+    // Evaluates each image instruction's descriptors against the user data.
+    void Resolve(const Program& p, const u32* ud, std::vector<TextureType>& types, std::vector<Bound>& out) {
+        for (const auto& img : p.images) {
+            u32 t[8], s[4] = {};
+            for (u32 k = 0; k < 8; ++k) {
+                t[k] = Shader::ResolveSgpr(img.tsharp[k], ud);
+            }
+            if (img.has_sampler) {
+                for (u32 k = 0; k < 4; ++k) {
+                    s[k] = Shader::ResolveSgpr(img.ssharp[k], ud);
+                }
+            }
+            TextureType tt;
+            id<MTLTexture> tex = GetTexture(t, &tt, img.storage);
+            types.push_back(tt);
+            out.push_back({tex, img.has_sampler ? GetSampler(s) : nil});
+        }
+    }
+
     void Draw(const RegFile& r, const DrawCall& dc);
+    void Dispatch(const RegFile& r, u32 x, u32 y, u32 z);
     void Flip(const FlipInfo& f);
+    std::unordered_map<u64, id<MTLComputePipelineState>> compute_pipelines;
 
     // DC_DEBUG_MEMTEST: reads `addr` through the shader memory path and
     // compares with what the CPU sees.
@@ -839,32 +879,11 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     }
 
     // ---- resources ----
-    struct Bound {
-        id<MTLTexture> tex;
-        id<MTLSamplerState> smp;
-    };
-    auto resolve = [&](const Program& p, const u32* ud, std::vector<TextureType>& types, std::vector<Bound>& out) {
-        for (const auto& img : p.images) {
-            u32 t[8], s[4] = {};
-            for (u32 k = 0; k < 8; ++k) {
-                t[k] = Shader::ResolveSgpr(img.tsharp[k], ud);
-            }
-            if (img.has_sampler) {
-                for (u32 k = 0; k < 4; ++k) {
-                    s[k] = Shader::ResolveSgpr(img.ssharp[k], ud);
-                }
-            }
-            TextureType tt;
-            id<MTLTexture> tex = GetTexture(t, &tt);
-            types.push_back(tt);
-            out.push_back({tex, img.has_sampler ? GetSampler(s) : nil});
-        }
-    };
     std::vector<TextureType> vs_types, ps_types;
     std::vector<Bound> vs_res, ps_res;
-    resolve(*vs, vs_ud, vs_types, vs_res);
+    Resolve(*vs, vs_ud, vs_types, vs_res);
     if (ps) {
-        resolve(*ps, ps_ud, ps_types, ps_res);
+        Resolve(*ps, ps_ud, ps_types, ps_res);
     }
 
     // ---- functions ----
@@ -1150,6 +1169,82 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
                   baseInstance:0];
 }
 
+void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
+    const u64 addr = r.ProgramAddr(Reg::COMPUTE_PGM_LO);
+    const u32 rsrc2 = r[Reg::COMPUTE_PGM_RSRC2];
+    const u32* ud = r.UserData(Reg::COMPUTE_USER_DATA_0);
+    const u32 tx = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_X] & 0xFFFF);
+    const u32 ty = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_Y] & 0xFFFF);
+    const u32 tz = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_Z] & 0xFFFF);
+    if (trace) {
+        DC_INFO("gpu: dispatch cs=%#llx groups %ux%ux%u threads %ux%ux%u rsrc2=%#x", addr, gx, gy, gz, tx, ty, tz, rsrc2);
+    }
+    if (!addr || !gx || !gy || !gz) {
+        return;
+    }
+    Program* cs = GetProgram(Stage::Compute, addr, ud, Bits(rsrc2, 1, 5), Bits(rsrc2, 11, 2), rsrc2);
+    if (!cs) {
+        return;
+    }
+    std::vector<TextureType> types;
+    std::vector<Bound> res;
+    Resolve(*cs, ud, types, res);
+
+    Shader::MslOptions o;
+    o.textures = types;
+    u64 key = Hash(cs->hash);
+    key = Hash(rsrc2, key);
+    key = Fnv(types.data(), types.size() * sizeof(TextureType), key);
+    id<MTLFunction> fn = GetFunction(*cs, o, key);
+    if (!fn) {
+        return;
+    }
+    const u32 group = tx * ty * tz;
+    const u64 pkey = Hash(group, key);
+    id<MTLComputePipelineState> pso = nil;
+    if (auto it = compute_pipelines.find(pkey); it != compute_pipelines.end()) {
+        pso = it->second;
+    } else {
+        MTLComputePipelineDescriptor* d = [MTLComputePipelineDescriptor new];
+        d.computeFunction = fn;
+        d.maxTotalThreadsPerThreadgroup = group; // the guest's group size must fit as is
+        NSError* err = nil;
+        pso = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:&err];
+        if (!pso) {
+            DC_ERROR("gpu: compute pipeline %#llx: %s", addr, err ? err.localizedDescription.UTF8String : "?");
+        } else if (pso.maxTotalThreadsPerThreadgroup < group) {
+            DC_ERROR("gpu: compute shader %#llx needs %u threads per group, Metal allows %lu", addr, group,
+                     (unsigned long)pso.maxTotalThreadsPerThreadgroup);
+            pso = nil;
+        }
+        compute_pipelines[pkey] = pso;
+    }
+    if (!pso) {
+        return;
+    }
+
+    EndPass();
+    EnsureCommandBuffer();
+    UpdateMemMap();
+    id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+    [e setComputePipelineState:pso];
+    [e setBytes:ud length:64 atIndex:Shader::Binding::UserData];
+    [e setBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
+    [e setBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
+    [e setBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
+    for (u32 k = 0; k < res.size(); ++k) {
+        [e setTexture:res[k].tex atIndex:k];
+        if (res[k].smp) {
+            [e setSamplerState:res[k].smp atIndex:k];
+        }
+    }
+    // LDS_SIZE is in 128-dword units on CI; Metal wants a multiple of 16 bytes.
+    const u32 lds = std::max<u32>(16, Bits(rsrc2, 15, 9) * 512);
+    [e setThreadgroupMemoryLength:std::min<u32>(lds, 32768) atIndex:0];
+    [e dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+    [e endEncoding];
+}
+
 void MetalRenderer::Impl::Flip(const FlipInfo& f) {
     ++frame_count;
     EndPass();
@@ -1248,7 +1343,9 @@ void MetalRenderer::Draw(const RegFile& regs, const DrawCall& draw) {
 
 void MetalRenderer::Dispatch(const RegFile& regs, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     std::scoped_lock lk(impl->lock);
-    impl->ReportOnce("compute dispatches are not implemented yet");
+    @autoreleasepool {
+        impl->Dispatch(regs, x, y, z);
+    }
 }
 
 void MetalRenderer::OnSubmit() {

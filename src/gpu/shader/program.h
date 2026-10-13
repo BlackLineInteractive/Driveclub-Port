@@ -51,7 +51,8 @@ struct Program {
     int fetch_ud = -1;     // user-data index holding its address
     u64 hash = 0;         // of the code bytes (plus fetch code)
     u32 num_user_sgprs = 0;
-    u32 vgpr_comp_cnt = 0; // VS: how many system VGPRs follow the vertex index
+    u32 vgpr_comp_cnt = 0; // VS: system VGPRs after the vertex index; CS: TIDIG_COMP_CNT
+    u32 compute_rsrc2 = 0; // CS: COMPUTE_PGM_RSRC2 (system SGPR enables, LDS size)
 
     std::vector<Gcn::Inst> code;
     std::vector<u32> labels; // byte offsets that need a case label (sorted)
@@ -84,6 +85,7 @@ struct BuildInput {
     u32 num_user_sgprs;
     u32 vgpr_comp_cnt;
     const u32* code = nullptr; // tools: decode from here instead of guest memory
+    u32 compute_rsrc2 = 0;
 };
 
 // Decodes and analyzes a program. Returns null if the code is unreadable.

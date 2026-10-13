@@ -184,7 +184,7 @@ private:
         if (p.stage == Stage::Fragment) {
             Line("if (!dc_exported) discard_fragment();");
         }
-        Line("return out;");
+        Line(p.stage == Stage::Compute ? "return;" : "return out;");
     }
 
     std::string AttrExpr(u32 attr, u32 chan);
@@ -579,9 +579,13 @@ void Emitter::EmitVop(const Inst& i) {
     case Vop::V_MADAK_F32: SetVF(i, f(0) + " * " + f(1) + " + as_type<float>(" + Hex(i.literal) + ")"); break;
     case Vop::V_BCNT_U32_B32: SetV(i.dst, "popcount(" + u(0) + ") + " + u(1)); break;
     // Lane counting needs the real wave; per-lane execution sees itself as lane 0.
+    // Counting active lanes below this one. Masks are per-lane here, so
+    // assume a full mask (the common "lane id" idiom); compute knows its lane.
     case Vop::V_MBCNT_LO_U32_B32:
+        SetV(i.dst, p.stage == Stage::Compute ? "min(dc_lane, 32u) + " + u(1) : u(1));
+        break;
     case Vop::V_MBCNT_HI_U32_B32:
-        SetV(i.dst, u(1));
+        SetV(i.dst, p.stage == Stage::Compute ? "(max(dc_lane, 32u) - 32u) + " + u(1) : u(1));
         break;
     case Vop::V_ADD_I32: carry_add(u(0), u(1), ""); break;
     case Vop::V_SUB_I32: borrow_sub(u(0), u(1), ""); break;
@@ -675,7 +679,9 @@ void Emitter::EmitVop(const Inst& i) {
     case Vop::V_MOV_FED_B32:
         SetV(i.dst, u(0));
         break;
-    case Vop::V_READFIRSTLANE_B32: SetS(i.dst, u(0)); break;
+    case Vop::V_READFIRSTLANE_B32:
+        SetS(i.dst, p.stage == Stage::Compute ? "simd_broadcast_first(" + u(0) + ")" : u(0));
+        break;
     case Vop::V_CVT_F32_I32: SetVF(i, "float(" + s(0) + ")"); break;
     case Vop::V_CVT_F32_U32: SetVF(i, "float(" + u(0) + ")"); break;
     case Vop::V_CVT_U32_F32: SetV(i.dst, "dc_cvt_u32(" + f(0) + ")"); break;
@@ -773,7 +779,111 @@ void Emitter::EmitDs(const Inst& i) {
             return;
         }
     }
-    Unsupported(i);
+    if (p.stage != Stage::Compute) {
+        Unsupported(i);
+        return;
+    }
+    // LDS: `lds` is the threadgroup memory as dwords; addresses are bytes.
+    const std::string a = VName(i.vaddr);
+    const u32 off16 = (u32(i.offset1) << 8) | i.offset0;
+    const std::string guard = p.writes_exec ? "if (exec_lo != 0u) " : "";
+    auto at = [&](u32 byte_off) { return "lds[(" + a + " + " + N(byte_off) + "u) >> 2]"; };
+    auto atomic = [&](const char* fn, bool rtn, bool sign) {
+        const std::string ty = sign ? "threadgroup atomic_int*" : "threadgroup atomic_uint*";
+        const std::string val = sign ? "int(" + VName(i.data0) + ")" : VName(i.data0);
+        const std::string call = std::string(fn) + "((" + ty + ")&" + at(off16) + ", " + val + ", memory_order_relaxed)";
+        if (rtn) {
+            SetV(i.dst, "uint(" + call + ")");
+        } else {
+            Line(guard + "(void)" + call + ";");
+        }
+    };
+    switch (static_cast<Ds>(i.op)) {
+    case Ds::DS_WRITE_B32: Line(guard + at(off16) + " = " + VName(i.data0) + ";"); break;
+    case Ds::DS_WRITE2_B32:
+    case Ds::DS_WRITE2ST64_B32: {
+        const u32 scale = static_cast<Ds>(i.op) == Ds::DS_WRITE2ST64_B32 ? 256 : 4;
+        Line(guard + "{ " + at(i.offset0 * scale) + " = " + VName(i.data0) + "; " + at(i.offset1 * scale) + " = " +
+             VName(i.data1) + "; }");
+        break;
+    }
+    case Ds::DS_WRITE_B64:
+        Line(guard + "{ " + at(off16) + " = " + VName(i.data0) + "; " + at(off16 + 4) + " = " + VName(i.data0 + 1u) + "; }");
+        break;
+    case Ds::DS_WRITE2_B64:
+        Line(guard + "{ " + at(i.offset0 * 8) + " = " + VName(i.data0) + "; " + at(i.offset0 * 8 + 4) + " = " +
+             VName(i.data0 + 1u) + "; " + at(i.offset1 * 8) + " = " + VName(i.data1) + "; " + at(i.offset1 * 8 + 4) +
+             " = " + VName(i.data1 + 1u) + "; }");
+        break;
+    case Ds::DS_WRITE_B96:
+    case Ds::DS_WRITE_B128: {
+        const u32 n = static_cast<Ds>(i.op) == Ds::DS_WRITE_B96 ? 3 : 4;
+        std::string w = guard + "{ ";
+        for (u32 k = 0; k < n; ++k) {
+            w += at(off16 + 4 * k) + " = " + VName(i.data0 + k) + "; ";
+        }
+        Line(w + "}");
+        break;
+    }
+    case Ds::DS_WRITE_B8:
+        Line(guard + "((threadgroup uchar*)lds)[" + a + " + " + N(off16) + "u] = uchar(" + VName(i.data0) + ");");
+        break;
+    case Ds::DS_WRITE_B16:
+        Line(guard + "((threadgroup ushort*)lds)[(" + a + " + " + N(off16) + "u) >> 1] = ushort(" + VName(i.data0) + ");");
+        break;
+    case Ds::DS_READ_B32: SetV(i.dst, at(off16)); break;
+    case Ds::DS_READ2_B32:
+    case Ds::DS_READ2ST64_B32: {
+        const u32 scale = static_cast<Ds>(i.op) == Ds::DS_READ2ST64_B32 ? 256 : 4;
+        Line("{ uint r0_ = " + at(i.offset0 * scale) + ", r1_ = " + at(i.offset1 * scale) + ";");
+        SetV(i.dst, "r0_");
+        SetV(i.dst + 1u, "r1_");
+        Line("}");
+        break;
+    }
+    case Ds::DS_READ_B64:
+    case Ds::DS_READ_B96:
+    case Ds::DS_READ_B128: {
+        const u32 n = static_cast<Ds>(i.op) == Ds::DS_READ_B64 ? 2 : static_cast<Ds>(i.op) == Ds::DS_READ_B96 ? 3 : 4;
+        std::string r = "{ uint r_[4] = {";
+        for (u32 k = 0; k < n; ++k) {
+            r += (k ? ", " : "") + at(off16 + 4 * k);
+        }
+        Line(r + "};");
+        for (u32 k = 0; k < n; ++k) {
+            SetV(i.dst + k, "r_[" + N(k) + "]");
+        }
+        Line("}");
+        break;
+    }
+    case Ds::DS_READ2_B64:
+        Line("{ uint r_[4] = {" + at(i.offset0 * 8) + ", " + at(i.offset0 * 8 + 4) + ", " + at(i.offset1 * 8) + ", " +
+             at(i.offset1 * 8 + 4) + "};");
+        for (u32 k = 0; k < 4; ++k) {
+            SetV(i.dst + k, "r_[" + N(k) + "]");
+        }
+        Line("}");
+        break;
+    case Ds::DS_READ_U8: SetV(i.dst, "uint(((threadgroup uchar*)lds)[" + a + " + " + N(off16) + "u])"); break;
+    case Ds::DS_READ_I8: SetV(i.dst, "uint(int(((threadgroup char*)lds)[" + a + " + " + N(off16) + "u]))"); break;
+    case Ds::DS_READ_U16:
+        SetV(i.dst, "uint(((threadgroup ushort*)lds)[(" + a + " + " + N(off16) + "u) >> 1])");
+        break;
+    case Ds::DS_READ_I16:
+        SetV(i.dst, "uint(int(((threadgroup short*)lds)[(" + a + " + " + N(off16) + "u) >> 1]))");
+        break;
+    case Ds::DS_ADD_U32: atomic("atomic_fetch_add_explicit", false, false); break;
+    case Ds::DS_ADD_RTN_U32: atomic("atomic_fetch_add_explicit", true, false); break;
+    case Ds::DS_SUB_U32: atomic("atomic_fetch_sub_explicit", false, false); break;
+    case Ds::DS_MIN_I32: atomic("atomic_fetch_min_explicit", false, true); break;
+    case Ds::DS_MAX_I32: atomic("atomic_fetch_max_explicit", false, true); break;
+    case Ds::DS_MIN_U32: atomic("atomic_fetch_min_explicit", false, false); break;
+    case Ds::DS_MAX_U32: atomic("atomic_fetch_max_explicit", false, false); break;
+    case Ds::DS_AND_B32: atomic("atomic_fetch_and_explicit", false, false); break;
+    case Ds::DS_OR_B32: atomic("atomic_fetch_or_explicit", false, false); break;
+    case Ds::DS_XOR_B32: atomic("atomic_fetch_xor_explicit", false, false); break;
+    default: Unsupported(i); break;
+    }
 }
 
 void Emitter::EmitBuffer(const Inst& i) {
@@ -910,12 +1020,35 @@ void Emitter::EmitImage(const Inst& i) {
         Line("}");
         return;
     }
+    const bool storage = slot < p.images.size() && p.images[slot].storage;
+    auto int_coord = [&](u32 a) {
+        if (tt.dim == TexDim::Tex2D) return "uint2(" + VName(a) + ", " + VName(a + 1) + ")";
+        if (tt.dim == TexDim::Tex2DArray) return "uint2(" + VName(a) + ", " + VName(a + 1) + "), " + VName(a + 2);
+        return "uint3(" + VName(a) + ", " + VName(a + 1) + ", " + VName(a + 2) + ")";
+    };
+    if (op == Mimg::IMAGE_STORE || op == Mimg::IMAGE_STORE_MIP) {
+        // Data registers hold the components selected by dmask, in order.
+        std::string comps[4] = {"0u", "0u", "0u", "0u"};
+        u32 n = 0;
+        for (u32 k = 0; k < 4; ++k) {
+            if (i.dmask & (1u << k)) {
+                comps[k] = VName(i.vdata + n++);
+            }
+        }
+        std::string value;
+        if (tt.sample == TexSample::Float) {
+            value = "float4(as_type<float>(" + comps[0] + "), as_type<float>(" + comps[1] + "), as_type<float>(" +
+                    comps[2] + "), as_type<float>(" + comps[3] + "))";
+        } else {
+            value = std::string(vec) + "(uint4(" + comps[0] + ", " + comps[1] + ", " + comps[2] + ", " + comps[3] + "))";
+        }
+        Line((p.writes_exec ? "if (exec_lo != 0u) " : "") + t + ".write(" + value + ", " + int_coord(i.vaddr) + ");");
+        return;
+    }
     if (op == Mimg::IMAGE_LOAD || op == Mimg::IMAGE_LOAD_MIP) {
         const u32 a = i.vaddr;
-        std::string coord, lod = op == Mimg::IMAGE_LOAD_MIP ? VName(a + (tt.dim == TexDim::Tex2D ? 2u : 3u)) : "0u";
-        if (tt.dim == TexDim::Tex2D) coord = "uint2(" + VName(a) + ", " + VName(a + 1) + "), " + lod;
-        else if (tt.dim == TexDim::Tex2DArray) coord = "uint2(" + VName(a) + ", " + VName(a + 1) + "), " + VName(a + 2) + ", " + lod;
-        else coord = "uint3(" + VName(a) + ", " + VName(a + 1) + ", " + VName(a + 2) + "), " + lod;
+        std::string lod = op == Mimg::IMAGE_LOAD_MIP ? VName(a + (tt.dim == TexDim::Tex2D ? 2u : 3u)) : "0u";
+        std::string coord = int_coord(a) + (storage ? "" : ", " + lod);
         Line(std::string("{ ") + vec + " r_ = " + t + ".read(" + coord + ");");
         write_dmask("r_");
         Line("}");
@@ -1094,7 +1227,9 @@ std::string Emitter::TexParams(bool entry) const {
         const TextureType tt = k < o.textures.size() ? o.textures[k] : TextureType{};
         const char* comp = tt.sample == TexSample::Float ? "float" : tt.sample == TexSample::Uint ? "uint" : "int";
         const char* kind = tt.dim == TexDim::Tex2D ? "texture2d" : tt.dim == TexDim::Tex2DArray ? "texture2d_array" : "texture3d";
-        s += std::string(", ") + kind + "<" + comp + "> t" + N(k);
+        // Images the shader writes are bound read_write (no sampling then).
+        const std::string access = p.images[k].storage ? ", access::read_write" : "";
+        s += std::string(", ") + kind + "<" + comp + access + "> t" + N(k);
         if (entry) s += " [[texture(" + N(k) + ")]]";
         if (p.images[k].has_sampler) {
             s += ", sampler smp" + N(k);
@@ -1132,8 +1267,25 @@ std::string Emitter::Run() {
     std::string decl;
     auto dl = [&](const std::string& s) { decl += "    " + s + "\n"; };
     const u32 nud = std::min<u32>(p.num_user_sgprs, 16);
+    std::vector<std::string> sinit(std::max<u32>(max_sgpr, nud + 4), "0u");
+    for (u32 k = 0; k < nud; ++k) {
+        sinit[k] = "ud[" + N(k) + "]";
+    }
+    if (p.stage == Stage::Compute) {
+        // COMPUTE_PGM_RSRC2: TGID_X/Y/Z_EN and TG_SIZE_EN append system SGPRs.
+        u32 k = nud;
+        static const char* ids[3] = {"dc_gid.x", "dc_gid.y", "dc_gid.z"};
+        for (u32 c = 0; c < 3; ++c) {
+            if (p.compute_rsrc2 & (1u << (7 + c))) {
+                sinit[k++] = ids[c];
+            }
+        }
+        if (p.compute_rsrc2 & (1u << 10)) {
+            sinit[k++] = "0u"; // TG_SIZE: wave index within the group
+        }
+    }
     for (u32 k = 0; k < std::max(max_sgpr, nud); ++k) {
-        dl("uint s" + N(k) + " = " + (k < nud ? "ud[" + N(k) + "]" : std::string("0u")) + ";");
+        dl("uint s" + N(k) + " = " + sinit[k] + ";");
     }
     dl("uint vcc_lo = 0u, vcc_hi = 0u, exec_lo = 0xffffffffu, exec_hi = 0xffffffffu, m0r = 0u, dc_null = 0u;");
     dl("bool scc = false;");
@@ -1142,6 +1294,11 @@ std::string Emitter::Run() {
         if (!vinit.empty()) vinit[0] = "vid";
         for (u32 k = 1; k <= 3 && k < vinit.size(); ++k) {
             if (k <= p.vgpr_comp_cnt) vinit[k] = "iid";
+        }
+    } else if (p.stage == Stage::Compute) {
+        static const char* ids[3] = {"dc_tid.x", "dc_tid.y", "dc_tid.z"};
+        for (u32 k = 0; k < 3 && k < vinit.size(); ++k) {
+            if (k <= p.vgpr_comp_cnt) vinit[k] = ids[k];
         }
     } else if (p.stage == Stage::Fragment) {
         // System inputs follow the enabled barycentrics in SPI_PS_INPUT_ADDR order.
@@ -1170,7 +1327,7 @@ std::string Emitter::Run() {
     if (p.has_branches) {
         wrapped = "    uint pc_ = 0u;\n    while (true) {\n    switch (pc_) {\n    case 0u:\n" + body +
                   "    default:\n        " + (p.stage == Stage::Fragment ? "if (!dc_exported) discard_fragment(); " : "") +
-                  "return out;\n    }\n    }\n";
+                  (p.stage == Stage::Compute ? "return;" : "return out;") + "\n    }\n    }\n";
     } else {
         wrapped = body;
     }
@@ -1248,6 +1405,13 @@ std::string Emitter::Run() {
         src += "    DcMem mem = {gm0, gm1, &gmap};\n    PsOut out = {};\n    bool dc_exported = false;\n";
         src += "    uint dc_qlane = (uint(pin.pos.x) & 1u) | ((uint(pin.pos.y) & 1u) << 1);\n";
         src += "    (void)mem; (void)dc_qlane;\n";
+        src += decl + wrapped + "}\n";
+    } else {
+        src += "kernel void main0(uint3 dc_tid [[thread_position_in_threadgroup]], "
+               "uint3 dc_gid [[threadgroup_position_in_grid]], uint dc_lidx [[thread_index_in_threadgroup]], " +
+               mem_params + ", threadgroup uint* lds [[threadgroup(0)]]" + TexParams(true) + ") {\n";
+        src += "    DcMem mem = {gm0, gm1, &gmap};\n    uint dc_lane = dc_lidx & 63u;\n";
+        src += "    (void)mem; (void)dc_lane; (void)lds;\n";
         src += decl + wrapped + "}\n";
     }
     return src;

@@ -26,7 +26,7 @@ bool Query(VAddr, bool, Vma*) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: gcn_dis <shader.bin> [vs|ps] [--msl]\n");
+        std::fprintf(stderr, "usage: gcn_dis <shader.bin> [vs|ps|cs] [--msl]\n");
         return 1;
     }
     std::ifstream f(argv[1], std::ios::binary);
@@ -36,10 +36,13 @@ int main(int argc, char** argv) {
 
     using namespace Gpu::Shader;
     const bool ps = argc > 2 && std::strcmp(argv[2], "ps") == 0;
+    const bool cs = argc > 2 && std::strcmp(argv[2], "cs") == 0;
     const bool print_msl = argc > 3 && std::strcmp(argv[3], "--msl") == 0;
 
     u32 ud[16] = {};
-    BuildInput in{ps ? Stage::Fragment : Stage::Vertex, 0x10000000, ud, 16, 3, code.data()};
+    BuildInput in{cs ? Stage::Compute : ps ? Stage::Fragment : Stage::Vertex, 0x10000000, ud, 16, cs ? 2u : 3u,
+                  code.data()};
+    in.compute_rsrc2 = cs ? (7u << 7) : 0; // tests: all group ids enabled
     auto prog = BuildProgram(in);
     if (!prog) {
         std::fprintf(stderr, "cannot decode\n");
