@@ -13,6 +13,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -125,7 +126,7 @@ public:
                    EmulatorSettings.IsVkCrashDiagnosticEnabled()},
           draw_scheduler{instance}, present_scheduler{instance}, swapchain{instance, window},
           runtime{instance, draw_scheduler},
-          rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, &liverpool)},
+          rasterizer{MakeRasterizer()},
           texture_cache{rasterizer->GetTextureCache()},
           waiter{std::make_unique<Waiter>(*draw_scheduler.GetWorkSemaphore())} {
         // Installs the write-watch fault handler before any page is watched.
@@ -432,6 +433,19 @@ public:
     }
 
 private:
+    // shadPS4's buffer cache backs guest memory with sparse buffers; fail with
+    // a clear message where the driver cannot (MoltenVK, llvmpipe on macOS).
+    std::unique_ptr<Rasterizer> MakeRasterizer() {
+        const auto features = instance.GetPhysicalDevice().getFeatures();
+        if (!features.sparseBinding || !features.sparseResidencyBuffer) {
+            throw std::runtime_error(fmt::format(
+                "Vulkan renderer: {} has no sparse buffer support (sparseBinding/"
+                "sparseResidencyBuffer), which shadPS4's buffer cache needs",
+                instance.GetModelName()));
+        }
+        return std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, &liverpool);
+    }
+
     void EnterGpuThread() {
         if (!gpu_thread_set) {
             liverpool.DcSetGpuThread();

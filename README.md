@@ -23,7 +23,7 @@ Sony HLE libraries ── libkernel, libc, Pad, AudioOut, VideoOut, Network/PSN 
 GPU frontend ── PM4 packet parsing, register state, GCN shaders -> IR
    │  src/gpu/renderer.h  (shared interface)
    ├──► Metal 3 (macOS)  - src/gpu/metal, IR -> MSL directly
-   └──► Vulkan (Windows/Linux) - shadPS4 renderer can be integrated
+   └──► Vulkan (Windows/Linux) - src/gpu/vulkan: shadPS4's renderer (third_party/shadps4)
 ```
 
 Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the command buffer itself and passes only the finished buffer to the driver (`sceGnmDraw*` are not imported). Therefore, the GPU layer operates at the PM4 + GCN shader level.
@@ -49,6 +49,26 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ./build/driveclub
 ```
+
+### Vulkan renderer
+
+`src/gpu/vulkan` puts shadPS4's Vulkan renderer (`video_core` + `shader_recompiler`,
+vendored in `third_party/shadps4`) behind the same `Gpu::Renderer` interface; our PM4
+command processor stays the front end. It is built when a Vulkan loader is found
+(`-DDC_ENABLE_VULKAN=ON/OFF`) and selected at run time with `DC_RENDERER=vulkan`.
+
+- Extra build dependencies: Vulkan loader + headers and `glslang` (`brew install vulkan-loader
+  vulkan-headers glslang molten-vk`). The other libraries (sirit, VMA, Boost headers, fmt,
+  magic_enum, robin-map, xbyak, Zydis, half, xxHash, miniz, Tracy headers) are taken from
+  system packages, from a shadPS4 checkout's `externals` (`DC_SHADPS4_EXTERNALS`, default
+  `./shadps4/externals`) or fetched by CMake.
+- The GPU needs sparse buffers (`sparseResidencyBuffer`) and `robustness2`: desktop AMD,
+  NVIDIA and Intel drivers on Windows/Linux have them; MoltenVK on Intel Macs does not, so
+  there the renderer stops with an error after creating the device.
+- Windows/Linux builds still need the core (`src/core`: loader, memory, signals, TLS) ported;
+  it is macOS-only for now.
+- Options: `DC_VK_GPU=<index>`, `DC_VK_VALIDATION=1`, `DC_VK_MARKERS=1`, `DC_VK_DUMP_SHADERS=1`,
+  `DC_VK_READBACKS=0|1|2`, `DC_VK_LOG=debug`.
 
 ## Game Files
 
@@ -78,7 +98,7 @@ This project is licensed under the **GNU General Public License v2.0 or later (G
 
 ## Acknowledgments
 
-- [shadPS4](https://github.com/shadps4-emu/shadPS4) - PS4 emulator, the primary source of knowledge on ELF loading, HLE libraries, PM4, and GCN shader recompilation. Its Vulkan renderer can serve as a backend for Windows/Linux. Note: shadPS4 is distributed under GPL-2.0.
+- [shadPS4](https://github.com/shadps4-emu/shadPS4) - PS4 emulator, the primary source of knowledge on ELF loading, HLE libraries, PM4, and GCN shader recompilation. Its Vulkan renderer and shader recompiler are the Vulkan backend here (`third_party/shadps4`, GPL-2.0-or-later; see its README for the local changes).
 - [OpenGNM](https://ps4-opengnm.github.io/opengnm/) - documentation on PS4 Gnm and GCN shaders.
 
 ## Community & Support

@@ -308,6 +308,12 @@ s32 sceFontRenderCharGlyphImageHorizontal(FontState* f, u32 code, RenderSurface*
         return kErrorInvalidParameter;
     }
     std::scoped_lock lk(g_lock);
+    static u64 rendered = 0;
+    if (++rendered <= 3 || rendered % 500 == 0) {
+        DC_INFO("font: glyph %llu: U+%04X at (%.1f, %.1f) %.1fx%.1f px into %dx%d surface %p (%d B/px)",
+                (unsigned long long)rendered, code, x, y, f->scale_w, f->scale_h, s->width, s->height, s->buffer,
+                s->pixel_size_byte);
+    }
     CTFontRef font = Sized(*f);
     CGGlyph glyph;
     if (!GlyphFor(font, code, &glyph)) {

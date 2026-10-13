@@ -294,6 +294,8 @@ int main(int argc, char** argv) {
         return Run(argc, argv);
     } catch (const std::exception& e) {
         DC_ERROR("fatal: %s", e.what());
-        return 1;
+        // Guest threads may be running: do not run static destructors under them.
+        std::fflush(nullptr);
+        std::_Exit(1);
     }
 }
