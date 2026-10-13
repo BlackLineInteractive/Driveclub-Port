@@ -350,6 +350,7 @@ s32 sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_ptrs[], const u32 dcb_s
 // Runs after the frame's command buffers: show the buffer, then tell the game.
 void FlipOnGpuThread(u32 vo_handle, u32 buf_idx, s64 flip_arg) {
     auto& vo = VideoOut::Driver::Instance();
+    vo.WaitFlipVblank(static_cast<s32>(vo_handle));
     if (auto* r = Instance().GetRenderer()) {
         const Gpu::FlipInfo flip = vo.GetFlipInfo(static_cast<s32>(vo_handle), buf_idx);
         if (flip.address) {

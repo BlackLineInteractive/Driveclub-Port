@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -61,6 +63,9 @@ public:
     void OnFlipDone(s32 handle, u32 buf_idx, s64 flip_arg);
 
     Gpu::FlipInfo GetFlipInfo(s32 handle, u32 buf_idx);
+    // Blocks until the vblank this port's next flip may happen on (honours
+    // sceVideoOutSetFlipRate), like the console's vsync'd flip queue.
+    void WaitFlipVblank(s32 handle);
     s32 GetVblankStatus(s32 handle, SceVideoOutVblankStatus* status);
 
     static Driver& Instance();
@@ -76,12 +81,14 @@ private:
         s32 prev_buffer = -1;
         u64 flip_count = 0;
         u64 vblank_count = 0;
+        u64 last_flip_vblank = 0;
         SceVideoOutVblankStatus vblank_status{};
         std::vector<Kernel::EventQueue*> flip_queues;
         std::vector<Kernel::EventQueue*> vblank_queues;
     };
 
     std::mutex lock;
+    std::condition_variable vblank_cv;
     std::array<Port, 4> ports;
     std::jthread vblank_thread;
 };

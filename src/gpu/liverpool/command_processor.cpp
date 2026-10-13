@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include <pthread.h>
@@ -17,6 +18,11 @@ namespace {
 
 // EVENT_WRITE_EOP / RELEASE_MEM data and interrupt selects.
 enum DataSel : u32 { kDataNone = 0, kData32 = 1, kData64 = 2, kGpuClock = 3, kPerfCounter = 4 };
+// NOP payload markers the Gnm driver uses for flip requests.
+constexpr u32 kNopPrepareFlipLabel = 0x68750778;
+constexpr u32 kNopPrepareFlipInterrupt = 0x68750780;
+constexpr u32 kNopPrepareFlipInterruptLabel = 0x68750781;
+
 enum IntSel : u32 { kIntNone = 0, kIntOnly = 1, kIntWriteConfirm = 2, kIntUndocumented = 3 };
 
 u64 GpuClock() {
@@ -64,6 +70,7 @@ bool Compare(u32 func, u32 value, u32 ref) {
 } // namespace
 
 CommandProcessor::CommandProcessor() {
+    trace = std::getenv("DC_CP_TRACE") != nullptr;
     ClearState();
 }
 
@@ -180,6 +187,15 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
         }
         if (job.after) {
             job.after();
+        }
+        if (flip_label.addr || flip_label.interrupt) {
+            if (flip_label.addr) {
+                *Ptr<u32>(static_cast<u32>(flip_label.addr), static_cast<u32>(flip_label.addr >> 32)) = flip_label.value;
+            }
+            if (flip_label.interrupt) {
+                Interrupt(kIrqGfxEop);
+            }
+            flip_label = {};
         }
         {
             std::scoped_lock lk(ring.lock);
@@ -342,6 +358,13 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
 
         switch (op) {
         case Op::Nop:
+            // The Gnm driver hides flip requests in NOPs: "when this frame is
+            // shown, write `value` to `label` and/or raise the EOP interrupt".
+            if (body_n >= 4 && (body[0] == kNopPrepareFlipLabel || body[0] == kNopPrepareFlipInterruptLabel)) {
+                flip_label = {u64(body[1] & ~3u) | (u64(body[2]) << 32), body[3], body[0] == kNopPrepareFlipInterruptLabel};
+            } else if (body_n >= 1 && body[0] == kNopPrepareFlipInterrupt) {
+                flip_label = {0, 0, true};
+            }
             break;
         case Op::ClearState:
             ClearState();
@@ -476,7 +499,20 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             break;
 
         default:
+            if (trace) {
+                static std::atomic<u64> seen[4]{};
+                const u64 bit = 1ull << (op & 63);
+                if (!(seen[op >> 6].fetch_or(bit) & bit)) {
+                    DC_INFO("gpu: CP%s: unhandled PM4 opcode %#x (%u dwords)", compute ? " compute" : "", op, body_n);
+                }
+            }
             break;
+        }
+        if (trace && (op == Op::EventWriteEop || op == Op::ReleaseMem || op == Op::EventWriteEos ||
+                      op == Op::WriteData || op == Op::DmaData || op == Op::WaitRegMem)) {
+            DC_INFO("gpu: CP%s %#x: %08x %08x %08x %08x %08x %08x", compute ? " compute" : "", op, body[0],
+                    body_n > 1 ? body[1] : 0, body_n > 2 ? body[2] : 0, body_n > 3 ? body[3] : 0,
+                    body_n > 4 ? body[4] : 0, body_n > 5 ? body[5] : 0);
         }
         p += body_n + 1;
     }

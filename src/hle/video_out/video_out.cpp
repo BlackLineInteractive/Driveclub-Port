@@ -1,5 +1,6 @@
 #include "hle/video_out/video_out.h"
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 
@@ -54,6 +55,7 @@ Driver::Driver() {
                     }
                 }
             }
+            vblank_cv.notify_all();
             for (const auto& item : triggers) {
                 item.eq->Trigger(kInternalEventVblank, Kernel::kEvfiltVideoOut, item.data);
             }
@@ -171,6 +173,19 @@ void Driver::OnFlipDone(s32 handle, u32 buf_idx, s64 flip_arg) {
     for (auto* eq : queues) {
         eq->Trigger(kInternalEventFlip, Kernel::kEvfiltVideoOut, data);
     }
+}
+
+void Driver::WaitFlipVblank(s32 handle) {
+    std::unique_lock lk(lock);
+    if (handle <= 0 || static_cast<size_t>(handle) >= ports.size() || !ports[handle].open) {
+        return;
+    }
+    Port& p = ports[handle];
+    // Flip rate 0/1/2 = every 1st/2nd/3rd vblank (60/30/20 Hz).
+    const u64 interval = static_cast<u64>(std::clamp(p.flip_rate, 0, 2)) + 1;
+    const u64 target = std::max(p.last_flip_vblank + interval, p.vblank_count + 1);
+    vblank_cv.wait_for(lk, std::chrono::milliseconds(100), [&] { return p.vblank_count >= target; });
+    p.last_flip_vblank = p.vblank_count;
 }
 
 Gpu::FlipInfo Driver::GetFlipInfo(s32 handle, u32 buf_idx) {

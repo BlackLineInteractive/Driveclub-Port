@@ -117,10 +117,8 @@ s32 sceAudioInClose(s32 handle) {
     return 0;
 }
 
-s32 sceAudioInGetSilentState(s32 handle, s32* state) {
-    if (state) {
-        *state = 0;
-    }
+// Returns the port's silence flags directly (0 = not muted); it has no out parameter.
+s32 sceAudioInGetSilentState(s32 handle) {
     return 0;
 }
 

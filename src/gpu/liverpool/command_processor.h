@@ -113,6 +113,13 @@ private:
     u32 index_size = 2;
     u32 num_instances = 1;
     bool warned_indirect = false;
+    bool trace = false; // DC_CP_TRACE
+    // Flip label requested by the frame being executed; written once it is shown.
+    struct FlipLabel {
+        u64 addr = 0;
+        u32 value = 0;
+        bool interrupt = false;
+    } flip_label;
     Gpu::Renderer* renderer = nullptr;
     Stats stats;
     std::function<void(u32)> on_irq;

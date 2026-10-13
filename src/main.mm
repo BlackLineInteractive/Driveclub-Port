@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -231,7 +232,10 @@ int Run(int argc, char** argv) {
     SDL_Metal_DestroyView(view);
     SDL_DestroyWindow(window);
     SDL_Quit();
-    return 0;
+    // Guest threads and the GPU thread are still running and use the renderer
+    // and HLE state: leave without running destructors under them.
+    std::fflush(nullptr);
+    std::_Exit(0);
 }
 
 } // namespace
