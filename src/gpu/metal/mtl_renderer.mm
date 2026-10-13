@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -12,12 +13,14 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/log.h"
 #include "core/memory.h"
 #include "gpu/liverpool/registers.h"
 #include "gpu/liverpool/tiling.h"
+#include "gpu/metal/mtl_compiler.h"
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_formats.h"
 #include "gpu/shader/msl.h"
@@ -129,8 +132,17 @@ struct MetalRenderer::Impl {
         u32 head[4] = {};
     };
     std::unordered_map<u64, std::vector<ShaderEntry>> shaders;
-    std::unordered_map<u64, id<MTLFunction>> functions;
     std::unordered_map<u64, id<MTLRenderPipelineState>> pipelines;
+
+    // Pipelines compile on `compiler`'s threads; draws whose pipeline is not
+    // ready yet are skipped (DC_SYNC_SHADERS waits instead), dispatches wait.
+    std::unique_ptr<ShaderCompiler> compiler;
+    bool sync_shaders = false;
+    std::unordered_set<u64> pending;
+    std::mutex done_lock;
+    std::condition_variable done_cv;
+    std::vector<std::pair<u64, id<MTLRenderPipelineState>>> done_render;
+    std::vector<std::pair<u64, id<MTLComputePipelineState>>> done_compute;
     std::unordered_map<u32, id<MTLDepthStencilState>> depth_states;
     std::unordered_map<u64, id<MTLSamplerState>> samplers;
 
@@ -172,6 +184,11 @@ struct MetalRenderer::Impl {
     id<MTLBuffer> debug_vs_buf = nil;
     id<MTLFunction> debug_fs = nil;    // DC_DEBUG_FLAT: every pixel shader outputs magenta
     bool trace = false;
+    bool stats = false;                // DC_GPU_STATS: per-second GPU time and submit counts
+    std::atomic<u64> gpu_ns{0};
+    u64 stat_commits = 0, stat_waits = 0, stat_dispatches = 0, stat_draws = 0;
+    double stat_wait_s = 0;
+    std::chrono::steady_clock::time_point stat_t0 = std::chrono::steady_clock::now();
     u64 draw_count = 0;
     std::set<std::string> reported;
 
@@ -194,6 +211,9 @@ struct MetalRenderer::Impl {
             debug_vsout = std::strtoull(v, nullptr, 16);
         }
         trace = std::getenv("DC_GPU_TRACE") != nullptr;
+        sync_shaders = std::getenv("DC_SYNC_SHADERS") != nullptr;
+        stats = std::getenv("DC_GPU_STATS") != nullptr;
+        compiler = std::make_unique<ShaderCompiler>(device, 4);
 
         void* view = Core::Memory::DirectHostView();
         const u64 total = Core::Memory::kDirectSize;
@@ -334,6 +354,12 @@ struct MetalRenderer::Impl {
             chunk = nil;
             chunk_off = 0;
         }
+        if (stats) {
+            ++stat_commits;
+            [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
+              gpu_ns += static_cast<u64>((c.GPUEndTime - c.GPUStartTime) * 1e9);
+            }];
+        }
         [cmd commit];
         last_committed = cmd;
         cmd = nil;
@@ -345,7 +371,12 @@ struct MetalRenderer::Impl {
     // Command buffers on one queue complete in order: the last one is enough.
     void WaitLast() {
         if (last_committed) {
+            const auto t0 = std::chrono::steady_clock::now();
             [last_committed waitUntilCompleted];
+            if (stats) {
+                ++stat_waits;
+                stat_wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            }
             last_committed = nil;
         }
     }
@@ -411,13 +442,10 @@ struct MetalRenderer::Impl {
         return list.back().prog.get();
     }
 
-    id<MTLFunction> GetFunction(const Program& p, const Shader::MslOptions& o, u64 key) {
-        auto it = functions.find(key);
-        if (it != functions.end()) {
-            return it->second;
-        }
+    // MSL for `p`; GPU thread only (reports and dumps).
+    std::string MslSource(const Program& p, const Shader::MslOptions& o, u64 key) {
         std::vector<std::string> unsupported;
-        const std::string src = Shader::GenerateMsl(p, o, &unsupported);
+        std::string src = Shader::GenerateMsl(p, o, &unsupported);
         for (const auto& u : unsupported) {
             ReportOnce("shader op not translated: " + u);
         }
@@ -427,18 +455,33 @@ struct MetalRenderer::Impl {
                           p.stage == Stage::Vertex ? "vs" : p.stage == Stage::Fragment ? "ps" : "cs", p.hash, key);
             std::ofstream(path) << src;
         }
-        MTLCompileOptions* opts = [MTLCompileOptions new];
-        opts.mathMode = MTLMathModeSafe;
-        opts.languageVersion = MTLLanguageVersion3_0;
-        NSError* err = nil;
-        id<MTLLibrary> lib = [device newLibraryWithSource:@(src.c_str()) options:opts error:&err];
-        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
-        if (!fn) {
-            DC_ERROR("gpu: MSL compile failed for shader %#llx: %s", p.address,
-                     err ? err.localizedDescription.UTF8String : "?");
+        return src;
+    }
+
+    // Moves finished pipelines into the caches.
+    void TakeCompiled() {
+        std::scoped_lock lk(done_lock);
+        for (auto& [k, pso] : done_render) {
+            pipelines[k] = pso;
+            pending.erase(k);
         }
-        functions[key] = fn;
-        return fn;
+        for (auto& [k, pso] : done_compute) {
+            compute_pipelines[k] = pso;
+            pending.erase(k);
+        }
+        done_render.clear();
+        done_compute.clear();
+    }
+
+    // Blocks until the pipeline `key` has been compiled.
+    void WaitCompiled(u64 key) {
+        while (pending.count(key)) {
+            {
+                std::unique_lock lk(done_lock);
+                done_cv.wait(lk, [&] { return !done_render.empty() || !done_compute.empty(); });
+            }
+            TakeCompiled();
+        }
     }
 
     // ================= textures =================
@@ -815,6 +858,7 @@ struct MetalRenderer::Impl {
 
 void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     ++draw_count;
+    ++stat_draws;
     const u64 vs_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS);
     const u64 ps_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS);
     const u32 cb_mode = Bits(r[Reg::CB_COLOR_CONTROL], 4, 3);
@@ -936,12 +980,9 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     vs_key = Hash(rect, vs_key);
     vs_key = Hash(capture, vs_key);
     vs_key = Fnv(vs_types.data(), vs_types.size() * sizeof(TextureType), vs_key);
-    id<MTLFunction> vfn = GetFunction(*vs, vo, vs_key);
-
-    id<MTLFunction> ffn = nil;
     u64 ps_key = 0;
+    Shader::MslOptions fo;
     if (ps) {
-        Shader::MslOptions fo;
         for (u32 k = 0; k < 32; ++k) {
             fo.ps_input_cntl[k] = r[Reg::SPI_PS_INPUT_CNTL_0 + k];
         }
@@ -961,11 +1002,6 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         ps_key = Hash(fo.col_format, ps_key);
         ps_key = Fnv(fo.mrt_type.data(), sizeof(fo.mrt_type), ps_key);
         ps_key = Fnv(ps_types.data(), ps_types.size() * sizeof(TextureType), ps_key);
-        ffn = GetFunction(*ps, fo, ps_key);
-    }
-    if (!vfn || (ps && !ffn)) {
-        if (trace) DC_INFO("gpu:   skipped: shader compile failed");
-        return;
     }
 
     // ---- pipeline ----
@@ -979,51 +1015,75 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     pk.write_mask = target_mask;
     pk.depth_fmt = static_cast<u32>(depth_fmt);
     const u64 pkey = Hash(pk);
-    id<MTLRenderPipelineState> pso = nil;
-    if (auto it = pipelines.find(pkey); it != pipelines.end()) {
-        pso = it->second;
-    } else {
-        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
-        d.vertexFunction = vfn;
-        d.fragmentFunction = debug_fs && ffn && out_type[0] == OutType::Float ? debug_fs : ffn;
-        for (u32 k = 0; k < 8; ++k) {
-            if (!colors[k]) {
-                continue;
-            }
-            MTLRenderPipelineColorAttachmentDescriptor* ca = d.colorAttachments[k];
-            ca.pixelFormat = color_fmt[k];
-            const u32 b = pk.blend[k];
-            const u32 wm = (target_mask >> (4 * k)) & 0xF;
-            ca.writeMask = ((wm & 1) ? MTLColorWriteMaskRed : 0) | ((wm & 2) ? MTLColorWriteMaskGreen : 0) |
-                           ((wm & 4) ? MTLColorWriteMaskBlue : 0) | ((wm & 8) ? MTLColorWriteMaskAlpha : 0);
-            const bool blendable = out_type[k] == OutType::Float && color_fmt[k] != MTLPixelFormatRGBA32Float;
-            if ((b >> 30) & 1 && blendable && !debug_fs) {
-                ca.blendingEnabled = YES;
-                ca.sourceRGBBlendFactor = BlendFactor(b & 0x1F);
-                ca.rgbBlendOperation = BlendOp((b >> 5) & 7);
-                ca.destinationRGBBlendFactor = BlendFactor((b >> 8) & 0x1F);
-                if ((b >> 29) & 1) {
-                    ca.sourceAlphaBlendFactor = BlendFactor((b >> 16) & 0x1F);
-                    ca.alphaBlendOperation = BlendOp((b >> 21) & 7);
-                    ca.destinationAlphaBlendFactor = BlendFactor((b >> 24) & 0x1F);
-                } else {
-                    ca.sourceAlphaBlendFactor = ca.sourceRGBBlendFactor;
-                    ca.alphaBlendOperation = ca.rgbBlendOperation;
-                    ca.destinationAlphaBlendFactor = ca.destinationRGBBlendFactor;
+    TakeCompiled();
+    auto pit = pipelines.find(pkey);
+    if (pit == pipelines.end()) {
+        if (!pending.count(pkey)) {
+            MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+            for (u32 k = 0; k < 8; ++k) {
+                if (!colors[k]) {
+                    continue;
+                }
+                MTLRenderPipelineColorAttachmentDescriptor* ca = d.colorAttachments[k];
+                ca.pixelFormat = color_fmt[k];
+                const u32 b = pk.blend[k];
+                const u32 wm = (target_mask >> (4 * k)) & 0xF;
+                ca.writeMask = ((wm & 1) ? MTLColorWriteMaskRed : 0) | ((wm & 2) ? MTLColorWriteMaskGreen : 0) |
+                               ((wm & 4) ? MTLColorWriteMaskBlue : 0) | ((wm & 8) ? MTLColorWriteMaskAlpha : 0);
+                const bool blendable = out_type[k] == OutType::Float && color_fmt[k] != MTLPixelFormatRGBA32Float;
+                if ((b >> 30) & 1 && blendable && !debug_fs) {
+                    ca.blendingEnabled = YES;
+                    ca.sourceRGBBlendFactor = BlendFactor(b & 0x1F);
+                    ca.rgbBlendOperation = BlendOp((b >> 5) & 7);
+                    ca.destinationRGBBlendFactor = BlendFactor((b >> 8) & 0x1F);
+                    if ((b >> 29) & 1) {
+                        ca.sourceAlphaBlendFactor = BlendFactor((b >> 16) & 0x1F);
+                        ca.alphaBlendOperation = BlendOp((b >> 21) & 7);
+                        ca.destinationAlphaBlendFactor = BlendFactor((b >> 24) & 0x1F);
+                    } else {
+                        ca.sourceAlphaBlendFactor = ca.sourceRGBBlendFactor;
+                        ca.alphaBlendOperation = ca.rgbBlendOperation;
+                        ca.destinationAlphaBlendFactor = ca.destinationRGBBlendFactor;
+                    }
                 }
             }
+            d.depthAttachmentPixelFormat = depth_fmt;
+            pending.insert(pkey);
+            std::string vsrc = MslSource(*vs, vo, vs_key);
+            std::string fsrc = ps ? MslSource(*ps, fo, ps_key) : std::string();
+            const bool flat = debug_fs && ps && out_type[0] == OutType::Float;
+            compiler->Submit([this, d, vsrc = std::move(vsrc), fsrc = std::move(fsrc), vs_key, ps_key, pkey, flat,
+                              vs_addr, ps_addr] {
+                id<MTLRenderPipelineState> pso = nil;
+                id<MTLFunction> vfn = compiler->Function(vs_key, vsrc, vs_addr);
+                id<MTLFunction> ffn = fsrc.empty() ? nil : compiler->Function(ps_key, fsrc, ps_addr);
+                if (vfn && (fsrc.empty() || ffn)) {
+                    d.vertexFunction = vfn;
+                    d.fragmentFunction = flat ? debug_fs : ffn;
+                    NSError* err = nil;
+                    const auto t0 = std::chrono::steady_clock::now();
+                    pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
+                    ReportSlowCompile("pipeline", vs_addr, ps_addr, t0);
+                    if (!pso) {
+                        DC_ERROR("gpu: pipeline (vs %#llx ps %#llx): %s", vs_addr, ps_addr,
+                                 err ? err.localizedDescription.UTF8String : "?");
+                    }
+                }
+                {
+                    std::scoped_lock lk(done_lock);
+                    done_render.emplace_back(pkey, pso);
+                }
+                done_cv.notify_all();
+            });
         }
-        d.depthAttachmentPixelFormat = depth_fmt;
-        NSError* err = nil;
-        const auto t0 = std::chrono::steady_clock::now();
-        pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
-        ReportSlowCompile("pipeline", vs_addr, ps_addr, t0);
-        if (!pso) {
-            DC_ERROR("gpu: pipeline (vs %#llx ps %#llx): %s", vs_addr, ps_addr,
-                     err ? err.localizedDescription.UTF8String : "?");
+        if (!sync_shaders) {
+            if (trace) DC_INFO("gpu:   skipped: pipeline compiling");
+            return;
         }
-        pipelines[pkey] = pso;
+        WaitCompiled(pkey);
+        pit = pipelines.find(pkey);
     }
+    id<MTLRenderPipelineState> pso = pit->second;
     if (!pso) {
         if (trace) DC_INFO("gpu:   skipped: no pipeline");
         return;
@@ -1225,6 +1285,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
     if (!addr || !gx || !gy || !gz) {
         return;
     }
+    ++stat_dispatches;
     Program* cs = GetProgram(Stage::Compute, addr, ud, Bits(rsrc2, 1, 5), Bits(rsrc2, 11, 2), rsrc2);
     if (!cs) {
         return;
@@ -1238,32 +1299,46 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
     u64 key = Hash(cs->hash);
     key = Hash(rsrc2, key);
     key = Fnv(types.data(), types.size() * sizeof(TextureType), key);
-    id<MTLFunction> fn = GetFunction(*cs, o, key);
-    if (!fn) {
-        return;
-    }
     const u32 group = tx * ty * tz;
     const u64 pkey = Hash(group, key);
-    id<MTLComputePipelineState> pso = nil;
-    if (auto it = compute_pipelines.find(pkey); it != compute_pipelines.end()) {
-        pso = it->second;
-    } else {
-        MTLComputePipelineDescriptor* d = [MTLComputePipelineDescriptor new];
-        d.computeFunction = fn;
-        d.maxTotalThreadsPerThreadgroup = group; // the guest's group size must fit as is
-        NSError* err = nil;
-        const auto t0 = std::chrono::steady_clock::now();
-        pso = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:&err];
-        ReportSlowCompile("compute pipeline", addr, 0, t0);
-        if (!pso) {
-            DC_ERROR("gpu: compute pipeline %#llx: %s", addr, err ? err.localizedDescription.UTF8String : "?");
-        } else if (pso.maxTotalThreadsPerThreadgroup < group) {
-            DC_ERROR("gpu: compute shader %#llx needs %u threads per group, Metal allows %lu", addr, group,
-                     (unsigned long)pso.maxTotalThreadsPerThreadgroup);
-            pso = nil;
+    TakeCompiled();
+    auto it = compute_pipelines.find(pkey);
+    if (it == compute_pipelines.end()) {
+        if (!pending.count(pkey)) {
+            pending.insert(pkey);
+            compiler->Submit([this, src = MslSource(*cs, o, key), key, pkey, group, addr] {
+                id<MTLComputePipelineState> pso = nil;
+                if (id<MTLFunction> fn = compiler->Function(key, src, addr)) {
+                    MTLComputePipelineDescriptor* d = [MTLComputePipelineDescriptor new];
+                    d.computeFunction = fn;
+                    d.maxTotalThreadsPerThreadgroup = group; // the guest's group size must fit as is
+                    NSError* err = nil;
+                    const auto t0 = std::chrono::steady_clock::now();
+                    pso = [device newComputePipelineStateWithDescriptor:d
+                                                                options:MTLPipelineOptionNone
+                                                             reflection:nil
+                                                                  error:&err];
+                    ReportSlowCompile("compute pipeline", addr, 0, t0);
+                    if (!pso) {
+                        DC_ERROR("gpu: compute pipeline %#llx: %s", addr, err ? err.localizedDescription.UTF8String : "?");
+                    } else if (pso.maxTotalThreadsPerThreadgroup < group) {
+                        DC_ERROR("gpu: compute shader %#llx needs %u threads per group, Metal allows %lu", addr, group,
+                                 (unsigned long)pso.maxTotalThreadsPerThreadgroup);
+                        pso = nil;
+                    }
+                }
+                {
+                    std::scoped_lock lk(done_lock);
+                    done_compute.emplace_back(pkey, pso);
+                }
+                done_cv.notify_all();
+            });
         }
-        compute_pipelines[pkey] = pso;
+        // Dispatches often produce data later work depends on: wait.
+        WaitCompiled(pkey);
+        it = compute_pipelines.find(pkey);
     }
+    id<MTLComputePipelineState> pso = it->second;
     if (!pso) {
         return;
     }
@@ -1293,6 +1368,20 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
 
 void MetalRenderer::Impl::Flip(const FlipInfo& f) {
     ++frame_count;
+    if (stats) {
+        const auto now = std::chrono::steady_clock::now();
+        const double dt = std::chrono::duration<double>(now - stat_t0).count();
+        static u64 frames = 0;
+        ++frames;
+        if (dt >= 1.0) {
+            DC_INFO("gpu stats: %.1f fps, gpu busy %.0f%%, wait %.0f%%, per frame: %.0f draws %.0f dispatches %.1f commits %.1f waits",
+                    frames / dt, gpu_ns.exchange(0) / 1e9 / dt * 100, stat_wait_s / dt * 100, stat_draws / double(frames),
+                    stat_dispatches / double(frames), stat_commits / double(frames), stat_waits / double(frames));
+            frames = stat_commits = stat_waits = stat_draws = stat_dispatches = 0;
+            stat_wait_s = 0;
+            stat_t0 = now;
+        }
+    }
     EndPass();
     EnsureCommandBuffer();
 

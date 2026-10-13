@@ -62,6 +62,7 @@ add_executable(driveclub
     src/gpu/metal/mtl_presenter.mm
     src/gpu/metal/mtl_formats.h
     src/gpu/metal/mtl_renderer.h
+    src/gpu/metal/mtl_compiler.mm
     src/gpu/metal/mtl_renderer.mm
     src/hle/hle.cpp
     src/hle/hle.h
