@@ -23,8 +23,10 @@
 #include "hle/kernel/kernel.h"
 #include "hle/pad/pad.h"
 #include "hle/video_out/video_out.h"
+#include "gpu/liverpool/command_processor.h"
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_presenter.h"
+#include "gpu/metal/mtl_renderer.h"
 
 namespace {
 
@@ -77,6 +79,9 @@ int Run(int argc, char** argv) {
     Gpu::Metal::Device device;
     Gpu::Metal::PresenterConfig config{};
     Gpu::Metal::Presenter presenter(device, SDL_Metal_GetLayer(view), config);
+
+    auto renderer = std::make_unique<Gpu::Metal::MetalRenderer>(device);
+    Gpu::Liverpool::Instance().SetRenderer(renderer.get());
 
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window, &w, &h);

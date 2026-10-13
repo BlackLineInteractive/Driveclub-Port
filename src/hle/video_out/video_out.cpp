@@ -187,6 +187,14 @@ FramebufferInfo Driver::GetLatestFramebuffer() {
     return latest_framebuffer;
 }
 
+void* Driver::GetBufferAddress(s32 handle, u32 buf_idx) {
+    std::scoped_lock lk(lock);
+    if (handle <= 0 || static_cast<size_t>(handle) >= ports.size() || buf_idx >= kMaxBuffers) {
+        return nullptr;
+    }
+    return ports[handle].buffers[buf_idx];
+}
+
 s32 Driver::GetVblankStatus(s32 handle, SceVideoOutVblankStatus* status) {
     if (!status) {
         return kErrorInvalidAddress;

@@ -303,4 +303,14 @@ bool Query(VAddr addr, bool find_next, Vma* out) {
     return false;
 }
 
+VAddr PhysToVirt(u64 phys) {
+    std::scoped_lock lk(g_lock);
+    for (const auto& [start, v] : g_vmas) {
+        if (v.type == VmaType::Direct && phys >= v.phys && phys < v.phys + v.size) {
+            return v.start + (phys - v.phys);
+        }
+    }
+    return 0;
+}
+
 } // namespace Core::Memory

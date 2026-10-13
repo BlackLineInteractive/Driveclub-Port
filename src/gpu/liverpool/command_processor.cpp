@@ -8,6 +8,7 @@
 #include <x86intrin.h>
 
 #include "common/log.h"
+#include "gpu/renderer.h"
 
 namespace Gpu::Liverpool {
 
@@ -61,7 +62,9 @@ bool Compare(u32 func, u32 value, u32 ref) {
 
 } // namespace
 
-CommandProcessor::CommandProcessor() : regs(kNumRegs, 0) {}
+CommandProcessor::CommandProcessor() {
+    regs.SetDefaults();
+}
 
 CommandProcessor::~CommandProcessor() {
     for (auto& r : rings) {
@@ -98,7 +101,13 @@ void CommandProcessor::Push(u32 index, Job job) {
 
 void CommandProcessor::SubmitGraphics(std::vector<std::span<const u32>> dcbs,
                                       std::function<void()> after) {
-    ++stats.submits;
+    const u64 submit_idx = ++stats.submits;
+    if (submit_idx <= 10 || submit_idx % 60 == 0) {
+        DC_INFO("gpu: SubmitGraphics #%llu with %zu dcbs", submit_idx, dcbs.size());
+    }
+    if (renderer) {
+        renderer->OnSubmit();
+    }
     Push(0, {std::move(dcbs), std::move(after)});
 }
 
@@ -138,8 +147,11 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
             ring.jobs.pop_front();
             ring.busy = true;
         }
-        for (const auto& buf : job.buffers) {
-            Execute(buf, ring.index != 0, 0);
+        for (size_t i = 0; i < job.buffers.size(); ++i) {
+            Execute(job.buffers[i], ring.index != 0, 0);
+        }
+        if (renderer) {
+            renderer->OnSubmit();
         }
         if (job.after) {
             job.after();
@@ -176,8 +188,8 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 break;
             }
             for (u32 i = 0; i < count; ++i) {
-                if (base_reg + i < regs.size()) {
-                    regs[base_reg + i] = p[1 + i];
+                if (base_reg + i < regs.reg_array.size()) {
+                    regs.reg_array[base_reg + i] = p[1 + i];
                 }
             }
             p += 1 + count;
@@ -197,16 +209,16 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             break;
 
         case Op::SetContextReg:
-            std::memcpy(&regs[kContextRegBase + body[0]], body + 1, (body_n - 1) * 4);
+            std::memcpy(&regs.reg_array[kContextRegBase + body[0]], body + 1, (body_n - 1) * 4);
             break;
         case Op::SetShReg:
-            std::memcpy(&regs[kShRegBase + body[0]], body + 1, (body_n - 1) * 4);
+            std::memcpy(&regs.reg_array[kShRegBase + body[0]], body + 1, (body_n - 1) * 4);
             break;
         case Op::SetUconfigReg:
-            std::memcpy(&regs[kUconfigRegBase + body[0]], body + 1, (body_n - 1) * 4);
+            std::memcpy(&regs.reg_array[kUconfigRegBase + body[0]], body + 1, (body_n - 1) * 4);
             break;
         case Op::SetConfigReg:
-            std::memcpy(&regs[kConfigRegBase + body[0]], body + 1, (body_n - 1) * 4);
+            std::memcpy(&regs.reg_array[kConfigRegBase + body[0]], body + 1, (body_n - 1) * 4);
             break;
 
         case Op::IndirectBuffer: {
@@ -273,18 +285,88 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             break;
         }
 
-        case Op::DrawIndex2:
-        case Op::DrawIndexAuto:
-        case Op::DrawIndexOffset2:
-        case Op::DrawIndirect:
-        case Op::DrawIndexIndirect:
+        case Op::DrawIndex2: {
             ++stats.draws;
+            regs.num_indices = body[3];
+            regs.draw_initiator = body[4];
+            if (renderer) {
+                renderer->Draw(regs, true);
+            }
             break;
+        }
+        case Op::DrawIndexAuto: {
+            const u64 cur_draw = ++stats.draws;
+            regs.num_indices = body[0];
+            regs.draw_initiator = body[1];
+            if (cur_draw <= 5 || cur_draw % 100 == 0) {
+                const u64 vs_addr = regs.vs_program.Address<uintptr_t>();
+                const u64 ps_addr = regs.ps_program.Address<uintptr_t>();
+                const u64 cb0_base = regs.color_buffers[0].Address();
+                const u32 cb0_pitch = regs.color_buffers[0].Pitch();
+                DC_INFO("gpu: draw #%llu DrawIndexAuto count=%u vs=%#llx ps=%#llx cb0=%#llx pitch=%u prim=%u",
+                        cur_draw, body[0], vs_addr, ps_addr, cb0_base, cb0_pitch, static_cast<u32>(regs.primitive_type));
+                if (cur_draw == 5 || cur_draw == 100) {
+                    const u64 vb_addr = (0x300000000ULL | regs.vs_program.user_data[4]);
+                    const u64 cb_addr = (0x300000000ULL | regs.vs_program.user_data[0]);
+                    DC_INFO("gpu: inspect draw #%llu: vb_addr=%#llx cb_addr=%#llx", cur_draw, vb_addr, cb_addr);
+                    const u32* vb32 = reinterpret_cast<const u32*>(vb_addr);
+                    for (int i = 0; i < 450; ++i) {
+                        if (vb32[i] != 0) {
+                            DC_INFO("gpu: vb32[%d] = %#x (f=%f)", i, vb32[i], reinterpret_cast<const float*>(&vb32[i])[0]);
+                        }
+                    }
+                    const u32* cb32 = reinterpret_cast<const u32*>(cb_addr);
+                    for (int i = 0; i < 128; ++i) {
+                        if (cb32[i] != 0) {
+                            DC_INFO("gpu: cb32[%d] = %#x (f=%f)", i, cb32[i], reinterpret_cast<const float*>(&cb32[i])[0]);
+                        }
+                    }
+                }
+            }
+            if (renderer) {
+                renderer->Draw(regs, false);
+            }
+            break;
+        }
+        case Op::DrawIndexOffset2: {
+            ++stats.draws;
+            regs.index_offset = body[1];
+            regs.num_indices = body[2];
+            regs.draw_initiator = body[3];
+            if (renderer) {
+                renderer->Draw(regs, true);
+            }
+            break;
+        }
+        case Op::DrawIndirect: {
+            ++stats.draws;
+            if (renderer) {
+                renderer->DrawIndirect(regs, false, static_cast<u64>(body[0]) | (static_cast<u64>(body[1]) << 32), 1, 0);
+            }
+            break;
+        }
+        case Op::DrawIndexIndirect: {
+            ++stats.draws;
+            if (renderer) {
+                renderer->DrawIndirect(regs, true, static_cast<u64>(body[0]) | (static_cast<u64>(body[1]) << 32), 1, 0);
+            }
+            break;
+        }
 
-        case Op::DispatchDirect:
-        case Op::DispatchIndirect:
+        case Op::DispatchDirect: {
             ++stats.dispatches;
+            if (renderer) {
+                renderer->Dispatch(regs, body[0], body[1], body[2]);
+            }
             break;
+        }
+        case Op::DispatchIndirect: {
+            ++stats.dispatches;
+            if (renderer) {
+                renderer->DispatchIndirect(regs, static_cast<u64>(body[0]) | (static_cast<u64>(body[1]) << 32));
+            }
+            break;
+        }
 
         default:
             break;

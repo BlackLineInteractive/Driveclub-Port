@@ -13,24 +13,24 @@
 
 namespace Gpu {
 
-using GuestAddr = std::uint64_t;
+namespace Liverpool {
+union Regs;
+}
 
-// Snapshot of the guest register file the backend needs to build pipelines
-// and bind resources. Filled by the frontend; layout is frontend-owned.
-struct GuestRegs;
+using GuestAddr = std::uint64_t;
 
 class Renderer {
 public:
     virtual ~Renderer() = default;
 
     // Draws using the current guest register state.
-    virtual void Draw(const GuestRegs& regs, bool indexed) = 0;
-    virtual void DrawIndirect(const GuestRegs& regs, bool indexed, GuestAddr args,
+    virtual void Draw(const Liverpool::Regs& regs, bool indexed) = 0;
+    virtual void DrawIndirect(const Liverpool::Regs& regs, bool indexed, GuestAddr args,
                               std::uint32_t draw_count, GuestAddr count_addr) = 0;
 
-    virtual void Dispatch(const GuestRegs& regs, std::uint32_t x, std::uint32_t y,
+    virtual void Dispatch(const Liverpool::Regs& regs, std::uint32_t x, std::uint32_t y,
                           std::uint32_t z) = 0;
-    virtual void DispatchIndirect(const GuestRegs& regs, GuestAddr args) = 0;
+    virtual void DispatchIndirect(const Liverpool::Regs& regs, GuestAddr args) = 0;
 
     // DMA-style operations issued by PM4 DMA_DATA / WRITE_DATA packets.
     virtual void CopyBuffer(GuestAddr dst, GuestAddr src, std::uint64_t size) = 0;

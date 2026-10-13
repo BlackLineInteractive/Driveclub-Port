@@ -19,6 +19,11 @@
 
 #include "common/types.h"
 #include "gpu/liverpool/pm4.h"
+#include "gpu/liverpool/regs.h"
+
+namespace Gpu {
+class Renderer;
+}
 
 namespace Gpu::Liverpool {
 
@@ -47,9 +52,12 @@ public:
     void WaitIdle();
 
     void SetInterruptHandler(std::function<void(u32 irq)> handler) { on_irq = std::move(handler); }
+    void SetRenderer(Gpu::Renderer* r) { renderer = r; }
+    Gpu::Renderer* GetRenderer() const { return renderer; }
 
     const Stats& GetStats() const { return stats; }
-    const u32* Regs() const { return regs.data(); }
+    const u32* Regs() const { return regs.reg_array.data(); }
+    const Liverpool::Regs& GetRegs() const { return regs; }
 
 private:
     struct Job {
@@ -75,7 +83,8 @@ private:
     void Execute(std::span<const u32> cmds, bool compute, int depth);
     void Interrupt(u32 irq);
 
-    std::vector<u32> regs;
+    Liverpool::Regs regs{};
+    Gpu::Renderer* renderer = nullptr;
     Stats stats;
     std::function<void(u32)> on_irq;
 

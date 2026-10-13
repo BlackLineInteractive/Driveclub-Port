@@ -12,6 +12,7 @@
 #include "common/log.h"
 #include "gpu/liverpool/command_processor.h"
 #include "gpu/liverpool/pm4.h"
+#include "gpu/renderer.h"
 #include "hle/hle.h"
 #include "hle/kernel/equeue.h"
 #include "hle/video_out/video_out.h"
@@ -355,6 +356,11 @@ s32 sceGnmSubmitAndFlipCommandBuffers(u32 count, const u32* dcb_ptrs[], const u3
     }
 
     Instance().SubmitGraphics(std::move(dcbs), [vo_handle, buf_idx, flip_arg] {
+        void* ptr = VideoOut::Driver::Instance().GetBufferAddress(vo_handle, buf_idx);
+        auto* r = Instance().GetRenderer();
+        if (r && ptr) {
+            r->Flip(reinterpret_cast<u64>(ptr), 1920, 1080, 1920, 0);
+        }
         VideoOut::Driver::Instance().OnFlipDone(vo_handle, buf_idx, flip_arg);
     });
     return 0;

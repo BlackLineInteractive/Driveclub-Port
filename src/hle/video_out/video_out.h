@@ -68,6 +68,7 @@ public:
     void MarkFlipPending(s32 handle, u32 buf_idx);
     void OnFlipDone(s32 handle, u32 buf_idx, s64 flip_arg);
 
+    void* GetBufferAddress(s32 handle, u32 buf_idx);
     s32 GetVblankStatus(s32 handle, SceVideoOutVblankStatus* status);
     FramebufferInfo GetLatestFramebuffer();
 

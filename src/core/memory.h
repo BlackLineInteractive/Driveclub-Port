@@ -65,4 +65,7 @@ void SetName(VAddr addr, u64 size, const char* name);
 // The mapping containing `addr`, or with `find_next` the first one above it.
 bool Query(VAddr addr, bool find_next, Vma* out);
 
+// Translates a direct physical address to the guest virtual address if mapped.
+VAddr PhysToVirt(u64 phys);
+
 } // namespace Core::Memory
