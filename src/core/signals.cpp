@@ -155,6 +155,24 @@ void Describe(const char* what, u64 rip, u64 fault, u64 rsp) {
     }
 }
 
+// Prints printable ASCII runs found on the stack: the game formats its fatal
+// error messages into a stack buffer right before breaking.
+void DumpStackStrings(u64 rsp) {
+    const char* p = reinterpret_cast<const char*>(rsp);
+    int run = 0;
+    for (int i = 0; i < 0x3000; ++i) {
+        const unsigned char c = static_cast<unsigned char>(p[i]);
+        if ((c >= 0x20 && c < 0x7F) || c == '\n' || c == '\t') {
+            ++run;
+            continue;
+        }
+        if (c == 0 && run >= 12) {
+            DC_ERROR("  message: %.*s", run, p + i - run);
+        }
+        run = 0;
+    }
+}
+
 [[noreturn]] void Die(int sig) {
     signal(sig, SIG_DFL);
     raise(sig);
@@ -176,6 +194,14 @@ void Handler(int sig, siginfo_t* info, void* raw) {
         Describe("illegal instruction", rip, rip, rsp);
         DC_ERROR("  bytes: %02x %02x %02x %02x %02x %02x %02x %02x", code[0], code[1], code[2],
                  code[3], code[4], code[5], code[6], code[7]);
+        Die(sig);
+    }
+
+    // `int 0x41` is the PS4 debugger break the game uses on fatal errors.
+    const u8* code = reinterpret_cast<const u8*>(rip);
+    if (sig == SIGSEGV && code[0] == 0xCD && code[1] == 0x41) {
+        Describe("guest debug break (int 0x41)", rip, 0, rsp);
+        DumpStackStrings(rsp);
         Die(sig);
     }
 
