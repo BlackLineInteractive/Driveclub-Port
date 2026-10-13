@@ -63,9 +63,9 @@ s32 sceAvPlayerClose(void* handle) {
 
 s32 sceAvPlayerAddSource(void* handle, const char* filename) {
     DC_INFO("sceAvPlayerAddSource(handle=%p, file=%s)", handle, filename ? filename : "null");
+    // No decoder yet: report the source as ready; Start() ends playback.
     if (g_player.event_cb) {
-        DC_INFO("sceAvPlayerAddSource: emitting StateStop (1) event to skip movie");
-        g_player.event_cb(g_player.object_ptr, 1 /*StateStop*/, 0, nullptr);
+        g_player.event_cb(g_player.object_ptr, 2 /*StateReady*/, 0, nullptr);
     }
     return 0;
 }
@@ -80,8 +80,9 @@ s32 sceAvPlayerAddSourceEx(void* handle, u32 uri_type, void* source_details) {
 
 s32 sceAvPlayerStart(void* handle) {
     DC_INFO("sceAvPlayerStart(handle=%p)", handle);
-    if (handle == &g_player) {
-        g_player.active = false; // Immediately finish video to allow skipping to menu
+    if (handle == &g_player && g_player.event_cb) {
+        g_player.event_cb(g_player.object_ptr, 3 /*StatePlay*/, 0, nullptr);
+        g_player.event_cb(g_player.object_ptr, 1 /*StateStop*/, 0, nullptr);
     }
     return 0;
 }
@@ -110,7 +111,8 @@ s32 sceAvPlayerResume(void* handle) {
 }
 
 bool sceAvPlayerIsActive(void* handle) {
-    // Return false so game knows the video is finished
+    static bool logged = false;
+    if (!logged) { logged = true; DC_INFO("sceAvPlayerIsActive"); }
     return (handle == &g_player) ? g_player.active : false;
 }
 
@@ -138,9 +140,21 @@ bool sceAvPlayerGetVideoDataEx(void* handle, void* p_info) {
 }
 
 s32 sceAvPlayerGetStreamInfo(void* handle, u32 stream_id, void* p_info) {
+    DC_INFO("sceAvPlayerGetStreamInfo(%u)", stream_id);
     (void)handle;
-    (void)stream_id;
-    (void)p_info;
+    if (p_info) {
+        // SceAvPlayerStreamInfo: type, reserved, video {width, height, aspect}, duration, start time.
+        u8* out = static_cast<u8*>(p_info);
+        std::memset(out, 0, 32);
+        const u32 type = 0, width = 1920, height = 1080;
+        const float aspect = 16.0f / 9.0f;
+        const u64 duration_ms = 1000;
+        std::memcpy(out + 0, &type, 4);
+        std::memcpy(out + 8, &width, 4);
+        std::memcpy(out + 12, &height, 4);
+        std::memcpy(out + 16, &aspect, 4);
+        std::memcpy(out + 24, &duration_ms, 8);
+    }
     return 0;
 }
 
@@ -200,7 +214,8 @@ s32 sceAvPlayerSetTrickSpeed(void* handle, s32 speed) {
 
 s32 sceAvPlayerStreamCount(void* handle) {
     (void)handle;
-    return 0;
+    DC_INFO("sceAvPlayerStreamCount");
+    return 1;
 }
 
 s32 sceAvPlayerJumpToTime(void* handle, u64 time) {
