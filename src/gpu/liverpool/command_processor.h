@@ -19,7 +19,7 @@
 
 #include "common/types.h"
 #include "gpu/liverpool/pm4.h"
-#include "gpu/liverpool/regs.h"
+#include "gpu/liverpool/registers.h"
 
 namespace Gpu {
 class Renderer;
@@ -56,8 +56,7 @@ public:
     Gpu::Renderer* GetRenderer() const { return renderer; }
 
     const Stats& GetStats() const { return stats; }
-    const u32* Regs() const { return regs.reg_array.data(); }
-    const Liverpool::Regs& GetRegs() const { return regs; }
+    const RegFile& Regs() const { return regs; }
 
 private:
     struct Job {
@@ -82,8 +81,15 @@ private:
     void Run(Ring& ring, std::stop_token stop);
     void Execute(std::span<const u32> cmds, bool compute, int depth);
     void Interrupt(u32 irq);
+    void SetRegs(u32 index, const u32* values, u32 count);
+    void Draw(bool indexed, u32 count, u32 index_offset);
 
-    Liverpool::Regs regs{};
+    RegFile regs;
+    // Draw state set by packets rather than registers.
+    u64 index_base = 0;
+    u32 index_size = 2;
+    u32 num_instances = 1;
+    bool warned_indirect = false;
     Gpu::Renderer* renderer = nullptr;
     Stats stats;
     std::function<void(u32)> on_irq;

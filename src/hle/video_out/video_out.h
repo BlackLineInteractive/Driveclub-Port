@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "common/types.h"
+#include "gpu/renderer.h"
 #include "hle/kernel/equeue.h"
 
 namespace Hle::VideoOut {
@@ -42,15 +43,6 @@ struct SceVideoOutVblankStatus {
     u8 pad1[7] = {};
 };
 
-struct FramebufferInfo {
-    const void* ptr = nullptr;
-    u32 width = 0;
-    u32 height = 0;
-    u32 pitch = 0;
-    u32 pixel_format = 0;
-    u64 flip_count = 0;
-};
-
 class Driver {
 public:
     static constexpr size_t kMaxBuffers = 16;
@@ -68,9 +60,8 @@ public:
     void MarkFlipPending(s32 handle, u32 buf_idx);
     void OnFlipDone(s32 handle, u32 buf_idx, s64 flip_arg);
 
-    void* GetBufferAddress(s32 handle, u32 buf_idx);
+    Gpu::FlipInfo GetFlipInfo(s32 handle, u32 buf_idx);
     s32 GetVblankStatus(s32 handle, SceVideoOutVblankStatus* status);
-    FramebufferInfo GetLatestFramebuffer();
 
     static Driver& Instance();
 
@@ -92,7 +83,6 @@ private:
 
     std::mutex lock;
     std::array<Port, 4> ports;
-    FramebufferInfo latest_framebuffer{};
     std::jthread vblank_thread;
 };
 

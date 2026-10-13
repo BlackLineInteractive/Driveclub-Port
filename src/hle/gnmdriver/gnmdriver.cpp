@@ -334,6 +334,18 @@ s32 sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_ptrs[], const u32 dcb_s
     return 0;
 }
 
+// Runs after the frame's command buffers: show the buffer, then tell the game.
+void FlipOnGpuThread(u32 vo_handle, u32 buf_idx, s64 flip_arg) {
+    auto& vo = VideoOut::Driver::Instance();
+    if (auto* r = Instance().GetRenderer()) {
+        const Gpu::FlipInfo flip = vo.GetFlipInfo(static_cast<s32>(vo_handle), buf_idx);
+        if (flip.address) {
+            r->Flip(flip);
+        }
+    }
+    vo.OnFlipDone(static_cast<s32>(vo_handle), buf_idx, flip_arg);
+}
+
 s32 sceGnmSubmitAndFlipCommandBuffers(u32 count, const u32* dcb_ptrs[], const u32 dcb_sizes[],
                                       const u32* ccb_ptrs[], const u32 ccb_sizes[],
                                       u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
@@ -356,12 +368,7 @@ s32 sceGnmSubmitAndFlipCommandBuffers(u32 count, const u32* dcb_ptrs[], const u3
     }
 
     Instance().SubmitGraphics(std::move(dcbs), [vo_handle, buf_idx, flip_arg] {
-        void* ptr = VideoOut::Driver::Instance().GetBufferAddress(vo_handle, buf_idx);
-        auto* r = Instance().GetRenderer();
-        if (r && ptr) {
-            r->Flip(reinterpret_cast<u64>(ptr), 1920, 1080, 1920, 0);
-        }
-        VideoOut::Driver::Instance().OnFlipDone(vo_handle, buf_idx, flip_arg);
+        FlipOnGpuThread(vo_handle, buf_idx, flip_arg);
     });
     return 0;
 }
@@ -384,7 +391,9 @@ void sceGnmFlushGarlic() {
 }
 
 s32 sceGnmRequestFlipAndSubmitDone(u32 vo_handle, u32 buf_idx, s64 flip_arg) {
-    VideoOut::Driver::Instance().OnFlipDone(vo_handle, buf_idx, flip_arg);
+    Instance().SubmitGraphics({}, [vo_handle, buf_idx, flip_arg] {
+        FlipOnGpuThread(vo_handle, buf_idx, flip_arg);
+    });
     return sceGnmSubmitDone();
 }
 

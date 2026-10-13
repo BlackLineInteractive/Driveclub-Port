@@ -1,6 +1,7 @@
 #include "core/memory.h"
 
 #include <cerrno>
+#include <atomic>
 #include <cstdio>
 #include <iterator>
 #include <map>
@@ -26,6 +27,7 @@ std::mutex g_lock;
 int g_direct_fd = -1;
 std::map<u64, u64> g_direct_used; // phys start -> size
 std::map<VAddr, Vma> g_vmas;      // start -> mapping (non-overlapping)
+std::atomic<u64> g_generation{0}; // bumped whenever the mapping set changes
 
 int HostProt(int prot) {
     int host = PROT_NONE;
@@ -212,6 +214,7 @@ int ReleaseDirect(u64 phys, u64 size) {
 
 int MapDirect(VAddr* addr, u64 size, int prot, int flags, u64 phys, u64 align, const char* name) {
     std::scoped_lock lk(g_lock);
+    g_generation.fetch_add(1, std::memory_order_release);
     size = AlignUp(size, kPage);
     if (phys + size > kDirectSize) {
         return EINVAL;
@@ -246,6 +249,7 @@ int MapFlexible(VAddr* addr, u64 size, int prot, int flags, const char* name) {
 
 int Reserve(VAddr* addr, u64 size, int flags, u64 align) {
     std::scoped_lock lk(g_lock);
+    g_generation.fetch_add(1, std::memory_order_release);
     size = AlignUp(size, kPage);
     if (const int err = Place(addr, size, flags, align)) {
         return err;
@@ -257,6 +261,7 @@ int Reserve(VAddr* addr, u64 size, int flags, u64 align) {
 
 int Unmap(VAddr addr, u64 size) {
     std::scoped_lock lk(g_lock);
+    g_generation.fetch_add(1, std::memory_order_release);
     size = AlignUp(size, kPage);
     Carve(addr, size);
     AddressSpace::Unmap(addr, size);
@@ -303,14 +308,31 @@ bool Query(VAddr addr, bool find_next, Vma* out) {
     return false;
 }
 
-VAddr PhysToVirt(u64 phys) {
+void* DirectHostView() {
+    static void* view = [] {
+        void* p = mmap(nullptr, kDirectSize, PROT_READ | PROT_WRITE, MAP_SHARED, g_direct_fd, 0);
+        if (p == MAP_FAILED) {
+            DC_ERROR("cannot map the host view of direct memory: %d", errno);
+            return static_cast<void*>(nullptr);
+        }
+        return p;
+    }();
+    return view;
+}
+
+u64 DirectMapGeneration() {
+    return g_generation.load(std::memory_order_acquire);
+}
+
+std::vector<DirectRange> DirectMappings() {
     std::scoped_lock lk(g_lock);
+    std::vector<DirectRange> out;
     for (const auto& [start, v] : g_vmas) {
-        if (v.type == VmaType::Direct && phys >= v.phys && phys < v.phys + v.size) {
-            return v.start + (phys - v.phys);
+        if (v.type == VmaType::Direct) {
+            out.push_back({v.start, v.size, v.phys});
         }
     }
-    return 0;
+    return out;
 }
 
 } // namespace Core::Memory

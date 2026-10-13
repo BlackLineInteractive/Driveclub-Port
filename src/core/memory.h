@@ -8,6 +8,7 @@
 // the console (games map GPU buffers twice with different attributes).
 
 #include <string>
+#include <vector>
 
 #include "common/types.h"
 
@@ -65,7 +66,19 @@ void SetName(VAddr addr, u64 size, const char* name);
 // The mapping containing `addr`, or with `find_next` the first one above it.
 bool Query(VAddr addr, bool find_next, Vma* out);
 
-// Translates a direct physical address to the guest virtual address if mapped.
-VAddr PhysToVirt(u64 phys);
+// ---- GPU view ----
+// The whole direct memory object mapped once more at a host address, so that
+// byte offset == physical address. The GPU reads guest memory through it.
+void* DirectHostView();
+
+struct DirectRange {
+    VAddr start;
+    u64 size;
+    u64 phys;
+};
+// Current guest virtual -> physical direct mappings, and a counter that
+// changes whenever they do (so callers can cache the list).
+std::vector<DirectRange> DirectMappings();
+u64 DirectMapGeneration();
 
 } // namespace Core::Memory

@@ -6,52 +6,53 @@
 // The frontend decodes command buffers the game submits through
 // sceGnmSubmitCommandBuffers / sceGnmDingDong, tracks register state, and
 // calls into this interface only for work that touches the host GPU.
-// Backends: Metal (macOS, ours). A Vulkan backend for Windows/Linux can be
-// built on shadPS4's renderer behind the same interface.
+// Backends: Metal (macOS). A Vulkan backend for Windows/Linux can sit behind
+// the same interface later.
 
 #include <cstdint>
 
 namespace Gpu {
 
 namespace Liverpool {
-union Regs;
+class RegFile;
 }
 
 using GuestAddr = std::uint64_t;
+
+// Per-draw state that comes from draw packets rather than registers.
+struct DrawCall {
+    bool indexed = false;
+    std::uint32_t count = 0;         // indices or vertices
+    std::uint32_t instances = 1;
+    GuestAddr index_base = 0;        // INDEX_BASE packet
+    std::uint32_t index_offset = 0;  // in indices (DRAW_INDEX_OFFSET_2)
+    std::uint32_t index_size = 2;    // bytes per index: 2 or 4
+};
+
+// What sceVideoOutSubmitFlip asks to show.
+struct FlipInfo {
+    GuestAddr address = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t pitch = 0; // pixels
+    std::uint32_t pixel_format = 0;
+    std::uint32_t tiling_mode = 0;
+};
 
 class Renderer {
 public:
     virtual ~Renderer() = default;
 
     // Draws using the current guest register state.
-    virtual void Draw(const Liverpool::Regs& regs, bool indexed) = 0;
-    virtual void DrawIndirect(const Liverpool::Regs& regs, bool indexed, GuestAddr args,
-                              std::uint32_t draw_count, GuestAddr count_addr) = 0;
-
-    virtual void Dispatch(const Liverpool::Regs& regs, std::uint32_t x, std::uint32_t y,
+    virtual void Draw(const Liverpool::RegFile& regs, const DrawCall& draw) = 0;
+    virtual void Dispatch(const Liverpool::RegFile& regs, std::uint32_t x, std::uint32_t y,
                           std::uint32_t z) = 0;
-    virtual void DispatchIndirect(const Liverpool::Regs& regs, GuestAddr args) = 0;
 
-    // DMA-style operations issued by PM4 DMA_DATA / WRITE_DATA packets.
-    virtual void CopyBuffer(GuestAddr dst, GuestAddr src, std::uint64_t size) = 0;
-    virtual void FillBuffer(GuestAddr dst, std::uint32_t value, std::uint64_t size) = 0;
-
-    // The guest CPU wrote to [addr, addr+size); drop or re-upload GPU copies.
-    virtual void InvalidateMemory(GuestAddr addr, std::uint64_t size) = 0;
-    // The guest CPU is about to read [addr, addr+size); download GPU results.
-    virtual void FlushMemory(GuestAddr addr, std::uint64_t size) = 0;
-
-    // Submission boundaries and EOP/EOS fences (sceGnmSubmitDone, EVENT_WRITE_EOP).
+    // End of one guest submission: hand recorded work to the host GPU.
     virtual void OnSubmit() = 0;
-    virtual void SignalFence(GuestAddr addr, std::uint64_t value, bool interrupt) = 0;
 
-    // sceVideoOutSubmitFlip: show the guest framebuffer at `addr`.
-    virtual void Flip(GuestAddr framebuffer, std::uint32_t width, std::uint32_t height,
-                      std::uint32_t pitch, std::uint32_t format) = 0;
-
-    // Debug markers (sceGnmInsertPushMarker etc.); no-ops in release builds.
-    virtual void PushMarker(const char* name) = 0;
-    virtual void PopMarker() = 0;
+    // Called on the GPU thread once the frame's command buffers are done.
+    virtual void Flip(const FlipInfo& flip) = 0;
 };
 
 } // namespace Gpu

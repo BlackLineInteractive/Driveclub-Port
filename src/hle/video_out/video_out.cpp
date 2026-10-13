@@ -163,15 +163,6 @@ void Driver::OnFlipDone(s32 handle, u32 buf_idx, s64 flip_arg) {
             // Mark the currently displayed buffer as busy
             p.labels[buf_idx] = 1;
             p.prev_buffer = static_cast<s32>(buf_idx);
-
-            if (p.buffers[buf_idx]) {
-                latest_framebuffer.ptr = p.buffers[buf_idx];
-                latest_framebuffer.width = p.attr.width;
-                latest_framebuffer.height = p.attr.height;
-                latest_framebuffer.pitch = p.attr.pitch_in_pixel;
-                latest_framebuffer.pixel_format = p.attr.pixel_format;
-                latest_framebuffer.flip_count = p.flip_count + 1;
-            }
         }
         ++p.flip_count;
         queues = p.flip_queues;
@@ -182,17 +173,20 @@ void Driver::OnFlipDone(s32 handle, u32 buf_idx, s64 flip_arg) {
     }
 }
 
-FramebufferInfo Driver::GetLatestFramebuffer() {
-    std::scoped_lock lk(lock);
-    return latest_framebuffer;
-}
-
-void* Driver::GetBufferAddress(s32 handle, u32 buf_idx) {
+Gpu::FlipInfo Driver::GetFlipInfo(s32 handle, u32 buf_idx) {
     std::scoped_lock lk(lock);
     if (handle <= 0 || static_cast<size_t>(handle) >= ports.size() || buf_idx >= kMaxBuffers) {
-        return nullptr;
+        return {};
     }
-    return ports[handle].buffers[buf_idx];
+    const Port& p = ports[handle];
+    Gpu::FlipInfo f;
+    f.address = reinterpret_cast<u64>(p.buffers[buf_idx]);
+    f.width = p.attr.width;
+    f.height = p.attr.height;
+    f.pitch = p.attr.pitch_in_pixel ? p.attr.pitch_in_pixel : p.attr.width;
+    f.pixel_format = p.attr.pixel_format;
+    f.tiling_mode = static_cast<u32>(p.attr.tiling_mode);
+    return f;
 }
 
 s32 Driver::GetVblankStatus(s32 handle, SceVideoOutVblankStatus* status) {

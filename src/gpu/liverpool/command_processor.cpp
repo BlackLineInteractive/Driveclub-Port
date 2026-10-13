@@ -62,9 +62,7 @@ bool Compare(u32 func, u32 value, u32 ref) {
 
 } // namespace
 
-CommandProcessor::CommandProcessor() {
-    regs.SetDefaults();
-}
+CommandProcessor::CommandProcessor() = default;
 
 CommandProcessor::~CommandProcessor() {
     for (auto& r : rings) {
@@ -101,13 +99,7 @@ void CommandProcessor::Push(u32 index, Job job) {
 
 void CommandProcessor::SubmitGraphics(std::vector<std::span<const u32>> dcbs,
                                       std::function<void()> after) {
-    const u64 submit_idx = ++stats.submits;
-    if (submit_idx <= 10 || submit_idx % 60 == 0) {
-        DC_INFO("gpu: SubmitGraphics #%llu with %zu dcbs", submit_idx, dcbs.size());
-    }
-    if (renderer) {
-        renderer->OnSubmit();
-    }
+    ++stats.submits;
     Push(0, {std::move(dcbs), std::move(after)});
 }
 
@@ -147,8 +139,8 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
             ring.jobs.pop_front();
             ring.busy = true;
         }
-        for (size_t i = 0; i < job.buffers.size(); ++i) {
-            Execute(job.buffers[i], ring.index != 0, 0);
+        for (const auto& buf : job.buffers) {
+            Execute(buf, ring.index != 0, 0);
         }
         if (renderer) {
             renderer->OnSubmit();
@@ -162,6 +154,28 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
         }
         ring.idle_cv.notify_all();
     }
+}
+
+void CommandProcessor::SetRegs(u32 index, const u32* values, u32 count) {
+    if (index + count > RegFile::kSize) {
+        return;
+    }
+    std::memcpy(regs.Data() + index, values, count * 4);
+}
+
+void CommandProcessor::Draw(bool indexed, u32 count, u32 index_offset) {
+    ++stats.draws;
+    if (!renderer || count == 0) {
+        return;
+    }
+    DrawCall dc;
+    dc.indexed = indexed;
+    dc.count = count;
+    dc.instances = num_instances;
+    dc.index_base = index_base;
+    dc.index_offset = index_offset;
+    dc.index_size = index_size;
+    renderer->Draw(regs, dc);
 }
 
 void CommandProcessor::Interrupt(u32 irq) {
@@ -188,8 +202,8 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 break;
             }
             for (u32 i = 0; i < count; ++i) {
-                if (base_reg + i < regs.reg_array.size()) {
-                    regs.reg_array[base_reg + i] = p[1 + i];
+                if (base_reg + i < RegFile::kSize) {
+                    regs[base_reg + i] = p[1 + i];
                 }
             }
             p += 1 + count;
@@ -209,16 +223,16 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             break;
 
         case Op::SetContextReg:
-            std::memcpy(&regs.reg_array[kContextRegBase + body[0]], body + 1, (body_n - 1) * 4);
+            SetRegs(kContextRegBase + body[0], body + 1, body_n - 1);
             break;
         case Op::SetShReg:
-            std::memcpy(&regs.reg_array[kShRegBase + body[0]], body + 1, (body_n - 1) * 4);
+            SetRegs(kShRegBase + body[0], body + 1, body_n - 1);
             break;
         case Op::SetUconfigReg:
-            std::memcpy(&regs.reg_array[kUconfigRegBase + body[0]], body + 1, (body_n - 1) * 4);
+            SetRegs(kUconfigRegBase + body[0], body + 1, body_n - 1);
             break;
         case Op::SetConfigReg:
-            std::memcpy(&regs.reg_array[kConfigRegBase + body[0]], body + 1, (body_n - 1) * 4);
+            SetRegs(kConfigRegBase + body[0], body + 1, body_n - 1);
             break;
 
         case Op::IndirectBuffer: {
@@ -285,88 +299,44 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             break;
         }
 
-        case Op::DrawIndex2: {
-            ++stats.draws;
-            regs.num_indices = body[3];
-            regs.draw_initiator = body[4];
-            if (renderer) {
-                renderer->Draw(regs, true);
-            }
+        case Op::IndexType:
+            index_size = (body[0] & 3) == 1 ? 4 : 2;
             break;
-        }
-        case Op::DrawIndexAuto: {
-            const u64 cur_draw = ++stats.draws;
-            regs.num_indices = body[0];
-            regs.draw_initiator = body[1];
-            if (cur_draw <= 5 || cur_draw % 100 == 0) {
-                const u64 vs_addr = regs.vs_program.Address<uintptr_t>();
-                const u64 ps_addr = regs.ps_program.Address<uintptr_t>();
-                const u64 cb0_base = regs.color_buffers[0].Address();
-                const u32 cb0_pitch = regs.color_buffers[0].Pitch();
-                DC_INFO("gpu: draw #%llu DrawIndexAuto count=%u vs=%#llx ps=%#llx cb0=%#llx pitch=%u prim=%u",
-                        cur_draw, body[0], vs_addr, ps_addr, cb0_base, cb0_pitch, static_cast<u32>(regs.primitive_type));
-                if (cur_draw == 5 || cur_draw == 100) {
-                    const u64 vb_addr = (0x300000000ULL | regs.vs_program.user_data[4]);
-                    const u64 cb_addr = (0x300000000ULL | regs.vs_program.user_data[0]);
-                    DC_INFO("gpu: inspect draw #%llu: vb_addr=%#llx cb_addr=%#llx", cur_draw, vb_addr, cb_addr);
-                    const u32* vb32 = reinterpret_cast<const u32*>(vb_addr);
-                    for (int i = 0; i < 450; ++i) {
-                        if (vb32[i] != 0) {
-                            DC_INFO("gpu: vb32[%d] = %#x (f=%f)", i, vb32[i], reinterpret_cast<const float*>(&vb32[i])[0]);
-                        }
-                    }
-                    const u32* cb32 = reinterpret_cast<const u32*>(cb_addr);
-                    for (int i = 0; i < 128; ++i) {
-                        if (cb32[i] != 0) {
-                            DC_INFO("gpu: cb32[%d] = %#x (f=%f)", i, cb32[i], reinterpret_cast<const float*>(&cb32[i])[0]);
-                        }
-                    }
-                }
-            }
-            if (renderer) {
-                renderer->Draw(regs, false);
-            }
+        case Op::IndexBase:
+            index_base = u64(body[0] & ~1u) | (u64(body[1] & 0xFFFF) << 32);
             break;
-        }
-        case Op::DrawIndexOffset2: {
-            ++stats.draws;
-            regs.index_offset = body[1];
-            regs.num_indices = body[2];
-            regs.draw_initiator = body[3];
-            if (renderer) {
-                renderer->Draw(regs, true);
-            }
+        case Op::NumInstances:
+            num_instances = body[0] ? body[0] : 1;
             break;
-        }
-        case Op::DrawIndirect: {
-            ++stats.draws;
-            if (renderer) {
-                renderer->DrawIndirect(regs, false, static_cast<u64>(body[0]) | (static_cast<u64>(body[1]) << 32), 1, 0);
-            }
-            break;
-        }
-        case Op::DrawIndexIndirect: {
-            ++stats.draws;
-            if (renderer) {
-                renderer->DrawIndirect(regs, true, static_cast<u64>(body[0]) | (static_cast<u64>(body[1]) << 32), 1, 0);
-            }
-            break;
-        }
 
-        case Op::DispatchDirect: {
+        case Op::DrawIndex2:
+            index_base = u64(body[1]) | (u64(body[2] & 0xFFFF) << 32);
+            Draw(true, body[3], 0);
+            break;
+        case Op::DrawIndexOffset2:
+            Draw(true, body[2], body[1]);
+            break;
+        case Op::DrawIndexAuto:
+            Draw(false, body[0], 0);
+            break;
+        case Op::DrawIndirect:
+        case Op::DrawIndexIndirect:
+            ++stats.draws;
+            if (!warned_indirect) {
+                warned_indirect = true;
+                DC_WARN("gpu: indirect draws are not implemented yet");
+            }
+            break;
+
+        case Op::DispatchDirect:
             ++stats.dispatches;
             if (renderer) {
                 renderer->Dispatch(regs, body[0], body[1], body[2]);
             }
             break;
-        }
-        case Op::DispatchIndirect: {
+        case Op::DispatchIndirect:
             ++stats.dispatches;
-            if (renderer) {
-                renderer->DispatchIndirect(regs, static_cast<u64>(body[0]) | (static_cast<u64>(body[1]) << 32));
-            }
             break;
-        }
 
         default:
             break;
