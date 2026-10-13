@@ -185,6 +185,13 @@ struct MetalRenderer::Impl {
     id<MTLFunction> debug_fs = nil;    // DC_DEBUG_FLAT: every pixel shader outputs magenta
     bool trace = false;
     bool stats = false;                // DC_GPU_STATS: per-second GPU time and submit counts
+    bool profile = false;              // DC_GPU_PROFILE: GPU time per shader (one command buffer per call)
+    struct ProfileEntry {
+        double seconds = 0;
+        u64 calls = 0;
+    };
+    std::mutex profile_lock;
+    std::unordered_map<std::string, ProfileEntry> profile_data;
     std::atomic<u64> gpu_ns{0};
     u64 stat_commits = 0, stat_waits = 0, stat_dispatches = 0, stat_draws = 0;
     double stat_wait_s = 0;
@@ -213,6 +220,7 @@ struct MetalRenderer::Impl {
         trace = std::getenv("DC_GPU_TRACE") != nullptr;
         sync_shaders = std::getenv("DC_SYNC_SHADERS") != nullptr;
         stats = std::getenv("DC_GPU_STATS") != nullptr;
+        profile = std::getenv("DC_GPU_PROFILE") != nullptr;
         compiler = std::make_unique<ShaderCompiler>(device, 4);
 
         void* view = Core::Memory::DirectHostView();
@@ -365,6 +373,41 @@ struct MetalRenderer::Impl {
         cmd = nil;
         if (wait) {
             WaitLast();
+        }
+    }
+
+    // DC_GPU_PROFILE: puts the work since the last cut in its own command
+    // buffer and charges its GPU time to `what`.
+    void ProfileCut(std::string what) {
+        if (!cmd) {
+            return;
+        }
+        EndPass();
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
+          std::scoped_lock lk(profile_lock);
+          auto& e = profile_data[what];
+          e.seconds += c.GPUEndTime - c.GPUStartTime;
+          ++e.calls;
+        }];
+        Commit(false);
+    }
+
+    void ProfileReport() {
+        std::vector<std::pair<std::string, ProfileEntry>> v;
+        {
+            std::scoped_lock lk(profile_lock);
+            v.assign(profile_data.begin(), profile_data.end());
+            profile_data.clear();
+        }
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.seconds > b.second.seconds; });
+        double total = 0;
+        for (const auto& [k, e] : v) {
+            total += e.seconds;
+        }
+        DC_INFO("gpu profile: %.1f ms GPU total", total * 1e3);
+        for (size_t k = 0; k < v.size() && k < 15; ++k) {
+            DC_INFO("gpu profile: %7.1f ms %6llu calls  %s", v[k].second.seconds * 1e3,
+                    (unsigned long long)v[k].second.calls, v[k].first.c_str());
         }
     }
 
@@ -1389,6 +1432,9 @@ void MetalRenderer::Impl::Flip(const FlipInfo& f) {
                     frames / dt, gpu_ns.exchange(0) / 1e9 / dt * 100, stat_wait_s / dt * 100, stat_draws / double(frames),
                     stat_dispatches / double(frames), stat_commits / double(frames), stat_waits / double(frames));
             frames = stat_commits = stat_waits = stat_draws = stat_dispatches = 0;
+            if (profile) {
+                ProfileReport();
+            }
             stat_wait_s = 0;
             stat_t0 = now;
         }
@@ -1484,6 +1530,12 @@ void MetalRenderer::Draw(const RegFile& regs, const DrawCall& draw) {
     std::scoped_lock lk(impl->lock);
     @autoreleasepool {
         impl->Draw(regs, draw);
+        if (impl->profile) {
+            char what[64];
+            std::snprintf(what, sizeof(what), "vs %#llx ps %#llx", regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_VS),
+                          regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_PS));
+            impl->ProfileCut(what);
+        }
     }
 }
 
@@ -1491,6 +1543,11 @@ void MetalRenderer::Dispatch(const RegFile& regs, std::uint32_t x, std::uint32_t
     std::scoped_lock lk(impl->lock);
     @autoreleasepool {
         impl->Dispatch(regs, x, y, z);
+        if (impl->profile) {
+            char what[64];
+            std::snprintf(what, sizeof(what), "cs %#llx %ux%ux%u", regs.ProgramAddr(Liverpool::Reg::COMPUTE_PGM_LO), x, y, z);
+            impl->ProfileCut(what);
+        }
     }
 }
 
