@@ -3,10 +3,11 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 1. PS4 Game Dumps, Packages & Proprietary Assets (Copyright / DMCA)
+# 1. PS4 Game Media, ROMs, Packages & Proprietary Assets (Copyright / DMCA)
 # ------------------------------------------------------------------------------
 # Disc & PKG dumps
 /pkg/
+/rom/
 *.pkg
 *.iso
 *.img
@@ -14,26 +15,42 @@
 # Extracted game filesystem and assets
 /extracted/
 /extracted*/
-/rom/
 /dump/
 /assets/
+/Image0/
+/Image0*/
 
 # PS4 Executables and system binaries
 eboot.bin
+*.bin
 *.elf
 *.self
 *.prx
 *.sprx
 param.sfo
 *.sfo
+keystone
+playgo*
 
-# Video, audio and container archives
+# Game data containers & engine archives (Evolution Studios engine formats)
+*.dat
+*.chc
+*.ndx
+*.plt
+*.trp
+sce_module/
+sce_sys/
+
+# Graphics, audio & video assets
 *.at9
 *.vag
 *.bik
 *.mp4
 *.pck
 *.bank
+*.dds
+icon*.png
+pic*.png
 
 # ------------------------------------------------------------------------------
 # 2. Reverse Engineering Databases & Tooling (Ghidra, IDA, Radare2)
@@ -49,17 +66,39 @@ param.sfo
 *.id0
 *.id1
 *.id2
-*.nam
 *.r2
 
-# Disassembly & export logs
+# Disassembly, transpile & export logs
 *.log
 codegen-warnings.log
 
 # ------------------------------------------------------------------------------
-# 3. Emulator Dumps, Caches & Submodules
+# 3. Transpiler / Recompiler & Code Generation
+# ------------------------------------------------------------------------------
+/generated/
+/recomp/out/
+/driveclub-recomp/generated/*
+!/driveclub-recomp/generated/rexglue.cmake
+/driveclub-recomp/out/
+
+# ------------------------------------------------------------------------------
+# 4. Standalone Tool Binaries & Configuration (Keys / Secrets)
+# ------------------------------------------------------------------------------
+tools/pkg_pfs_tool
+tools/unself
+tools/shadpkg
+tools/unxmem
+tools/*.exe
+tools/*.dylib
+tools/*.so
+tools/*.a
+tools/config.ini
+
+# ------------------------------------------------------------------------------
+# 5. Emulator Dumps, Caches & Submodules
 # ------------------------------------------------------------------------------
 /shadps4/
+/emulator/
 
 # Shader dumps and pipeline caches
 /shaders/
@@ -75,7 +114,7 @@ codegen-warnings.log
 /screenshots/
 
 # ------------------------------------------------------------------------------
-# 4. Build & Compiler Artifacts (C/C++ / CMake / Clang / Ninja)
+# 6. Build & Compiler Artifacts (C/C++ / CMake / Clang / Ninja)
 # ------------------------------------------------------------------------------
 /build/
 /build-*/
@@ -102,7 +141,7 @@ compile_commands.json
 CMakeUserPresets.json
 
 # ------------------------------------------------------------------------------
-# 5. Scripting & Environment
+# 7. Scripting & Environment
 # ------------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
@@ -116,7 +155,7 @@ env/
 .env
 
 # ------------------------------------------------------------------------------
-# 6. OS & System Specific Files
+# 8. OS & System Specific Files
 # ------------------------------------------------------------------------------
 # macOS
 .DS_Store
@@ -135,7 +174,7 @@ imgui.ini
 *.ini
 
 # ------------------------------------------------------------------------------
-# 7. IDEs & Editors
+# 9. IDEs & Editors
 # ------------------------------------------------------------------------------
 .idea/
 *.iml
@@ -152,7 +191,7 @@ imgui.ini
 \#*\#
 
 # ------------------------------------------------------------------------------
-# 8. Temporary & Crash Dumps
+# 10. Temporary & Crash Dumps
 # ------------------------------------------------------------------------------
 /tmp/
 /temp/
