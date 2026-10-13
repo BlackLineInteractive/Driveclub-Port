@@ -111,8 +111,6 @@ s32 sceAvPlayerResume(void* handle) {
 }
 
 bool sceAvPlayerIsActive(void* handle) {
-    static bool logged = false;
-    if (!logged) { logged = true; DC_INFO("sceAvPlayerIsActive"); }
     return (handle == &g_player) ? g_player.active : false;
 }
 
@@ -214,7 +212,6 @@ s32 sceAvPlayerSetTrickSpeed(void* handle, s32 speed) {
 
 s32 sceAvPlayerStreamCount(void* handle) {
     (void)handle;
-    DC_INFO("sceAvPlayerStreamCount");
     return 1;
 }
 

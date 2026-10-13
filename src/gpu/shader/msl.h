@@ -7,9 +7,10 @@
 // results) are kept per lane as all-ones / all-zero words, so the bitwise
 // scalar ops that combine masks work unchanged. Guest memory is reached
 // through two Metal buffers that alias the whole direct-memory object, with a
-// small range table translating guest virtual addresses to offsets.
+// page table translating guest virtual addresses to offsets.
 
 #include <array>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -29,17 +30,18 @@ constexpr u32 Gds = 5;      // device uint[16K]: global data share (compute stag
 } // namespace Binding
 
 // Host-side mirrors of the MSL structs in the prelude.
-struct alignas(8) GpuRange {
-    u64 start;
-    u64 size;
-    u64 phys;
-};
-struct alignas(8) GpuMemMap {
-    static constexpr u32 kMaxRanges = 32;
-    u32 count;
-    u32 pad;
+// Header of the page table bound at Binding::MemMap; `pages` s32 entries
+// follow it, each the page's (phys - va) in 16 KB units, or kUnmapped.
+struct GpuMemMap {
+    static constexpr u32 kMinShift = 14;
+    static constexpr u32 kMaxShift = 21;
+    static constexpr s32 kUnmapped = INT32_MIN;
+    u64 base;
+    u64 pages;
     u64 split;
-    GpuRange ranges[kMaxRanges];
+    u32 shift;
+    u32 pad;
+    u64 limit; // physical size
 };
 struct alignas(16) GpuDrawConsts {
     float vp_scale[4];  // viewport scale (1 where the transform is disabled)

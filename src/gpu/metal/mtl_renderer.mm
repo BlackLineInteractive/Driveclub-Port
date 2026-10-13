@@ -2,7 +2,9 @@
 
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -243,23 +245,56 @@ struct MetalRenderer::Impl {
         }
     }
 
+    // Metal compiles lazily and stalls the GPU thread meanwhile; name the slow ones.
+    static void ReportSlowCompile(const char* what, u64 a, u64 b, std::chrono::steady_clock::time_point t0) {
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (s > 0.5) {
+            DC_WARN("gpu: %s %#llx/%#llx took %.1f s to compile", what, a, b, s);
+        }
+    }
+
     void UpdateMemMap() {
         const u64 gen = Core::Memory::DirectMapGeneration();
         if (gen == mem_map_gen && mem_map) {
             return;
         }
         mem_map_gen = gen;
-        Shader::GpuMemMap map{};
-        map.split = mem_split;
-        for (const auto& r : Core::Memory::DirectMappings()) {
-            if (map.count == Shader::GpuMemMap::kMaxRanges) {
-                ReportOnce("too many direct mappings for the GPU range table");
+        auto ranges = Core::Memory::DirectMappings();
+        std::sort(ranges.begin(), ranges.end(), [](const auto& x, const auto& y) { return x.start < y.start; });
+        // Largest page size at which no page holds two mappings.
+        u32 shift = Shader::GpuMemMap::kMaxShift;
+        for (; shift > Shader::GpuMemMap::kMinShift; --shift) {
+            const u64 page = 1ull << shift;
+            u64 prev_end = 0;
+            bool ok = true;
+            for (const auto& r : ranges) {
+                ok = ok && (r.start & (page - 1)) == 0 && ((prev_end + page - 1) & ~(page - 1)) <= r.start;
+                prev_end = r.start + r.size;
+            }
+            if (ok) {
                 break;
             }
-            map.ranges[map.count++] = {r.start, r.size, r.phys};
+        }
+        const u64 page = 1ull << shift;
+        const u64 lo = ranges.empty() ? 0 : ranges.front().start & ~(page - 1);
+        const u64 hi = ranges.empty() ? 0 : ranges.back().start + ranges.back().size;
+        const u64 pages = (hi - lo + page - 1) >> shift;
+        constexpr u64 header = sizeof(Shader::GpuMemMap) / 4;
+        std::vector<s32> table(header + pages, Shader::GpuMemMap::kUnmapped);
+        auto& map = *reinterpret_cast<Shader::GpuMemMap*>(table.data());
+        map = {lo, pages, mem_split, shift, 0, Core::Memory::kDirectSize};
+        for (const auto& r : ranges) {
+            if (((r.start ^ r.phys) & ((1ull << Shader::GpuMemMap::kMinShift) - 1)) != 0) {
+                ReportOnce("direct mapping not 16 KB aligned");
+            }
+            const s32 delta = static_cast<s32>((static_cast<s64>(r.phys) - static_cast<s64>(r.start)) >>
+                                               Shader::GpuMemMap::kMinShift);
+            for (u64 va = r.start & ~(page - 1); va < r.start + r.size; va += page) {
+                table[header + ((va - lo) >> shift)] = delta;
+            }
         }
         // A fresh buffer: work already recorded keeps reading the old table.
-        mem_map = [device newBufferWithBytes:&map length:sizeof(map) options:MTLResourceStorageModeShared];
+        mem_map = [device newBufferWithBytes:table.data() length:table.size() * 4 options:MTLResourceStorageModeShared];
     }
 
     // ================= recording =================
@@ -715,9 +750,9 @@ struct MetalRenderer::Impl {
         done = true;
         std::string src = Shader::kMslPrelude;
         src += "kernel void memtest(device uint* gm0 [[buffer(1)]], device uint* gm1 [[buffer(2)]], "
-               "constant DcMap& gmap [[buffer(3)]], constant ulong& addr [[buffer(4)]], device uint* out [[buffer(5)]]) {"
+               "device const DcMap& gmap [[buffer(3)]], constant ulong& addr [[buffer(4)]], device uint* out [[buffer(5)]]) {"
                " DcMem mem = {gm0, gm1, &gmap}; for (uint i = 0; i < 4; ++i) out[i] = dc_ld(mem, addr + i * 4);"
-               " out[4] = gmap.count; out[5] = uint(gmap.split >> 20); }";
+               " out[4] = uint(gmap.pages); out[5] = uint(gmap.split >> 20); }";
         NSError* err = nil;
         id<MTLLibrary> lib = [device newLibraryWithSource:@(src.c_str()) options:nil error:&err];
         id<MTLComputePipelineState> cp = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"memtest"] error:&err];
@@ -978,7 +1013,9 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         }
         d.depthAttachmentPixelFormat = depth_fmt;
         NSError* err = nil;
+        const auto t0 = std::chrono::steady_clock::now();
         pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
+        ReportSlowCompile("pipeline", vs_addr, ps_addr, t0);
         if (!pso) {
             DC_ERROR("gpu: pipeline (vs %#llx ps %#llx): %s", vs_addr, ps_addr,
                      err ? err.localizedDescription.UTF8String : "?");
@@ -1213,7 +1250,9 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
         d.computeFunction = fn;
         d.maxTotalThreadsPerThreadgroup = group; // the guest's group size must fit as is
         NSError* err = nil;
+        const auto t0 = std::chrono::steady_clock::now();
         pso = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:&err];
+        ReportSlowCompile("compute pipeline", addr, 0, t0);
         if (!pso) {
             DC_ERROR("gpu: compute pipeline %#llx: %s", addr, err ? err.localizedDescription.UTF8String : "?");
         } else if (pso.maxTotalThreadsPerThreadgroup < group) {

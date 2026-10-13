@@ -7,22 +7,21 @@ namespace Gpu::Shader {
 inline constexpr const char* kMslPrelude = R"MSL(#include <metal_stdlib>
 using namespace metal;
 
-struct DcRange { ulong start; ulong size; ulong phys; };
-struct DcMap { uint count; uint pad; ulong split; DcRange r[32]; };
+// Guest VA -> physical page table: a header followed by one entry per page,
+// the page's (phys - va) in 16 KB units (INT_MIN = unmapped).
+struct DcMap { ulong base; ulong pages; ulong split; uint shift; uint pad; ulong limit; };
 struct DcDraw { float4 vp_scale; float4 vp_offset; float2 rt_scale; uint vte; uint pad; };
-struct DcMem { device uint* lo; device uint* hi; constant DcMap* map; };
+struct DcMem { device uint* lo; device uint* hi; device const DcMap* map; };
 
 // ---- guest memory ----
 static inline device uint* dc_ptr(thread const DcMem& m, ulong va) {
-    constant DcMap& mp = *m.map;
-    for (uint i = 0u; i < mp.count; ++i) {
-        ulong d = va - mp.r[i].start;
-        if (d < mp.r[i].size) {
-            ulong p = mp.r[i].phys + d;
-            return p < mp.split ? m.lo + (p >> 2) : m.hi + ((p - mp.split) >> 2);
-        }
-    }
-    return nullptr;
+    ulong i = (va - m.map->base) >> m.map->shift;
+    if (i >= m.map->pages) return nullptr;
+    int e = ((device const int*)(m.map + 1))[i];
+    if (e == int(0x80000000u)) return nullptr;
+    ulong p = va + ulong(long(e) << 14);
+    if (p >= m.map->limit) return nullptr;
+    return p < m.map->split ? m.lo + (p >> 2) : m.hi + ((p - m.map->split) >> 2);
 }
 static inline uint dc_ld(thread const DcMem& m, ulong va) {
     device uint* p = dc_ptr(m, va & ~3ul);

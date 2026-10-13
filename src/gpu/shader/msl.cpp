@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <set>
+#include <unordered_map>
 
 #include "gpu/shader/msl_prelude.h"
 
@@ -179,13 +180,24 @@ private:
     void EmitBuffer(const Inst& i);
     void EmitImage(const Inst& i);
     void EmitExp(const Inst& i);
-    void Jump(u32 target) { Line("{ pc_ = " + Hex(target) + "; continue; }"); }
+    void Jump(u32 target) {
+        if (!structured) {
+            Line("{ pc_ = " + Hex(target) + "; continue; }");
+            return;
+        }
+        const u32 t = index_of.at(target);
+        Line(t <= cur ? "{ tgt_ = " + N(t) + "u; continue; }" : "tgt_ = " + N(t) + "u;");
+    }
     void End() {
         if (p.stage == Stage::Fragment) {
             Line("if (!dc_exported) discard_fragment();");
         }
         Line(p.stage == Stage::Compute ? "return;" : "return out;");
     }
+
+    bool Structure();
+    void EmitStructured();
+    void EmitSwitch();
 
     std::string AttrExpr(u32 attr, u32 chan);
     std::string TexArgs() const;     // call arguments for dc_run
@@ -197,6 +209,12 @@ private:
     u32 max_sgpr = 0;
     u32 max_vgpr = 0;
     std::set<u32> ps_params; // VS params the PS reads
+
+    // Structured control flow (see Structure()).
+    bool structured = false;
+    u32 cur = 0;                              // index of the instruction being emitted
+    std::unordered_map<u32, u32> index_of;    // pc -> instruction index
+    std::unordered_map<u32, u32> loop_end;    // loop header index -> index of its last back edge
 };
 
 void Emitter::Emit(const Inst& i) {
@@ -1285,8 +1303,101 @@ std::string Emitter::TexArgs() const {
     return s;
 }
 
-std::string Emitter::Run() {
-    // Body first: it records which registers and inputs are used.
+// Branchy code can always run as a `switch (pc_)` dispatch loop, but GPU
+// compilers take seconds on that shape. GCN code from the shader compiler is
+// structured, so instead each basic block becomes `if (tgt_ <= index) {..}`:
+// a forward branch sets tgt_ to its target and the blocks in between are
+// skipped; a backward branch becomes `continue` of a `while (true)` around
+// its loop. That needs the loops to nest and every back edge to target its
+// innermost loop; otherwise the dispatch loop is used.
+bool Emitter::Structure() {
+    if (!p.has_branches) {
+        return false;
+    }
+    for (u32 k = 0; k < p.code.size(); ++k) {
+        index_of[p.code[k].pc] = k;
+    }
+    const Inst& last = p.code.back();
+    index_of.emplace(last.pc + last.size * 4u, static_cast<u32>(p.code.size()));
+    for (u32 k = 0; k < p.code.size(); ++k) {
+        const Inst& i = p.code[k];
+        if (!IsBranch(i)) {
+            continue;
+        }
+        const auto it = index_of.find(BranchTarget(i));
+        if (it == index_of.end()) {
+            return false;
+        }
+        if (it->second <= k) {
+            u32& end = loop_end[it->second];
+            end = std::max(end, k);
+        }
+    }
+    // Loops [h, e] must nest, and a back edge must target its innermost loop.
+    for (const auto& [h1, e1] : loop_end) {
+        for (const auto& [h2, e2] : loop_end) {
+            if (h1 < h2 && h2 <= e1 && e1 < e2) {
+                return false;
+            }
+        }
+    }
+    for (u32 k = 0; k < p.code.size(); ++k) {
+        const Inst& i = p.code[k];
+        if (!IsBranch(i)) {
+            continue;
+        }
+        const u32 h = index_of.at(BranchTarget(i));
+        if (h > k) {
+            continue;
+        }
+        for (const auto& [h2, e2] : loop_end) {
+            if (h < h2 && h2 <= k && k <= e2) {
+                return false; // continue would hit the inner loop
+            }
+        }
+    }
+    return true;
+}
+
+void Emitter::EmitStructured() {
+    std::set<u32> starts; // first instruction of every basic block
+    for (u32 k = 0; k < p.code.size(); ++k) {
+        const Inst& i = p.code[k];
+        if (IsBranch(i)) {
+            starts.insert(index_of.at(BranchTarget(i)));
+            starts.insert(k + 1);
+        }
+    }
+    bool open = false;
+    auto close = [&] {
+        if (open) {
+            body += "    }\n";
+            open = false;
+        }
+    };
+    for (cur = 0; cur < p.code.size(); ++cur) {
+        if (loop_end.count(cur)) {
+            close();
+            body += "    while (true) {\n";
+        }
+        if (cur == 0 || starts.count(cur)) {
+            close();
+            body += "    if (tgt_ <= " + N(cur) + "u) {\n";
+            open = true;
+        }
+        Emit(p.code[cur]);
+        for (const auto& [h, e] : loop_end) {
+            if (e == cur) {
+                close();
+                body += "    break;\n    }\n";
+            }
+        }
+    }
+    close();
+    End();
+}
+
+void Emitter::EmitSwitch() {
     size_t label = 0;
     for (const Inst& i : p.code) {
         while (p.has_branches && label < p.labels.size() && p.labels[label] <= i.pc) {
@@ -1298,6 +1409,16 @@ std::string Emitter::Run() {
         Emit(i);
     }
     End();
+}
+
+std::string Emitter::Run() {
+    // Body first: it records which registers and inputs are used.
+    structured = Structure();
+    if (structured) {
+        EmitStructured();
+    } else {
+        EmitSwitch();
+    }
 
     std::string decl;
     auto dl = [&](const std::string& s) { decl += "    " + s + "\n"; };
@@ -1359,7 +1480,9 @@ std::string Emitter::Run() {
     }
 
     std::string wrapped;
-    if (p.has_branches) {
+    if (structured) {
+        wrapped = "    uint tgt_ = 0u;\n" + body;
+    } else if (p.has_branches) {
         wrapped = "    uint pc_ = 0u;\n    while (true) {\n    switch (pc_) {\n    case 0u:\n" + body +
                   "    default:\n        " + (p.stage == Stage::Fragment ? "if (!dc_exported) discard_fragment(); " : "") +
                   (p.stage == Stage::Compute ? "return;" : "return out;") + "\n    }\n    }\n";
@@ -1371,7 +1494,7 @@ std::string Emitter::Run() {
     src += "\n";
     const std::string mem_params =
         "constant uint* ud [[buffer(0)]], device uint* gm0 [[buffer(1)]], device uint* gm1 [[buffer(2)]], "
-        "constant DcMap& gmap [[buffer(3)]]";
+        "device const DcMap& gmap [[buffer(3)]]";
     if (p.stage == Stage::Vertex) {
         src += "struct VsOut {\n    float4 pos [[position]];\n";
         for (u32 k = 0; k < 32; ++k) {
