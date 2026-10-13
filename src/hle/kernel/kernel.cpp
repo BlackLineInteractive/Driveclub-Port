@@ -8,6 +8,7 @@
 #include "core/runtime.h"
 #include "core/tls.h"
 #include "hle/hle.h"
+#include "hle/kernel/kernel.h"
 
 namespace Hle {
 
@@ -52,9 +53,16 @@ s32 sceKernelLoadStartModule(const char* path, u64 args, const void* argp, u32 f
     return HandleOf(m);
 }
 
+// libc hands libkernel its malloc API table; nothing in our runtime needs it.
+s32 _sceKernelRtldSetApplicationHeapAPI(void* api) {
+    return 0;
+}
+
 } // namespace
 
 void RegisterKernel() {
+    Kernel::RegisterPthread();
+    DC_HLE("libkernel", _sceKernelRtldSetApplicationHeapAPI);
     DC_HLE("libkernel", __tls_get_addr);
     DC_HLE("libkernel", sceKernelGetProcParam);
     DC_HLE("libkernel", sceKernelLoadStartModule);

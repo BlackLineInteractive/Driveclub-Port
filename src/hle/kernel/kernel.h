@@ -18,8 +18,5 @@ constexpr s32 OrbisError(int err) {
 // Guest timespec / timeval are FreeBSD amd64 layouts: same as macOS x86_64.
 
 void RegisterPthread();
-void RegisterTime();
-void RegisterMemory();
-void RegisterFile();
 
 } // namespace Hle::Kernel

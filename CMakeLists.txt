@@ -48,6 +48,8 @@ add_executable(driveclub
     src/hle/hle.cpp
     src/hle/hle.h
     src/hle/kernel/kernel.cpp
+    src/hle/kernel/kernel.h
+    src/hle/kernel/pthread.cpp
     src/hle/nid_db.inc
 )
 

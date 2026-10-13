@@ -350,6 +350,14 @@ void Linker::PrintReport() const {
     for (const auto& [lib, n] : sorted) {
         DC_INFO("  %5llu %s", n, lib.c_str());
     }
+    // DC_LIST_UNRESOLVED=1 prints every missing function by name.
+    if (std::getenv("DC_LIST_UNRESOLVED")) {
+        for (const Unresolved& u : unresolved) {
+            const auto name = Hle::NameOf(u.nid);
+            DC_INFO("  missing %s %.*s", u.library.c_str(), static_cast<int>(name.size()),
+                    name.data());
+        }
+    }
 }
 
 } // namespace Core::Loader
