@@ -10,6 +10,15 @@ namespace Hle {
 void RegisterKernel();
 namespace VideoOut { void RegisterVideoOut(); }
 namespace GnmDriver { void RegisterGnmDriver(); }
+namespace PlayGo { void RegisterPlayGo(); }
+namespace UserService { void RegisterUserService(); }
+namespace SystemService { void RegisterSystemService(); }
+namespace SaveData { void RegisterSaveData(); }
+namespace Pad { void RegisterPad(); }
+namespace Rtc { void RegisterRtc(); }
+namespace Sysmodule { void RegisterSysmodule(); }
+namespace Net { void RegisterNet(); }
+namespace MiscServices { void RegisterMiscServices(); }
 
 namespace {
 
@@ -86,6 +95,15 @@ void RegisterAll() {
     RegisterKernel();
     VideoOut::RegisterVideoOut();
     GnmDriver::RegisterGnmDriver();
+    PlayGo::RegisterPlayGo();
+    UserService::RegisterUserService();
+    SystemService::RegisterSystemService();
+    SaveData::RegisterSaveData();
+    Pad::RegisterPad();
+    Rtc::RegisterRtc();
+    Sysmodule::RegisterSysmodule();
+    Net::RegisterNet();
+    MiscServices::RegisterMiscServices();
 }
 
 } // namespace Hle

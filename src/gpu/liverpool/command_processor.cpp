@@ -165,8 +165,22 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
     while (p < end) {
         const u32 header = *p;
         const u32 type = HeaderType(header);
-        if (type == 2) { // filler
+        if (header == 0 || type == 2) { // filler / trailing padding
             ++p;
+            continue;
+        }
+        if (type == 0) {
+            const u32 base_reg = header & 0xFFFF;
+            const u32 count = ((header >> 16) & 0x3FFF) + 1;
+            if (p + 1 + count > end) {
+                break;
+            }
+            for (u32 i = 0; i < count; ++i) {
+                if (base_reg + i < regs.size()) {
+                    regs[base_reg + i] = p[1 + i];
+                }
+            }
+            p += 1 + count;
             continue;
         }
         if (type != 3) {

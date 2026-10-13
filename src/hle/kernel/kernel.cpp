@@ -46,11 +46,11 @@ s32 sceKernelLoadStartModule(const char* path, u64 args, const void* argp, u32 f
         DC_WARN("sceKernelLoadStartModule(%s): not found", path);
         return static_cast<s32>(0x80020002); // ORBIS_KERNEL_ERROR_ENOENT
     }
-    const int ret = Core::Runtime::StartModule(name.c_str());
+    const int ret = Core::Runtime::StartModule(name.c_str(), args, argp);
     if (result) {
         *result = ret;
     }
-    DC_INFO("sceKernelLoadStartModule(%s) -> handle %d", path, HandleOf(m));
+    DC_INFO("sceKernelLoadStartModule(%s) -> handle %d (ret=%d)", path, HandleOf(m), ret);
     return HandleOf(m);
 }
 

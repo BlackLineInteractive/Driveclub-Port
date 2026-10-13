@@ -66,7 +66,7 @@ void* GuestMain(void*) {
 
 } // namespace
 
-int StartModule(const char* name) {
+int StartModule(const char* name, u64 args, const void* argp) {
     Loader::Module* m = Loader::Linker::Instance()->FindModule(name);
     if (!m) {
         DC_WARN("module_start: %s is not loaded", name);
@@ -81,10 +81,10 @@ int StartModule(const char* name) {
     if (!m->HasInit()) {
         return 0;
     }
-    DC_INFO("starting module %s", name);
+    DC_INFO("starting module %s with args=%llu argp=%p", name, args, argp);
     using ModuleStart = int (*)(u64 args, const void* argp, void* param);
     const int ret = reinterpret_cast<ModuleStart>(m->InitAddr())(
-        0, nullptr, reinterpret_cast<void*>(m->ProcParam()));
+        args, argp, reinterpret_cast<void*>(m->ProcParam()));
     DC_INFO("module %s started: %d", name, ret);
     return ret;
 }

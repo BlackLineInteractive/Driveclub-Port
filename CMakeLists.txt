@@ -65,6 +65,24 @@ add_executable(driveclub
     src/hle/video_out/video_out.cpp
     src/hle/gnmdriver/gnmdriver.h
     src/hle/gnmdriver/gnmdriver.cpp
+    src/hle/playgo/playgo.h
+    src/hle/playgo/playgo.cpp
+    src/hle/user_service/user_service.h
+    src/hle/user_service/user_service.cpp
+    src/hle/system_service/system_service.h
+    src/hle/system_service/system_service.cpp
+    src/hle/save_data/save_data.h
+    src/hle/save_data/save_data.cpp
+    src/hle/pad/pad.h
+    src/hle/pad/pad.cpp
+    src/hle/rtc/rtc.h
+    src/hle/rtc/rtc.cpp
+    src/hle/sysmodule/sysmodule.h
+    src/hle/sysmodule/sysmodule.cpp
+    src/hle/net/net.h
+    src/hle/net/net.cpp
+    src/hle/services/misc_services.h
+    src/hle/services/misc_services.cpp
     src/hle/nid_db.inc
 )
 
