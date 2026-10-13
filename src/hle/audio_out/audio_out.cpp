@@ -8,7 +8,9 @@
 // into a per-port ring; SDL pulls from it on its own audio thread, so no SDL
 // call ever runs on a guest thread.
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <chrono>
 #include <mutex>
 #include <condition_variable>
@@ -43,7 +45,10 @@ struct Port {
     u64 read = 0, write = 0; // byte counters
     float gain = 1.0f;       // applied on the SDL thread
     float applied_gain = 1.0f;
-    u64 loud_buffers = 0;    // diagnostics: buffers that were not silent
+    bool is_float = false;
+    // Diagnostics: peak level, logged every few seconds while there is sound.
+    float peak = 0.0f;
+    u64 meter_buffers = 0;
 };
 
 std::mutex g_lock; // open/close and handle lookup
@@ -82,6 +87,28 @@ void SDLCALL Feed(void* user, SDL_AudioStream* stream, int additional, int /*tot
     p.cv.notify_all();
 }
 
+void Meter(Port& p, const u8* src) {
+    // Every 16th sample is plenty for a level meter.
+    if (p.is_float) {
+        const auto* f = reinterpret_cast<const float*>(src);
+        for (u32 k = 0; k < p.buffer_bytes / 4; k += 16) {
+            p.peak = std::max(p.peak, std::abs(f[k]));
+        }
+    } else {
+        const auto* v = reinterpret_cast<const s16*>(src);
+        for (u32 k = 0; k < p.buffer_bytes / 2; k += 16) {
+            p.peak = std::max(p.peak, std::abs(v[k] / 32768.0f));
+        }
+    }
+    if (++p.meter_buffers == 1875) { // ~10 s of 256-sample buffers at 48 kHz
+        if (p.peak > 0.0f) {
+            DC_INFO("audio: port %td peak %.3f over the last ~10 s", &p - g_ports.data() + 1, p.peak);
+        }
+        p.peak = 0.0f;
+        p.meter_buffers = 0;
+    }
+}
+
 // Copies one buffer in, blocking while the ring is full (that is the pacing).
 void Queue(Port& p, const void* data) {
     std::unique_lock lk(p.lock);
@@ -91,14 +118,7 @@ void Queue(Port& p, const void* data) {
         p.read = p.write - (size - p.buffer_bytes); // device stalled: drop the oldest audio
     }
     const auto* src = static_cast<const u8*>(data);
-    for (u32 k = 0; k < p.buffer_bytes; k += 64) {
-        if (src[k] && src[k] != 0x80) {
-            if (++p.loud_buffers == 1 || p.loud_buffers % 2000 == 0) {
-                DC_INFO("audio: %llu non-silent buffers so far", p.loud_buffers);
-            }
-            break;
-        }
-    }
+    Meter(p, src);
     u64 left = p.buffer_bytes;
     while (left > 0) {
         const u64 off = p.write % size;
@@ -141,6 +161,7 @@ s32 sceAudioOutOpen(s32 user_id, s32 port_type, s32 index, u32 len, u32 freq, u3
             continue;
         }
         p.channels = channels;
+        p.is_float = is_float;
         p.buffer_bytes = len * channels * (is_float ? 4 : 2);
         p.ring.assign(u64(p.buffer_bytes) * kRingBuffers, 0);
         p.read = p.write = 0;

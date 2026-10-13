@@ -22,6 +22,7 @@ public:
     void OnSubmit() override;
     void WaitIdle() override;
     void Signal(std::function<void()> done) override;
+    void NoteConstDump(std::uint64_t addr, std::uint32_t bytes) override;
     void Flip(const FlipInfo& flip) override;
     std::uint8_t* Gds() override;
 

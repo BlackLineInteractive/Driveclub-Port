@@ -237,7 +237,6 @@ void CommandProcessor::SyncRenderer() {
     if (renderer) {
         renderer->WaitIdle();
     }
-    ce.dumped.clear();
 }
 
 void CommandProcessor::RunConstantEngine(const std::function<bool()>& done) {
@@ -288,15 +287,10 @@ void CommandProcessor::RunConstantEngine(const std::function<bool()>& done) {
             if (!dst || off + count > ce.ram.size()) {
                 break;
             }
-            // The renderer may still have to read what an earlier dump put at
-            // this address: let it finish before the ring slot is reused.
-            const u64 addr = reinterpret_cast<u64>(dst);
-            if (std::find(ce.dumped.begin(), ce.dumped.end(), addr) != ce.dumped.end()) {
-                static std::atomic<u64> n{0}; if ((++n % 1000) == 0) DC_INFO("TMP sync dumpconst %llu", (unsigned long long)n.load());
-                SyncRenderer();
-            }
-            ce.dumped.push_back(addr);
             std::memcpy(dst, ce.ram.data() + off, count * 4);
+            if (renderer) {
+                renderer->NoteConstDump(reinterpret_cast<u64>(dst), count * 4);
+            }
             break;
         }
         case Op::IncrementCeCounter:
@@ -486,7 +480,6 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             if (!dst || bytes == 0) {
                 break;
             }
-            { static std::atomic<u64> n{0}; if ((++n % 1000) == 0) DC_INFO("TMP sync dma %llu src %u dst %u bytes %u", (unsigned long long)n.load(), src_sel, dst_sel, bytes); }
             SyncRenderer(); // the GPU may still be producing what we copy
             if (src_sel == 2) {
                 for (u32 k = 0; k + 4 <= bytes; k += 4) {

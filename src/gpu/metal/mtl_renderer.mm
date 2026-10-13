@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <map>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -167,6 +168,28 @@ struct MetalRenderer::Impl {
     id<MTLSamplerState> default_sampler = nil;
     id<MTLBuffer> quad_indices = nil;
     id<MTLBuffer> gds = nil; // 64 KB global data share
+
+    // ---- constant-engine snapshots ----
+    // The CE dumps resource tables into a small ring that the guest rewrites
+    // while draws that read it may still be queued on the host GPU. A draw
+    // whose user data points into a dump gets a pointer to a copy in `arena`
+    // (guest memory the renderer owns) taken when the draw is recorded.
+    struct ConstDump {
+        u32 bytes = 0;
+        u64 gen = 0;
+    };
+    std::map<u64, ConstDump> const_dumps; // by guest address
+    u64 dump_gen = 0;
+    struct Snapshot {
+        u64 gen = 0;
+        u64 va = 0;
+    };
+    std::unordered_map<u64, Snapshot> snapshots; // dump address -> its latest copy
+    static constexpr u64 kArenaSize = 16ull << 20;
+    u64 arena_va = 0;
+    u64 arena_head = 0;                // bytes handed out so far (wraps modulo kArenaSize)
+    std::atomic<u64> arena_released{0}; // head values the GPU is done with
+    u64 arena_commit_head = 0;         // head when the last command buffer was committed
 
     // ---- presentation ----
     id<MTLRenderPipelineState> copy_pipeline = nil;
@@ -362,6 +385,12 @@ struct MetalRenderer::Impl {
             chunk = nil;
             chunk_off = 0;
         }
+        if (arena_va) {
+            const u64 head = arena_commit_head = arena_head;
+            [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+              arena_released.store(head, std::memory_order_release);
+            }];
+        }
         if (stats) {
             ++stat_commits;
             [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
@@ -373,6 +402,86 @@ struct MetalRenderer::Impl {
         cmd = nil;
         if (wait) {
             WaitLast();
+        }
+    }
+
+    void NoteConstDump(u64 addr, u32 bytes) {
+        // A new dump replaces whatever older dumps it overlaps.
+        auto it = const_dumps.lower_bound(addr);
+        if (it != const_dumps.begin() && std::prev(it)->first + std::prev(it)->second.bytes > addr) {
+            --it;
+        }
+        while (it != const_dumps.end() && it->first < addr + bytes) {
+            it = const_dumps.erase(it);
+        }
+        const_dumps[addr] = {bytes, ++dump_gen};
+    }
+
+    bool InitArena() {
+        u64 phys = 0;
+        VAddr va = 0;
+        if (Core::Memory::AllocateDirect(0, Core::Memory::kDirectSize, kArenaSize, 64 << 10, 0, &phys) != 0 ||
+            Core::Memory::MapDirect(&va, kArenaSize, Core::Memory::kProtCpuRead | Core::Memory::kProtCpuWrite |
+                                                         Core::Memory::kProtGpuRead,
+                                    0, phys, 64 << 10, "gpu constant snapshots") != 0) {
+            ReportOnce("cannot allocate the constant snapshot arena");
+            return false;
+        }
+        arena_va = va;
+        return true;
+    }
+
+    // Guest address of `bytes` of arena space the GPU is not using.
+    u64 ArenaAlloc(u64 bytes) {
+        bytes = (bytes + 255) & ~255ull;
+        if (!arena_va && !InitArena()) {
+            return 0;
+        }
+        u64 off = arena_head % kArenaSize;
+        if (off + bytes > kArenaSize) {
+            arena_head += kArenaSize - off; // do not split a copy across the wrap
+            off = 0;
+        }
+        if (arena_head + bytes - arena_released.load(std::memory_order_acquire) > kArenaSize) {
+            // Ring full of in-flight copies (rare): wait for what was committed.
+            // A draw may be half recorded here, so the open command buffer stays.
+            WaitLast();
+            arena_released = arena_commit_head;
+        }
+        arena_head += bytes;
+        return arena_va + off;
+    }
+
+    // Points user-data pointers that land in a CE dump at a snapshot of it.
+    void PatchUserData(u32* ud) {
+        if (const_dumps.empty()) {
+            return;
+        }
+        for (u32 k = 0; k + 1 < 16; ++k) {
+            const u64 v = ud[k] | (u64(ud[k + 1] & 0xFFF) << 32); // pointer or V# base
+            auto it = const_dumps.upper_bound(v);
+            if (it == const_dumps.begin()) {
+                continue;
+            }
+            --it;
+            const u64 off = v - it->first;
+            if (off >= it->second.bytes) {
+                continue;
+            }
+            Snapshot& snap = snapshots[it->first];
+            if (snap.gen != it->second.gen || !snap.va) {
+                snap.va = ArenaAlloc(it->second.bytes);
+                if (!snap.va) {
+                    return;
+                }
+                std::memcpy(reinterpret_cast<void*>(snap.va), reinterpret_cast<const void*>(it->first),
+                            it->second.bytes);
+                snap.gen = it->second.gen;
+            }
+            const u64 nv = snap.va + off;
+            ud[k] = static_cast<u32>(nv);
+            ud[k + 1] = (ud[k + 1] & ~0xFFFu) | static_cast<u32>(nv >> 32);
+            ++k;
         }
     }
 
@@ -1200,8 +1309,15 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     if (std::getenv("DC_DEBUG_MEMTEST")) {
         MemTest(vs_addr);
     }
+    u32 vud[16], pud[16];
+    std::memcpy(vud, vs_ud, sizeof(vud));
+    std::memcpy(pud, ps_ud, sizeof(pud));
+    PatchUserData(vud);
+    if (ps) {
+        PatchUserData(pud);
+    }
     UpdateMemMap();
-    [enc setVertexBytes:vs_ud length:64 atIndex:Shader::Binding::UserData];
+    [enc setVertexBytes:vud length:64 atIndex:Shader::Binding::UserData];
     [enc setVertexBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
     [enc setVertexBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
     [enc setVertexBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
@@ -1213,7 +1329,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         }
     }
     if (ps) {
-        [enc setFragmentBytes:ps_ud length:64 atIndex:Shader::Binding::UserData];
+        [enc setFragmentBytes:pud length:64 atIndex:Shader::Binding::UserData];
         [enc setFragmentBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
         [enc setFragmentBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
         [enc setFragmentBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
@@ -1399,10 +1515,13 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
 
     EndPass();
     EnsureCommandBuffer();
+    u32 cud[16];
+    std::memcpy(cud, ud, sizeof(cud));
+    PatchUserData(cud);
     UpdateMemMap();
     id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
     [e setComputePipelineState:pso];
-    [e setBytes:ud length:64 atIndex:Shader::Binding::UserData];
+    [e setBytes:cud length:64 atIndex:Shader::Binding::UserData];
     [e setBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
     [e setBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
     [e setBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
@@ -1577,6 +1696,11 @@ void MetalRenderer::Flip(const FlipInfo& flip) {
     @autoreleasepool {
         impl->Flip(flip);
     }
+}
+
+void MetalRenderer::NoteConstDump(std::uint64_t addr, std::uint32_t bytes) {
+    std::scoped_lock lk(impl->lock);
+    impl->NoteConstDump(addr, bytes);
 }
 
 std::uint8_t* MetalRenderer::Gds() {

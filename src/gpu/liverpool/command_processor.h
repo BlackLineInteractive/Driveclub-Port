@@ -79,7 +79,6 @@ private:
         u64 ce_counter = 0;
         u64 de_counter = 0;
         std::vector<u32> ram = std::vector<u32>(0xC000 / 4, 0);
-        std::vector<u64> dumped; // dump targets since the renderer last went idle
     };
 
     // One hardware ring: the graphics ring or a compute queue. Rings run in

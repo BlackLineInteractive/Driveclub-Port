@@ -62,6 +62,11 @@ public:
     // go through this, so the guest sees GPU progress without the CP waiting.
     virtual void Signal(std::function<void()> done) = 0;
 
+    // The constant engine wrote `bytes` of resource table at guest `addr`.
+    // The guest reuses that memory quickly, so the renderer snapshots dumps
+    // that draws point at instead of the CP waiting for the GPU.
+    virtual void NoteConstDump(std::uint64_t addr, std::uint32_t bytes) = 0;
+
     // Called on the GPU thread once the frame's command buffers are done.
     virtual void Flip(const FlipInfo& flip) = 0;
 
