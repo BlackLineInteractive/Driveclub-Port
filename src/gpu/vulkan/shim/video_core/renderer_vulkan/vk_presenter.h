@@ -7,6 +7,8 @@
 
 #include "video_core/renderer_vulkan/vk_instance.h"
 
+#include <vk_mem_alloc.h>
+
 namespace Vulkan {
 
 struct Frame {

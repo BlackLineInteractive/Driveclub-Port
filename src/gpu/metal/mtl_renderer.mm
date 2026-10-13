@@ -156,9 +156,16 @@ struct MetalRenderer::Impl {
     std::unordered_map<u64, RenderTarget> color_targets; // by address
     std::unordered_map<u64, RenderTarget> depth_targets;
 
+    // Guest textures are re-uploaded when their memory changes. Each keeps
+    // hashes of its 64 KB chunks; a texture that never changed has one chunk
+    // checked per frame in turn, one that did (glyph caches, streamed or
+    // CPU-animated textures) is checked in full every frame it is used.
+    static constexpr u64 kChunk = 64 << 10;
     struct TextureEntry {
         id<MTLTexture> tex = nil;
-        u64 checksum = 0;
+        std::vector<u64> chunks;
+        u32 next_chunk = 0;
+        bool hot = false;
         u64 frame = 0;
         u64 addr = 0;
         u64 size = 0;
@@ -676,12 +683,8 @@ struct MetalRenderer::Impl {
     }
 
     // Cheap change detection: a few dwords spread over the texture.
-    // Hash of the whole texture: games patch textures in place (glyph caches
-    // add a few glyphs to a big atlas), so sampling a few words misses edits.
-    // Four independent lanes keep it near memory speed.
-    u64 Checksum(u64 addr, u64 size) {
+    u64 Hash64(const u8* p, u64 size) {
         stat_hashed += size;
-        const auto* p = reinterpret_cast<const u8*>(addr);
         u64 h[4] = {0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull};
         u64 off = 0;
         for (; off + 32 <= size; off += 32) {
@@ -696,6 +699,26 @@ struct MetalRenderer::Impl {
             h[0] = (h[0] ^ p[off]) * 0x100000001b3ull;
         }
         return h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7);
+    }
+
+    u64 ChunkHash(u64 addr, u64 size, u32 chunk) {
+        const u64 off = u64(chunk) * kChunk;
+        return Hash64(reinterpret_cast<const u8*>(addr) + off, std::min(kChunk, size - off));
+    }
+
+    // True if the texture memory differs from what was uploaded.
+    bool TextureChanged(TextureEntry& e, u64 addr, u64 size) {
+        const u32 n = static_cast<u32>(e.chunks.size());
+        if (e.hot) {
+            for (u32 c = 0; c < n; ++c) {
+                if (ChunkHash(addr, size, c) != e.chunks[c]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        const u32 c = e.next_chunk++ % n;
+        return ChunkHash(addr, size, c) != e.chunks[c];
     }
 
     // Decodes a T# and returns a Metal texture for it.
@@ -772,10 +795,12 @@ struct MetalRenderer::Impl {
         if (e.tex && e.frame == frame_count) {
             return e.tex;
         }
-        const u64 sum = Checksum(addr, size);
-        if (e.tex && sum == e.checksum) {
-            e.frame = frame_count;
-            return e.tex;
+        if (e.tex) {
+            if (!TextureChanged(e, addr, size)) {
+                e.frame = frame_count;
+                return e.tex;
+            }
+            e.hot = true;
         }
 
         if (!e.tex) {
@@ -821,7 +846,10 @@ struct MetalRenderer::Impl {
                      bytesPerRow:row
                    bytesPerImage:image];
         }
-        e.checksum = sum;
+        e.chunks.resize((size + kChunk - 1) / kChunk);
+        for (u32 c = 0; c < e.chunks.size(); ++c) {
+            e.chunks[c] = ChunkHash(addr, size, c);
+        }
         e.frame = frame_count;
         e.addr = addr;
         e.size = size;

@@ -146,6 +146,7 @@ add_dependencies(dc_shadps4_vulkan dc_host_shaders)
 target_include_directories(dc_shadps4_vulkan PRIVATE
     src/gpu/vulkan/shim          # first: shadows the shadPS4 headers we replace
     ${DC_SHADPS4_SRC}
+    ${DC_SHADPS4_SRC}/..         # a few files include "src/common/..."
     ${CMAKE_BINARY_DIR}/host_shaders/include
     ${half_dir}/include
     ${tracy_dir}/public

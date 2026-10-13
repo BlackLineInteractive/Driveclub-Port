@@ -1,7 +1,8 @@
 // Driveclub Native: entry point.
 // Usage: driveclub <game dir> [--load-only]
-// Loads and links the game's modules, then brings up the window and the Metal
-// presenter. Guest execution and the GPU frontend plug in behind this.
+// Loads and links the game's modules, then brings up the window and the
+// renderer: Metal by default, or the Vulkan one (shadPS4's, through MoltenVK)
+// with DC_RENDERER=vulkan.
 
 #include <chrono>
 #include <cmath>
@@ -10,6 +11,8 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <memory>
+#include <string>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
@@ -28,6 +31,9 @@
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_presenter.h"
 #include "gpu/metal/mtl_renderer.h"
+#if DC_HAS_VULKAN
+#include "gpu/vulkan/vk_renderer.h"
+#endif
 
 namespace {
 
@@ -78,16 +84,39 @@ int Run(int argc, char** argv) {
     }
     SDL_MetalView view = SDL_Metal_CreateView(window);
 
-    Gpu::Metal::Device device;
+    const char* backend = std::getenv("DC_RENDERER");
+    const bool use_vulkan = backend && std::strcmp(backend, "vulkan") == 0;
     Gpu::Metal::PresenterConfig config{};
-    Gpu::Metal::Presenter presenter(device, SDL_Metal_GetLayer(view), config);
-
-    auto renderer = std::make_unique<Gpu::Metal::MetalRenderer>(device);
-    Gpu::Liverpool::Instance().SetRenderer(renderer.get());
+    std::unique_ptr<Gpu::Metal::Device> device;
+    std::unique_ptr<Gpu::Metal::Presenter> presenter;
+    std::unique_ptr<Gpu::Metal::MetalRenderer> renderer;
+#if DC_HAS_VULKAN
+    std::unique_ptr<Gpu::Vulkan::VulkanRenderer> vk_renderer;
+#endif
+    std::string gpu_name;
+    if (use_vulkan) {
+#if DC_HAS_VULKAN
+        vk_renderer = std::make_unique<Gpu::Vulkan::VulkanRenderer>(window, SDL_Metal_GetLayer(view),
+                                                                    config.vsync);
+        Gpu::Liverpool::Instance().SetRenderer(vk_renderer.get());
+        gpu_name = vk_renderer->DeviceName() + " (Vulkan)";
+#else
+        DC_ERROR("DC_RENDERER=vulkan: built without the Vulkan renderer (DC_ENABLE_VULKAN)");
+        return 1;
+#endif
+    } else {
+        device = std::make_unique<Gpu::Metal::Device>();
+        presenter = std::make_unique<Gpu::Metal::Presenter>(*device, SDL_Metal_GetLayer(view), config);
+        renderer = std::make_unique<Gpu::Metal::MetalRenderer>(*device);
+        Gpu::Liverpool::Instance().SetRenderer(renderer.get());
+        gpu_name = device->Info().name;
+    }
 
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window, &w, &h);
-    presenter.Resize(w, h);
+    if (presenter) {
+        presenter->Resize(w, h);
+    }
 
     using Clock = std::chrono::steady_clock;
     const auto start = Clock::now();
@@ -103,7 +132,14 @@ int Run(int argc, char** argv) {
                 running = false;
                 break;
             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-                presenter.Resize(ev.window.data1, ev.window.data2);
+                if (presenter) {
+                    presenter->Resize(ev.window.data1, ev.window.data2);
+                }
+#if DC_HAS_VULKAN
+                if (vk_renderer) {
+                    vk_renderer->Resize(ev.window.data1, ev.window.data2);
+                }
+#endif
                 break;
             case SDL_EVENT_KEY_DOWN:
             case SDL_EVENT_KEY_UP: {
@@ -112,7 +148,9 @@ int Run(int argc, char** argv) {
                 case SDLK_V:
                     if (pressed) {
                         config.vsync = !config.vsync;
-                        presenter.SetVsync(config.vsync);
+                        if (presenter) {
+                            presenter->SetVsync(config.vsync);
+                        }
                         DC_INFO("vsync: %d", config.vsync);
                     }
                     break;
@@ -208,12 +246,22 @@ int Run(int argc, char** argv) {
             }
         }
 
-        void* tex = renderer->LatestFrame();
-        if (tex) {
-            presenter.PresentTexture(tex);
-        } else {
-            const float t = std::chrono::duration<float>(Clock::now() - start).count();
-            presenter.PresentClear(0.5f + 0.5f * std::sin(t), 0.2f, 0.3f);
+#if DC_HAS_VULKAN
+        if (vk_renderer) {
+            // Paced by the swapchain once frames flow; idle until the first one.
+            if (!vk_renderer->Present()) {
+                SDL_Delay(4);
+            }
+        }
+#endif
+        if (renderer) {
+            void* tex = renderer->LatestFrame();
+            if (tex) {
+                presenter->PresentTexture(tex);
+            } else {
+                const float t = std::chrono::duration<float>(Clock::now() - start).count();
+                presenter->PresentClear(0.5f + 0.5f * std::sin(t), 0.2f, 0.3f);
+            }
         }
 
         ++frames;
@@ -223,7 +271,7 @@ int Run(int argc, char** argv) {
             const double fps = frames / secs;
             char title[96];
             std::snprintf(title, sizeof(title), "Driveclub Native | %s | %.0f FPS",
-                          device.Info().name.c_str(), fps);
+                          gpu_name.c_str(), fps);
             SDL_SetWindowTitle(window, title);
             frames = 0;
             fps_window = now;

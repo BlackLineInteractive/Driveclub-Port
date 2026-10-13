@@ -18,6 +18,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/videoout/buffer.h"
 #include "core/memory.h"
