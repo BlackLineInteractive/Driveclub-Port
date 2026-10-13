@@ -18,6 +18,7 @@
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_formats.h"
 #include "gpu/shader/msl.h"
+#include "gpu/shader/msl_prelude.h"
 #include "gpu/shader/program.h"
 
 namespace Gpu::Metal {
@@ -644,6 +645,47 @@ struct MetalRenderer::Impl {
     void Draw(const RegFile& r, const DrawCall& dc);
     void Flip(const FlipInfo& f);
 
+    // DC_DEBUG_MEMTEST: reads `addr` through the shader memory path and
+    // compares with what the CPU sees.
+    void MemTest(u64 addr) {
+        static bool done = false;
+        if (done || !Readable(addr, 16)) {
+            return;
+        }
+        done = true;
+        std::string src = Shader::kMslPrelude;
+        src += "kernel void memtest(device uint* gm0 [[buffer(1)]], device uint* gm1 [[buffer(2)]], "
+               "constant DcMap& gmap [[buffer(3)]], constant ulong& addr [[buffer(4)]], device uint* out [[buffer(5)]]) {"
+               " DcMem mem = {gm0, gm1, &gmap}; for (uint i = 0; i < 4; ++i) out[i] = dc_ld(mem, addr + i * 4);"
+               " out[4] = gmap.count; out[5] = uint(gmap.split >> 20); }";
+        NSError* err = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:@(src.c_str()) options:nil error:&err];
+        id<MTLComputePipelineState> cp = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"memtest"] error:&err];
+        if (!cp) {
+            DC_ERROR("memtest: %s", err.localizedDescription.UTF8String);
+            return;
+        }
+        UpdateMemMap();
+        id<MTLBuffer> out = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> c = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> e = [c computeCommandEncoder];
+        [e setComputePipelineState:cp];
+        [e setBuffer:mem[0] offset:0 atIndex:1];
+        [e setBuffer:mem[1] offset:0 atIndex:2];
+        [e setBuffer:mem_map offset:0 atIndex:3];
+        [e setBytes:&addr length:8 atIndex:4];
+        [e setBuffer:out offset:0 atIndex:5];
+        [e dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [e endEncoding];
+        [c commit];
+        [c waitUntilCompleted];
+        const u32* g = static_cast<const u32*>(out.contents);
+        const u32* cpu = reinterpret_cast<const u32*>(addr);
+        DC_INFO("memtest %#llx: gpu %08x %08x %08x %08x | cpu %08x %08x %08x %08x | ranges %u split %u MB (%s)",
+                addr, g[0], g[1], g[2], g[3], cpu[0], cpu[1], cpu[2], cpu[3], g[4], g[5],
+                c.error ? c.error.localizedDescription.UTF8String : "ok");
+    }
+
     // Reads a presented frame back and writes it as a PPM (debug only).
     void DumpFrame(id<MTLTexture> tex) {
         const u32 w = static_cast<u32>(tex.width), h = static_cast<u32>(tex.height);
@@ -960,6 +1002,9 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     consts.vte = vte;
 
     // ---- bindings ----
+    if (std::getenv("DC_DEBUG_MEMTEST")) {
+        MemTest(u64(vs_ud[4]) | (u64(vs_ud[5] & 0xFFFF) << 32));
+    }
     UpdateMemMap();
     [enc setVertexBytes:vs_ud length:64 atIndex:Shader::Binding::UserData];
     [enc setVertexBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
