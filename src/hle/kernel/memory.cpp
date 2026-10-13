@@ -18,6 +18,8 @@ s32 sceKernelAllocateDirectMemory(s64 search_start, s64 search_end, u64 len, u64
                                   int memory_type, s64* phys_out) {
     u64 phys = 0;
     const int err = Mem::AllocateDirect(search_start, search_end, len, align, memory_type, &phys);
+    DC_INFO("allocate direct len %#llx align %#llx type %d -> phys %#llx err %d", len, align,
+            memory_type, phys, err);
     if (err == 0) {
         *phys_out = static_cast<s64>(phys);
     }
@@ -35,7 +37,10 @@ u64 sceKernelGetDirectMemorySize() {
 s32 sceKernelMapNamedDirectMemory(void** addr, u64 len, int prot, int flags, s64 phys,
                                   u64 align, const char* name) {
     VAddr va = reinterpret_cast<VAddr>(*addr);
+    const VAddr hint = va;
     const int err = Mem::MapDirect(&va, len, prot, flags, phys, align, name);
+    DC_INFO("map direct hint %#llx len %#llx prot %#x flags %#x phys %#llx -> %#llx err %d",
+            hint, len, prot, flags, phys, va, err);
     if (err == 0) {
         *addr = reinterpret_cast<void*>(va);
     }
@@ -48,7 +53,10 @@ s32 sceKernelMapDirectMemory(void** addr, u64 len, int prot, int flags, s64 phys
 
 s32 sceKernelMapNamedFlexibleMemory(void** addr, u64 len, int prot, int flags, const char* name) {
     VAddr va = reinterpret_cast<VAddr>(*addr);
+    const VAddr hint = va;
     const int err = Mem::MapFlexible(&va, len, prot, flags, name);
+    DC_INFO("map flexible hint %#llx len %#llx prot %#x flags %#x -> %#llx err %d", hint, len,
+            prot, flags, va, err);
     if (err == 0) {
         *addr = reinterpret_cast<void*>(va);
     }
@@ -61,7 +69,9 @@ s32 sceKernelMapFlexibleMemory(void** addr, u64 len, int prot, int flags) {
 
 s32 sceKernelReserveVirtualRange(void** addr, u64 len, int flags, u64 align) {
     VAddr va = reinterpret_cast<VAddr>(*addr);
+    const VAddr hint = va;
     const int err = Mem::Reserve(&va, len, flags, align);
+    DC_INFO("reserve hint %#llx len %#llx flags %#x -> %#llx err %d", hint, len, flags, va, err);
     if (err == 0) {
         *addr = reinterpret_cast<void*>(va);
     }
