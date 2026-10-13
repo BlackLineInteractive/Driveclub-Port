@@ -106,6 +106,8 @@ tools/config.ini
 *.spv
 *.dxbc
 *.metal
+# Our own Metal shader sources are tracked
+!/src/**/*.metal
 
 # Emulator user data, saves, and dumps
 /user/
