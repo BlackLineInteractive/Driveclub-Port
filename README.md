@@ -1,5 +1,7 @@
 # Driveclub Native
 
+![Driveclub Native](media/DRIVECLUB.webp)
+
 A native port of **Driveclub** (PS4, CUSA00003 v1.05) to macOS with rendering via **Metal 3**.
 
 This is not a general-purpose emulator. PS4 code is x86-64, so on Intel Macs it executes directly without CPU recompilation. We only replace what is console-specific: Sony system libraries (HLE) and the AMD Liverpool GPU (GCN) - with a custom Metal renderer tailored specifically for this single game.
