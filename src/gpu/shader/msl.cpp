@@ -476,9 +476,11 @@ void Emitter::EmitSmrd(const Inst& i) {
     const std::string base = buffer ? "dc_vbase(" + b0 + ", " + b1 + ")"
                                     : "((ulong(" + b0 + ") | (ulong(" + b1 + ") << 32)) & 0xfffffffffffful)";
     const std::string off = i.imm ? Hex(i.smrd_offset * 4) : SName(static_cast<u16>(i.smrd_offset));
-    std::string s = "{ ulong a_ = " + base + " + ulong(" + off + ");";
+    // Scalar loads ignore the low address bits: one translation for all dwords.
+    std::string s = "{ device uint* p_ = dc_ptr_n(mem, (" + base + " + ulong(" + off + ")) & ~3ul, " +
+                    N(count * 4) + "u);";
     for (u32 k = 0; k < count; ++k) {
-        s += " " + SName(static_cast<u16>(i.dst + k)) + " = dc_ld(mem, a_ + " + N(k * 4) + "ul);";
+        s += " " + SName(static_cast<u16>(i.dst + k)) + " = p_ ? p_[" + N(k) + "] : 0u;";
     }
     Line(s + " }");
 }
@@ -995,9 +997,15 @@ void Emitter::EmitBuffer(const Inst& i) {
         const u32 n = i.op == static_cast<u16>(Mubuf::BUFFER_LOAD_DWORD) ? 1
                     : i.op == static_cast<u16>(Mubuf::BUFFER_LOAD_DWORDX2) ? 2
                     : i.op == static_cast<u16>(Mubuf::BUFFER_LOAD_DWORDX3) ? 3 : 4;
-        for (u32 k = 0; k < n; ++k) {
-            SetV(i.vdata + k, "oob_ ? 0u : dc_ld(mem, a_ + " + N(4 * k) + "ul)");
+        if (n == 1) {
+            SetV(i.vdata, "oob_ ? 0u : dc_ld(mem, a_)");
+            break;
         }
+        Line("{ device uint* p_ = oob_ || (a_ & 3ul) ? nullptr : dc_ptr_n(mem, a_, " + N(4 * n) + "u);");
+        for (u32 k = 0; k < n; ++k) {
+            SetV(i.vdata + k, "p_ ? p_[" + N(k) + "] : (oob_ ? 0u : dc_ld(mem, a_ + " + N(4 * k) + "ul))");
+        }
+        Line("}");
         break;
     }
     case Mubuf::BUFFER_STORE_FORMAT_X:

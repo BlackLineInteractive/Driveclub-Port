@@ -23,6 +23,14 @@ static inline device uint* dc_ptr(thread const DcMem& m, ulong va) {
     if (p >= m.map->limit) return nullptr;
     return p < m.map->split ? m.lo + (p >> 2) : m.hi + ((p - m.map->split) >> 2);
 }
+// `bytes` contiguous bytes at dword-aligned `va` (one translation for a
+// multi-dword load), or nullptr.
+static inline device uint* dc_ptr_n(thread const DcMem& m, ulong va, uint bytes) {
+    device uint* p = dc_ptr(m, va);
+    ulong last = va + ulong(bytes - 4u);
+    if (((va ^ last) >> m.map->shift) != 0ul && dc_ptr(m, last) != p + ((bytes - 4u) >> 2)) return nullptr;
+    return p;
+}
 static inline uint dc_ld(thread const DcMem& m, ulong va) {
     device uint* p = dc_ptr(m, va & ~3ul);
     uint lo = p ? *p : 0u;
@@ -88,7 +96,15 @@ static inline uint4 dc_fmt_convert(uint4 r, uint4 bits, uint nfmt, uint n) {
     return o;
 }
 static inline uint4 dc_load_fmt(thread const DcMem& m, ulong a, uint dfmt, uint nfmt) {
-    uint w0 = dc_ld(m, a);
+    uint words = dfmt == 14u ? 4u : dfmt == 13u ? 3u : (dfmt == 11u || dfmt == 12u) ? 2u : 1u;
+    uint4 w = uint4(0u);
+    if ((a & 3ul) == 0ul) {
+        device uint* p = dc_ptr_n(m, a, words * 4u);
+        if (p) for (uint k = 0u; k < words; ++k) w[k] = p[k];
+    } else {
+        for (uint k = 0u; k < words; ++k) w[k] = dc_ld(m, a + ulong(k) * 4ul);
+    }
+    uint w0 = w.x;
     uint4 r = uint4(0u);
     uint4 bits = uint4(32u);
     uint n = 0u;
@@ -103,10 +119,10 @@ static inline uint4 dc_load_fmt(thread const DcMem& m, ulong a, uint dfmt, uint 
     case 8u: r = uint4(w0 & 3u, (w0 >> 2) & 0x3ffu, (w0 >> 12) & 0x3ffu, w0 >> 22); bits = uint4(2u, 10u, 10u, 10u); n = 4u; break;
     case 9u: r = uint4(w0 & 0x3ffu, (w0 >> 10) & 0x3ffu, (w0 >> 20) & 0x3ffu, w0 >> 30); bits = uint4(10u, 10u, 10u, 2u); n = 4u; break;
     case 10u: r = uint4(w0 & 0xffu, (w0 >> 8) & 0xffu, (w0 >> 16) & 0xffu, w0 >> 24); bits = uint4(8u); n = 4u; break;
-    case 11u: r.xy = uint2(w0, dc_ld(m, a + 4ul)); n = 2u; break;
-    case 12u: { uint w1 = dc_ld(m, a + 4ul); r = uint4(w0 & 0xffffu, w0 >> 16, w1 & 0xffffu, w1 >> 16); bits = uint4(16u); n = 4u; break; }
-    case 13u: r.xyz = uint3(w0, dc_ld(m, a + 4ul), dc_ld(m, a + 8ul)); n = 3u; break;
-    case 14u: r = uint4(w0, dc_ld(m, a + 4ul), dc_ld(m, a + 8ul), dc_ld(m, a + 12ul)); n = 4u; break;
+    case 11u: r.xy = w.xy; n = 2u; break;
+    case 12u: r = uint4(w.x & 0xffffu, w.x >> 16, w.y & 0xffffu, w.y >> 16); bits = uint4(16u); n = 4u; break;
+    case 13u: r.xyz = w.xyz; n = 3u; break;
+    case 14u: r = w; n = 4u; break;
     default: break;
     }
     return dc_fmt_convert(r, bits, nfmt, n);
