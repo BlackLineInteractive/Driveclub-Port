@@ -201,6 +201,8 @@ void Handler(int sig, siginfo_t* info, void* raw) {
     const u8* code = reinterpret_cast<const u8*>(rip);
     if (sig == SIGSEGV && code[0] == 0xCD && code[1] == 0x41) {
         Describe("guest debug break (int 0x41)", rip, 0, rsp);
+        // Driveclub's fatal handler formats into [caller rsp + 0x30].
+        DC_ERROR("  fatal message: %.512s", reinterpret_cast<const char*>(rsp + 8 + 0x30));
         DumpStackStrings(rsp);
         Die(sig);
     }
