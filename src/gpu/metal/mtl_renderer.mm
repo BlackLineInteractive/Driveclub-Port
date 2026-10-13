@@ -84,6 +84,7 @@ vertex V copy_vs(uint vid [[vertex_id]]) {
     o.pos = float4(o.uv.x * 2.0 - 1.0, 1.0 - o.uv.y * 2.0, 0.0, 1.0);
     return o;
 }
+fragment float4 debug_fs() { return float4(1.0, 0.0, 1.0, 1.0); }
 fragment float4 copy_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]],
                         constant float2& scale [[buffer(0)]]) {
     constexpr sampler s(filter::nearest, address::clamp_to_edge);
@@ -159,6 +160,9 @@ struct MetalRenderer::Impl {
 
     // ---- diagnostics ----
     const char* dump_dir = nullptr;
+    const char* dump_frames = nullptr; // DC_DUMP_FRAMES=dir: every flip as a PPM
+    bool debug_clear = false;          // DC_DEBUG_CLEAR: new targets start dark blue
+    id<MTLFunction> debug_fs = nil;    // DC_DEBUG_FLAT: every pixel shader outputs magenta
     bool trace = false;
     u64 draw_count = 0;
     std::set<std::string> reported;
@@ -173,6 +177,8 @@ struct MetalRenderer::Impl {
 
     void Init() {
         dump_dir = std::getenv("DC_DUMP_SHADERS");
+        dump_frames = std::getenv("DC_DUMP_FRAMES");
+        debug_clear = std::getenv("DC_DEBUG_CLEAR") != nullptr;
         trace = std::getenv("DC_GPU_TRACE") != nullptr;
 
         void* view = Core::Memory::DirectHostView();
@@ -210,6 +216,9 @@ struct MetalRenderer::Impl {
         NSError* err = nil;
         id<MTLLibrary> lib = [device newLibraryWithSource:@(kCopyShader) options:nil error:&err];
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        if (std::getenv("DC_DEBUG_FLAT")) {
+            debug_fs = [lib newFunctionWithName:@"debug_fs"];
+        }
         pd.vertexFunction = [lib newFunctionWithName:@"copy_vs"];
         pd.fragmentFunction = [lib newFunctionWithName:@"copy_fs"];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -593,7 +602,7 @@ struct MetalRenderer::Impl {
             RenderTarget& rt = *colors[k];
             rp.colorAttachments[k].texture = rt.tex;
             rp.colorAttachments[k].loadAction = rt.initialized ? MTLLoadActionLoad : MTLLoadActionClear;
-            rp.colorAttachments[k].clearColor = MTLClearColorMake(0, 0, 0, 0);
+            rp.colorAttachments[k].clearColor = debug_clear ? MTLClearColorMake(0.1, 0.1, 0.3, 1) : MTLClearColorMake(0, 0, 0, 0);
             rp.colorAttachments[k].storeAction = MTLStoreActionStore;
             rt.initialized = true;
             ps.color[k] = rt.addr;
@@ -634,6 +643,37 @@ struct MetalRenderer::Impl {
 
     void Draw(const RegFile& r, const DrawCall& dc);
     void Flip(const FlipInfo& f);
+
+    // Reads a presented frame back and writes it as a PPM (debug only).
+    void DumpFrame(id<MTLTexture> tex) {
+        const u32 w = static_cast<u32>(tex.width), h = static_cast<u32>(tex.height);
+        id<MTLBuffer> buf = [device newBufferWithLength:u64(w) * h * 4 options:MTLResourceStorageModeShared];
+        id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+        [b copyFromTexture:tex
+                     sourceSlice:0
+                     sourceLevel:0
+                    sourceOrigin:MTLOriginMake(0, 0, 0)
+                      sourceSize:MTLSizeMake(w, h, 1)
+                        toBuffer:buf
+               destinationOffset:0
+          destinationBytesPerRow:w * 4
+        destinationBytesPerImage:u64(w) * h * 4];
+        [b endEncoding];
+        Commit(true);
+        EnsureCommandBuffer();
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/frame_%04llu.ppm", dump_frames, frame_count);
+        std::ofstream out(path, std::ios::binary);
+        out << "P6\n" << w << " " << h << "\n255\n";
+        const auto* px = static_cast<const u8*>(buf.contents);
+        std::vector<u8> rgb(u64(w) * h * 3);
+        for (u64 i = 0; i < u64(w) * h; ++i) { // BGRA -> RGB
+            rgb[i * 3] = px[i * 4 + 2];
+            rgb[i * 3 + 1] = px[i * 4 + 1];
+            rgb[i * 3 + 2] = px[i * 4];
+        }
+        out.write(reinterpret_cast<const char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
+    }
 };
 
 void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
@@ -821,7 +861,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     } else {
         MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
         d.vertexFunction = vfn;
-        d.fragmentFunction = ffn;
+        d.fragmentFunction = debug_fs && ffn && out_type[0] == OutType::Float ? debug_fs : ffn;
         for (u32 k = 0; k < 8; ++k) {
             if (!colors[k]) {
                 continue;
@@ -833,7 +873,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
             ca.writeMask = ((wm & 1) ? MTLColorWriteMaskRed : 0) | ((wm & 2) ? MTLColorWriteMaskGreen : 0) |
                            ((wm & 4) ? MTLColorWriteMaskBlue : 0) | ((wm & 8) ? MTLColorWriteMaskAlpha : 0);
             const bool blendable = out_type[k] == OutType::Float && color_fmt[k] != MTLPixelFormatRGBA32Float;
-            if ((b >> 30) & 1 && blendable) {
+            if ((b >> 30) & 1 && blendable && !debug_fs) {
                 ca.blendingEnabled = YES;
                 ca.sourceRGBBlendFactor = BlendFactor(b & 0x1F);
                 ca.rgbBlendOperation = BlendOp((b >> 5) & 7);
@@ -1078,6 +1118,9 @@ void MetalRenderer::Impl::Flip(const FlipInfo& f) {
         [e setFragmentBytes:scale length:sizeof(scale) atIndex:0];
         [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [e endEncoding];
+    }
+    if (src && dump_frames) {
+        DumpFrame(dst);
     }
     Commit(false);
     if (src) {
