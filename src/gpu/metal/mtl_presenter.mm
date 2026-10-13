@@ -40,7 +40,6 @@ struct Presenter::Impl {
     CAMetalLayer* layer;
     id<MTLRenderPipelineState> pipeline;
     id<MTLSamplerState> sampler;
-    id<MTLTexture> fb_texture;
     dispatch_semaphore_t frames_in_flight;
 };
 
@@ -132,71 +131,11 @@ void Presenter::PresentClear(float r, float g, float b) {
     }
 }
 
-void Presenter::PresentFramebuffer(const void* pixels, int width, int height, int pitch_pixels) {
-    if (!pixels || width <= 0 || height <= 0 || !impl->pipeline) {
-        return;
-    }
-    dispatch_semaphore_wait(impl->frames_in_flight, DISPATCH_TIME_FOREVER);
-
-    @autoreleasepool {
-        id<CAMetalDrawable> drawable = [impl->layer nextDrawable];
-        if (!drawable) {
-            dispatch_semaphore_signal(impl->frames_in_flight);
-            return;
-        }
-
-        if (!impl->fb_texture || static_cast<int>(impl->fb_texture.width) != width ||
-            static_cast<int>(impl->fb_texture.height) != height) {
-            MTLTextureDescriptor* desc = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                width:static_cast<NSUInteger>(width)
-                height:static_cast<NSUInteger>(height)
-                mipmapped:NO];
-            desc.usage = MTLTextureUsageShaderRead;
-            desc.storageMode = MTLStorageModeShared;
-            impl->fb_texture = [impl->device newTextureWithDescriptor:desc];
-        }
-
-        const NSUInteger bytesPerRow =
-            static_cast<NSUInteger>(pitch_pixels > 0 ? pitch_pixels * 4 : width * 4);
-        [impl->fb_texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
-                            mipmapLevel:0
-                              withBytes:pixels
-                            bytesPerRow:bytesPerRow];
-
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass.colorAttachments[0].texture = drawable.texture;
-        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-
-        id<MTLCommandBuffer> cmd = [impl->queue commandBuffer];
-        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
-        [enc setRenderPipelineState:impl->pipeline];
-        [enc setFragmentTexture:impl->fb_texture atIndex:0];
-        [enc setFragmentSamplerState:impl->sampler atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-        [enc endEncoding];
-
-        dispatch_semaphore_t sem = impl->frames_in_flight;
-        [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
-          dispatch_semaphore_signal(sem);
-        }];
-        [cmd presentDrawable:drawable];
-        [cmd commit];
-    }
-}
-
 void Presenter::PresentTexture(void* texture_handle) {
     if (!texture_handle || !impl->pipeline) {
         return;
     }
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture_handle;
-
-    static uint64_t pres_count = 0;
-    if (++pres_count <= 5 || pres_count % 60 == 0) {
-        NSLog(@"Presenter: PresentTexture #%llu tex=%p (%lux%lu)",
-              pres_count, tex, (unsigned long)tex.width, (unsigned long)tex.height);
-    }
 
     dispatch_semaphore_wait(impl->frames_in_flight, DISPATCH_TIME_FOREVER);
 

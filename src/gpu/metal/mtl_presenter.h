@@ -31,12 +31,7 @@ public:
     // Placeholder frame: clears the drawable.
     void PresentClear(float r, float g, float b);
 
-    // Presents the guest framebuffer by uploading to a Metal texture and
-    // rendering a fullscreen triangle onto the CAMetalLayer drawable.
-    void PresentFramebuffer(const void* pixels, int width, int height, int pitch_pixels);
-
-    // Presents an existing Metal texture directly (zero-copy GPU-to-GPU).
-    // `texture_handle` is an id<MTLTexture> cast to void*.
+    // Draws a finished frame (id<MTLTexture> as void*) scaled to the drawable.
     void PresentTexture(void* texture_handle);
 
 private:

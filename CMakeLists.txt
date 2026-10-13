@@ -46,10 +46,19 @@ add_executable(driveclub
     src/gpu/liverpool/pm4.h
     src/gpu/liverpool/command_processor.h
     src/gpu/liverpool/command_processor.cpp
+    src/gpu/liverpool/registers.h
+    src/gpu/shader/gcn.h
+    src/gpu/shader/gcn_decode.cpp
+    src/gpu/shader/program.h
+    src/gpu/shader/program.cpp
+    src/gpu/shader/msl.h
+    src/gpu/shader/msl.cpp
+    src/gpu/shader/msl_prelude.h
     src/gpu/metal/mtl_device.h
     src/gpu/metal/mtl_device.mm
     src/gpu/metal/mtl_presenter.h
     src/gpu/metal/mtl_presenter.mm
+    src/gpu/metal/mtl_formats.h
     src/gpu/metal/mtl_renderer.h
     src/gpu/metal/mtl_renderer.mm
     src/hle/hle.cpp
@@ -120,3 +129,14 @@ target_link_libraries(driveclub PRIVATE
     "-framework QuartzCore"
     "-framework Foundation"
 )
+
+# Developer tool: GCN disassembler + MSL translation check (gcn_dis shader.bin [vs|ps] [--msl]).
+add_executable(gcn_dis EXCLUDE_FROM_ALL
+    src/tools/gcn_dis.mm
+    src/gpu/shader/gcn_decode.cpp
+    src/gpu/shader/program.cpp
+    src/gpu/shader/msl.cpp
+)
+target_include_directories(gcn_dis PRIVATE src)
+target_compile_options(gcn_dis PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+target_link_libraries(gcn_dis PRIVATE "-framework Metal" "-framework Foundation")

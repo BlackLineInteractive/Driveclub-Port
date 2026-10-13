@@ -206,7 +206,7 @@ int Run(int argc, char** argv) {
             }
         }
 
-        void* tex = renderer->GetLatestTexture();
+        void* tex = renderer->LatestFrame();
         if (tex) {
             presenter.PresentTexture(tex);
         } else {
@@ -223,7 +223,6 @@ int Run(int argc, char** argv) {
             std::snprintf(title, sizeof(title), "Driveclub Native | %s | %.0f FPS",
                           device.Info().name.c_str(), fps);
             SDL_SetWindowTitle(window, title);
-            DC_INFO("Presenter: %.0f FPS (latest_tex=%p)", fps, tex);
             frames = 0;
             fps_window = now;
         }
