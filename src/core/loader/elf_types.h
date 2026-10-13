@@ -108,6 +108,7 @@ constexpr u16 ET_SCE_DYNAMIC = 0xFE18;
 constexpr u32 PT_LOAD = 1;
 constexpr u32 PT_DYNAMIC = 2;
 constexpr u32 PT_TLS = 7;
+constexpr u32 PT_GNU_EH_FRAME = 0x6474E550;
 constexpr u32 PT_SCE_DYNLIBDATA = 0x61000000;
 constexpr u32 PT_SCE_PROCPARAM = 0x61000001;
 constexpr u32 PT_SCE_MODULE_PARAM = 0x61000002;

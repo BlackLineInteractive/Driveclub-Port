@@ -40,6 +40,14 @@ public:
     VAddr InitAddr() const { return base + init; }
     VAddr ProcParam() const { return proc_param ? base + proc_param : 0; }
 
+    // Exception-handling tables, for the guest's C++ unwinder.
+    VAddr EhFrameHdr() const { return eh_frame_hdr ? base + eh_frame_hdr : 0; }
+    u64 EhFrameHdrSize() const { return eh_frame_hdr_size; }
+    VAddr EhFrame() const { return eh_frame ? base + eh_frame : 0; }
+    u64 EhFrameSize() const { return eh_frame_size; }
+    VAddr FiniAddr() const { return base + fini; }
+    const std::vector<Elf64_Phdr>& LoadSegments() const { return load_segments; }
+
     // Executable range, for the instruction patcher.
     VAddr CodeBegin() const { return base + code_begin; }
     VAddr CodeEnd() const { return base + code_end; }
@@ -75,7 +83,10 @@ private:
     u64 size = 0;
     u64 entry = 0;
     u64 init = 0;
+    u64 fini = 0;
     bool has_init = false;
+    u64 eh_frame_hdr = 0, eh_frame_hdr_size = 0;
+    u64 eh_frame = 0, eh_frame_size = 0;
     u64 code_begin = 0;
     u64 code_end = 0;
     u64 proc_param = 0;

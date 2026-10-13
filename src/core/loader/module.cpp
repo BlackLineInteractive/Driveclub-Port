@@ -18,6 +18,50 @@ bool IsLoadable(const Elf64_Phdr& ph) {
     return ph.p_type == PT_LOAD || ph.p_type == PT_SCE_RELRO;
 }
 
+// Reads one DWARF-encoded pointer from .eh_frame_hdr (the encodings linkers
+// actually emit there). Returns false for anything else.
+bool ReadEncoded(const u8*& p, u8 enc, VAddr field_addr, VAddr hdr_addr, u64& out) {
+    s64 v = 0;
+    switch (enc & 0x0F) {
+    case 0x00: // absptr
+    case 0x04: // udata8
+    case 0x0C: // sdata8
+        std::memcpy(&v, p, 8);
+        p += 8;
+        break;
+    case 0x03: { // udata4
+        u32 u;
+        std::memcpy(&u, p, 4);
+        v = u;
+        p += 4;
+        break;
+    }
+    case 0x0B: { // sdata4
+        s32 i;
+        std::memcpy(&i, p, 4);
+        v = i;
+        p += 4;
+        break;
+    }
+    default:
+        return false;
+    }
+    switch (enc & 0x70) {
+    case 0x00:
+        break;
+    case 0x10: // pcrel
+        v += static_cast<s64>(field_addr);
+        break;
+    case 0x30: // datarel
+        v += static_cast<s64>(hdr_addr);
+        break;
+    default:
+        return false;
+    }
+    out = static_cast<u64>(v);
+    return true;
+}
+
 // Dynamic tags pack (name offset, version, id) into one value.
 LibraryRef DecodeRef(const Module& m, u64 value) {
     return {std::string(m.String(static_cast<u32>(value))), static_cast<u16>(value >> 48)};
@@ -90,12 +134,30 @@ bool Module::MapSegments(const ElfImage& image, std::string& error) {
         case PT_TLS:
             tls = {ph.p_vaddr, ph.p_filesz, ph.p_memsz, ph.p_align};
             break;
+        case PT_GNU_EH_FRAME:
+            eh_frame_hdr = ph.p_vaddr;
+            eh_frame_hdr_size = ph.p_memsz;
+            break;
         case PT_SCE_PROCPARAM:
         case PT_SCE_MODULE_PARAM:
             proc_param = ph.p_vaddr;
             break;
         default:
             break;
+        }
+    }
+
+    // .eh_frame_hdr: version, eh_frame_ptr encoding, ..., then eh_frame_ptr.
+    if (eh_frame_hdr_size >= 8) {
+        const VAddr hdr = base + eh_frame_hdr;
+        const u8* p = reinterpret_cast<const u8*>(hdr);
+        const u8* field = p + 4;
+        u64 ptr = 0;
+        if (p[0] == 1 && ReadEncoded(field, p[1], hdr + 4, hdr, ptr) && ptr >= base) {
+            eh_frame = ptr - base;
+            // Same estimate the PS4 tooling uses: up to the header, or to the
+            // end of the image when the header comes first.
+            eh_frame_size = eh_frame_hdr > eh_frame ? eh_frame_hdr - eh_frame : size - eh_frame;
         }
     }
     return true;
@@ -152,6 +214,9 @@ bool Module::ParseDynamic(const ElfImage& image, std::string& error) {
         case DT_INIT:
             init = d.d_val;
             has_init = true;
+            break;
+        case DT_FINI:
+            fini = d.d_val;
             break;
         case DT_SCE_IMPORT_LIB:
             import_libs.push_back(DecodeRef(*this, d.d_val));
