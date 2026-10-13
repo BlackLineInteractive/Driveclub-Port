@@ -41,6 +41,10 @@ struct Vma {
 
 void Init();
 
+// Records a range the loader owns (module images, patch areas) so guest
+// mappings never land on it.
+void MarkUsed(VAddr start, u64 size, const char* name);
+
 u64 DirectMemoryAvailable();
 
 // Direct (physical) memory. Errors are errno values.

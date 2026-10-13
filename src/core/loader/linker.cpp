@@ -8,6 +8,7 @@
 
 #include "common/log.h"
 #include "core/address_space.h"
+#include "core/memory.h"
 #include "core/signals.h"
 #include "core/tls.h"
 #include "hle/hle.h"
@@ -130,6 +131,7 @@ bool Linker::LoadModule(const std::filesystem::path& path, VAddr base) {
     CollectExports(*m);
 
     const VAddr patch_area = AlignUp(m->Base() + m->Size(), 1 << 20);
+    Memory::MarkUsed(m->Base(), patch_area + kPatchAreaSize - m->Base(), m->Name().c_str());
     if (AddressSpace::Map(patch_area, kPatchAreaSize, AddressSpace::Prot::ReadWrite |
                                                           AddressSpace::Prot::Exec)) {
         Signals::AddPatchArea(m->CodeBegin(), m->CodeEnd(), patch_area, kPatchAreaSize);

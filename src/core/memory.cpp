@@ -57,9 +57,10 @@ bool Overlaps(VAddr start, u64 size) {
     return it != g_vmas.end() && it->first < start + size;
 }
 
-// First free, aligned gap of `size` bytes at or above `hint`.
+// First free, aligned gap of `size` bytes at or above `hint` (or the default
+// base without a hint).
 VAddr FindFree(VAddr hint, u64 size, u64 align) {
-    VAddr addr = AlignUp(std::max(hint, kDefaultSearchBase), std::max(align, kPage));
+    VAddr addr = AlignUp(hint ? hint : kDefaultSearchBase, std::max(align, kPage));
     for (;;) {
         if (!AddressSpace::Contains(addr, size)) {
             return 0;
@@ -149,6 +150,11 @@ void Init() {
     if (ftruncate(g_direct_fd, static_cast<off_t>(kDirectSize)) != 0) {
         DC_ERROR("cannot size direct memory to %llu MB: %d", kDirectSize >> 20, errno);
     }
+}
+
+void MarkUsed(VAddr start, u64 size, const char* name) {
+    std::scoped_lock lk(g_lock);
+    g_vmas[start] = {start, AlignUp(size, kPage), 0, VmaType::Reserved, 0, name};
 }
 
 u64 DirectMemoryAvailable() {
