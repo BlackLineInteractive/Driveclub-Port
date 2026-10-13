@@ -952,7 +952,9 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
             fo.mrt_type[k] = out_type[k];
         }
         fo.textures = ps_types;
+        fo.depth_target = depth != nullptr;
         ps_key = Hash(ps->hash);
+        ps_key = Hash(fo.depth_target, ps_key);
         ps_key = Fnv(fo.ps_input_cntl.data(), sizeof(fo.ps_input_cntl), ps_key);
         ps_key = Hash(fo.vs_param_mask, ps_key);
         ps_key = Hash(fo.ps_input_addr, ps_key);

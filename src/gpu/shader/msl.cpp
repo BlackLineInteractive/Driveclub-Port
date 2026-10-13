@@ -1231,7 +1231,7 @@ void Emitter::EmitExp(const Inst& i) {
     }
     Line("dc_exported = true;");
     if (i.target == ExpTarget::MrtZ) {
-        if (i.en & 1) {
+        if ((i.en & 1) && o.depth_target) {
             Line("out.depth = " + comp(0, "0.0f") + ";");
         }
         return;
@@ -1555,7 +1555,7 @@ std::string Emitter::Run() {
                 src += std::string("    ") + t + " c" + N(k) + " [[color(" + N(k) + ")]];\n";
             }
         }
-        if (p.exports_depth) {
+        if (p.exports_depth && o.depth_target) {
             src += "    float depth [[depth(any)]];\n";
         }
         src += "};\n\n";

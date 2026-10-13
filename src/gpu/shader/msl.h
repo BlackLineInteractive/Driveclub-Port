@@ -72,6 +72,7 @@ struct MslOptions {
     u32 ps_input_addr = 0;               // SPI_PS_INPUT_ADDR
     u32 col_format = 0;                  // SPI_SHADER_COL_FORMAT
     std::array<OutType, 8> mrt_type{};
+    bool depth_target = true; // false drops depth exports (no depth attachment)
     // Both.
     std::vector<TextureType> textures; // per Program::images slot
 };
