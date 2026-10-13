@@ -1,16 +1,19 @@
 // Driveclub Native: entry point.
-// Right now this only brings up the window and the Metal presenter; the
-// loader, HLE libraries and guest GPU frontend plug in behind it.
+// Usage: driveclub <game dir> [--load-only]
+// Loads and links the game's modules, then brings up the window and the Metal
+// presenter. Guest execution and the GPU frontend plug in behind this.
 
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
 
 #include "common/log.h"
+#include "core/loader/linker.h"
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_presenter.h"
 
@@ -19,7 +22,23 @@ namespace {
 constexpr int kWindowWidth = 1920;
 constexpr int kWindowHeight = 1080;
 
-int Run() {
+int Run(int argc, char** argv) {
+    if (argc < 2) {
+        DC_ERROR("usage: %s <game dir> [--load-only]", argv[0]);
+        return 1;
+    }
+    const bool load_only = argc > 2 && std::strcmp(argv[2], "--load-only") == 0;
+
+    Core::Loader::Linker linker;
+    if (!linker.LoadGame(argv[1])) {
+        return 1;
+    }
+    linker.Relocate();
+    linker.PrintReport();
+    if (load_only) {
+        return 0;
+    }
+
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         DC_ERROR("SDL_Init: %s", SDL_GetError());
         return 1;
@@ -94,9 +113,9 @@ int Run() {
 
 } // namespace
 
-int main(int, char**) {
+int main(int argc, char** argv) {
     try {
-        return Run();
+        return Run(argc, argv);
     } catch (const std::exception& e) {
         DC_ERROR("fatal: %s", e.what());
         return 1;

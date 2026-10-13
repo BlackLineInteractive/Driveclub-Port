@@ -23,11 +23,21 @@ find_package(SDL3 REQUIRED CONFIG)
 add_executable(driveclub
     src/main.mm
     src/common/log.h
+    src/common/types.h
+    src/core/loader/elf_types.h
+    src/core/loader/linker.cpp
+    src/core/loader/linker.h
+    src/core/loader/module.cpp
+    src/core/loader/module.h
+    src/core/loader/self.cpp
+    src/core/loader/self.h
     src/gpu/renderer.h
     src/gpu/metal/mtl_device.h
     src/gpu/metal/mtl_device.mm
     src/gpu/metal/mtl_presenter.h
     src/gpu/metal/mtl_presenter.mm
+    src/hle/hle.cpp
+    src/hle/hle.h
 )
 
 target_include_directories(driveclub PRIVATE src)
@@ -37,6 +47,10 @@ target_compile_options(driveclub PRIVATE
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
     $<$<CONFIG:Release>:-O3 -march=native>
 )
+
+# Guest code is mapped at its PS4 addresses (executable at 0x400000), which
+# sit inside the default 4 GB __PAGEZERO. Shrink it to free that range.
+target_link_options(driveclub PRIVATE -Wl,-pagezero_size,0x4000)
 
 target_link_libraries(driveclub PRIVATE
     SDL3::SDL3
