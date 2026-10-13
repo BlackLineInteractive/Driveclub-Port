@@ -5,8 +5,9 @@
 // Liverpool addresses surfaces through a fixed table of tile modes (the T#
 // TILING_INDEX). 1D modes split the surface into 8x8-element micro tiles
 // stored one after another in row order; the element order inside a micro
-// tile depends on the micro tile type. 2D (macro-tiled) modes add pipe/bank
-// swizzling on top and are not handled yet.
+// tile depends on the micro tile type. 2D (macro-tiled) modes group micro
+// tiles into macro tiles and interleave them across pipes and banks (bit
+// layout as in AMD's AddrLib for the PS4's 8-pipe configuration).
 
 #include "common/types.h"
 

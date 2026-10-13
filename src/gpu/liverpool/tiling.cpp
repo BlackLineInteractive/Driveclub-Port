@@ -41,6 +41,81 @@ u32 AlignUp(u32 v, u32 a) {
     return (v + a - 1) / a * a;
 }
 
+u32 Log2(u32 v) {
+    return 31u - static_cast<u32>(__builtin_clz(v));
+}
+
+// ---- 2D (macro) tiling: 2D_TILED_THIN1 with PS4's P8_32x32_16x16 pipes ----
+
+constexpr u32 kPipes = 8;
+constexpr u32 kPipeInterleaveBytes = 256;
+
+Micro MicroType2D(u32 tile_index) {
+    switch (tile_index) {
+    case 0x0A: return Micro::Display; // Display_2dThin
+    case 0x0E: return Micro::Thin;    // Thin_2dThin
+    default: return Micro::None;
+    }
+}
+
+struct MacroParams {
+    u32 banks;
+    u32 bank_height;
+    u32 aspect;
+    u32 pitch; // macro tile size in elements
+    u32 height;
+};
+
+// Bank layout for single-sampled colour surfaces; the macro tile mode follows
+// from the micro tile size (64 elements x bytes per element).
+MacroParams Macro(u32 bytes_per_el) {
+    MacroParams m{};
+    switch (bytes_per_el) {
+    case 1: m = {16, 4, 4}; break;
+    case 2: m = {16, 2, 2}; break;
+    case 4:
+    case 8: m = {16, 1, 2}; break;
+    default: m = {8, 1, 1}; break;
+    }
+    m.pitch = 8 * kPipes * m.aspect;            // bank width is always 1
+    m.height = 8 * m.bank_height * m.banks / m.aspect;
+    return m;
+}
+
+u32 Pipe(u32 x, u32 y) {
+    const u32 tx = x / 8, ty = y / 8;
+    const u32 x3 = tx & 1, x4 = (tx >> 1) & 1, x5 = (tx >> 2) & 1;
+    const u32 y3 = ty & 1, y4 = (ty >> 1) & 1, y5 = (ty >> 2) & 1;
+    return (x3 ^ y3 ^ x4) | ((x4 ^ y4) << 1) | ((x5 ^ y5) << 2);
+}
+
+u32 Bank(u32 x, u32 y, const MacroParams& m) {
+    const u32 tx = x / 8 / kPipes, ty = y / 8 / m.bank_height;
+    const u32 x3 = tx & 1, x4 = (tx >> 1) & 1, x5 = (tx >> 2) & 1, x6 = (tx >> 3) & 1;
+    const u32 y3 = ty & 1, y4 = (ty >> 1) & 1, y5 = (ty >> 2) & 1, y6 = (ty >> 3) & 1;
+    if (m.banks == 16) {
+        return (x3 ^ y6) | ((x4 ^ y5 ^ y6) << 1) | ((x5 ^ y4) << 2) | ((x6 ^ y3) << 3);
+    }
+    return (x3 ^ y5) | ((x4 ^ y4 ^ y5) << 1) | ((x5 ^ y3) << 2); // 8 banks
+}
+
+// Byte offset of element (x, y) in a macro-tiled slice.
+u64 MacroOffset(u32 x, u32 y, u32 pitch, const MacroParams& m, const u32* micro_order, u32 bpe) {
+    const u64 micro_bytes = 64ull * bpe;
+    const u64 macro_bytes = micro_bytes * (m.pitch / 8) * (m.height / 8) / (kPipes * m.banks);
+    const u64 macro_offset = (u64(y / m.height) * (pitch / m.pitch) + x / m.pitch) * macro_bytes;
+    const u64 tile_offset = u64((y / 8) % m.bank_height) * micro_bytes; // bank width 1
+    const u64 element = u64(micro_order[(y & 7) * 8 + (x & 7)]) * bpe;
+    const u64 total = macro_offset + tile_offset + element;
+
+    const u32 pipe_bits = Log2(kPipes), interleave_bits = Log2(kPipeInterleaveBytes);
+    u64 addr = total & (kPipeInterleaveBytes - 1);
+    addr |= u64(Pipe(x, y)) << interleave_bits;
+    addr |= u64(Bank(x, y, m)) << (interleave_bits + pipe_bits);
+    addr |= (total >> interleave_bits) << (interleave_bits + pipe_bits + Log2(m.banks));
+    return addr;
+}
+
 } // namespace
 
 bool IsLinear(u32 tile_index) {
@@ -48,12 +123,17 @@ bool IsLinear(u32 tile_index) {
 }
 
 bool Supported(u32 tile_index) {
-    return IsLinear(tile_index) || MicroType1D(tile_index) != Micro::None;
+    return IsLinear(tile_index) || MicroType1D(tile_index) != Micro::None ||
+           MicroType2D(tile_index) != Micro::None;
 }
 
 u64 SliceSize(u32 tile_index, u32 pitch_el, u32 height_el, u32 bytes_per_el) {
     if (IsLinear(tile_index)) {
         return u64(pitch_el) * height_el * bytes_per_el;
+    }
+    if (MicroType2D(tile_index) != Micro::None) {
+        const MacroParams m = Macro(bytes_per_el);
+        return u64(AlignUp(pitch_el, m.pitch)) * AlignUp(height_el, m.height) * bytes_per_el;
     }
     return u64(AlignUp(pitch_el, 8)) * AlignUp(height_el, 8) * bytes_per_el;
 }
@@ -64,6 +144,24 @@ void DetileSlice(u32 tile_index, const u8* src, u8* dst, u32 width_el, u32 heigh
     if (IsLinear(tile_index)) {
         for (u32 y = 0; y < height_el; ++y) {
             std::memcpy(dst + y * row, src + u64(y) * pitch_el * bytes_per_el, row);
+        }
+        return;
+    }
+    if (const Micro type2d = MicroType2D(tile_index); type2d != Micro::None) {
+        const MacroParams m = Macro(bytes_per_el);
+        const u32 pitch = AlignUp(pitch_el, m.pitch);
+        u32 order[64];
+        for (u32 y = 0; y < 8; ++y) {
+            for (u32 x = 0; x < 8; ++x) {
+                order[y * 8 + x] = MicroIndex(type2d, bytes_per_el, x, y);
+            }
+        }
+        for (u32 y = 0; y < height_el; ++y) {
+            u8* out = dst + y * row;
+            for (u32 x = 0; x < width_el; ++x) {
+                std::memcpy(out + u64(x) * bytes_per_el, src + MacroOffset(x, y, pitch, m, order, bytes_per_el),
+                            bytes_per_el);
+            }
         }
         return;
     }
