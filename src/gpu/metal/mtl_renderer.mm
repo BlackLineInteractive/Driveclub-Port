@@ -1052,28 +1052,6 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
                 vs_addr, vs_ud[0], vs_ud[1], vs_ud[2], vs_ud[3], vs_ud[4], vs_ud[5], vs_ud[6], vs_ud[7], vs_ud[8],
                 vs_ud[9], vs_ud[10], vs_ud[11], vs_ud[12], vs_ud[13], vs_ud[14], vs_ud[15]);
     }
-    if (capture) {
-        const u64 table = u64(vs_ud[12]) | (u64(vs_ud[13]) << 32);
-        if (Readable(table, 64)) {
-            const u32* t = reinterpret_cast<const u32*>(table);
-            for (u32 k = 0; k < 3; ++k) {
-                const u64 base = u64(t[k * 4]) | (u64(t[k * 4 + 1] & 0xFFFF) << 32);
-                Core::Memory::Vma vma{};
-                const bool mapped = Core::Memory::Query(base, false, &vma);
-                DC_INFO("gpu:   table[%u] V# %08x %08x %08x %08x base %#llx mapped=%d type=%d first=%08x %08x %08x %08x",
-                        k, t[k * 4], t[k * 4 + 1], t[k * 4 + 2], t[k * 4 + 3], base, mapped, static_cast<int>(vma.type),
-                        mapped ? reinterpret_cast<const u32*>(base)[0] : 0, mapped ? reinterpret_cast<const u32*>(base)[1] : 0,
-                        mapped ? reinterpret_cast<const u32*>(base)[2] : 0, mapped ? reinterpret_cast<const u32*>(base)[3] : 0);
-            }
-        }
-        const u64 cb2 = u64(vs_ud[8]) | (u64(vs_ud[9] & 0xFFFF) << 32);
-        const float* m = reinterpret_cast<const float*>(cb2);
-        DC_INFO("gpu:   cb2 matrix %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", m[0], m[1], m[2], m[3], m[4],
-                m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
-        for (const auto& rg : Core::Memory::DirectMappings()) {
-            DC_INFO("gpu:   direct %#llx+%#llx phys %#llx", rg.start, rg.size, rg.phys);
-        }
-    }
     // ---- primitive assembly ----
     const u32 base_vertex = r[Reg::VGT_INDX_OFFSET];
     const NSUInteger instances = std::max<u32>(dc.instances, 1);
