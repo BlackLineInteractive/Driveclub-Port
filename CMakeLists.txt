@@ -47,6 +47,8 @@ add_executable(driveclub
     src/gpu/liverpool/command_processor.h
     src/gpu/liverpool/command_processor.cpp
     src/gpu/liverpool/registers.h
+    src/gpu/liverpool/tiling.h
+    src/gpu/liverpool/tiling.cpp
     src/gpu/shader/gcn.h
     src/gpu/shader/gcn_decode.cpp
     src/gpu/shader/program.h

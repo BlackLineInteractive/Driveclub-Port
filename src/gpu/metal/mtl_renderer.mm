@@ -15,6 +15,7 @@
 #include "common/log.h"
 #include "core/memory.h"
 #include "gpu/liverpool/registers.h"
+#include "gpu/liverpool/tiling.h"
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_formats.h"
 #include "gpu/shader/msl.h"
@@ -469,11 +470,15 @@ struct MetalRenderer::Impl {
         }
         const u32 layers = tt.dim == TexDim::Tex2DArray ? std::max<u32>(last_array + 1, ttype == 11 ? 6 : 1)
                          : tt.dim == TexDim::Tex3D ? depth : 1;
-        const u32 bw = fi.compressed ? (pitch + 3) / 4 : pitch;
-        const u32 bh = fi.compressed ? (height + 3) / 4 : height;
-        const u64 row = u64(bw) * fi.bytes_per_block;
-        const u64 image = row * bh;
-        const u64 size = image * layers;
+        if (!Tiling::Supported(tiling)) {
+            ReportOnce("texture tile mode " + std::to_string(tiling) + " not supported yet");
+            return Dummy(tt);
+        }
+        const u32 width_el = fi.compressed ? (width + 3) / 4 : width;
+        const u32 height_el = fi.compressed ? (height + 3) / 4 : height;
+        const u32 pitch_el = fi.compressed ? (pitch + 3) / 4 : pitch;
+        const u64 slice = Tiling::SliceSize(tiling, pitch_el, height_el, fi.bytes_per_block);
+        const u64 size = slice * layers;
         if (!Readable(addr, size)) {
             ReportOnce("texture memory not mapped");
             return Dummy(tt);
@@ -491,9 +496,6 @@ struct MetalRenderer::Impl {
         if (e.tex && sum == e.checksum) {
             e.frame = frame_count;
             return e.tex;
-        }
-        if (tiling != 8 && tiling != 0x1F) {
-            ReportOnce("tiled texture (tile index " + std::to_string(tiling) + ") uploaded as linear");
         }
 
         if (!e.tex) {
@@ -518,13 +520,18 @@ struct MetalRenderer::Impl {
             }
         }
         const auto* src = reinterpret_cast<const u8*>(addr);
+        const u64 row = u64(width_el) * fi.bytes_per_block;
+        const u64 image = row * height_el;
+        std::vector<u8> linear(image);
         for (u32 l = 0; l < layers; ++l) {
+            Tiling::DetileSlice(tiling, src + slice * l, linear.data(), width_el, height_el, pitch_el,
+                                fi.bytes_per_block);
             const MTLRegion region = tt.dim == TexDim::Tex3D ? MTLRegionMake3D(0, 0, l, width, height, 1)
                                                              : MTLRegionMake2D(0, 0, width, height);
             [e.tex replaceRegion:region
                      mipmapLevel:0
                            slice:tt.dim == TexDim::Tex2DArray ? l : 0
-                       withBytes:src + image * l
+                       withBytes:linear.data()
                      bytesPerRow:row
                    bytesPerImage:image];
         }
