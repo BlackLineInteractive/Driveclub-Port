@@ -91,6 +91,8 @@ private:
         std::condition_variable idle_cv;
         std::deque<Job> jobs;
         bool busy = false;
+        RegFile regs;           // compute rings: their own SH state
+        u64 indirect_base = 0;  // SET_BASE
         std::jthread thread;
     };
 
@@ -100,7 +102,12 @@ private:
     void Execute(std::span<const u32> cmds, bool compute, int depth);
     void Interrupt(u32 irq);
     void SetRegs(u32 index, const u32* values, u32 count);
-    void Draw(bool indexed, u32 count, u32 index_offset);
+    void Draw(bool indexed, u32 count, u32 index_offset, u32 first_vertex, u32 instances);
+    RegFile& CurRegs();
+    // Ring and registers of the ring the calling thread executes.
+    static thread_local Ring* t_ring;
+    static thread_local Liverpool::RegFile* t_regs;
+    const u32* IndirectArgs(u32 offset, u32 dwords);
     void SyncRenderer();
     void ClearState();
     // Runs the CE until `done()` holds, it blocks on the DE, or its CCB ends.

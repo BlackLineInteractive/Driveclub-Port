@@ -122,38 +122,6 @@ s32 sceAudioInGetSilentState(s32 handle) {
     return 0;
 }
 
-// libSceAudioOut
-s32 sceAudioOutInit() {
-    DC_INFO("sceAudioOutInit()");
-    return 0;
-}
-
-s32 sceAudioOutOpen(s32 user_id, s32 port_type, s32 index, u32 len, u32 freq, u32 param) {
-    DC_INFO("sceAudioOutOpen(user_id=%#x, port_type=%d, len=%u, freq=%u) -> handle 1",
-            user_id, port_type, len, freq);
-    return 1;
-}
-
-s32 sceAudioOutClose(s32 handle) {
-    return 0;
-}
-
-s32 sceAudioOutOutput(s32 handle, const void* ptr) {
-    return 0;
-}
-
-s32 sceAudioOutOutputs(void* param, u32 num) {
-    return 0;
-}
-
-s32 sceAudioOutSetVolume(s32 handle, s32 flag, const s32* vol) {
-    return 0;
-}
-
-s32 sceAudioOutGetPortInfo(s32 handle, void* info) {
-    return 0;
-}
-
 // libSceAjm
 s32 sceAjmInitialize(s64 reserved, u32* p_ctx) {
     if (p_ctx) {
@@ -350,13 +318,6 @@ void RegisterMiscServices() {
     DC_HLE("libSceAudioIn", sceAudioInClose);
     DC_HLE("libSceAudioIn", sceAudioInGetSilentState);
 
-    DC_HLE("libSceAudioOut", sceAudioOutInit);
-    DC_HLE("libSceAudioOut", sceAudioOutOpen);
-    DC_HLE("libSceAudioOut", sceAudioOutClose);
-    DC_HLE("libSceAudioOut", sceAudioOutOutput);
-    DC_HLE("libSceAudioOut", sceAudioOutOutputs);
-    DC_HLE("libSceAudioOut", sceAudioOutSetVolume);
-    DC_HLE("libSceAudioOut", sceAudioOutGetPortInfo);
 
     DC_HLE("libSceAjm", sceAjmInitialize);
     DC_HLE("libSceAjm", sceAjmModuleRegister);

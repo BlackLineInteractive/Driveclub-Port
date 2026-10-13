@@ -12,6 +12,7 @@ namespace Gpu::Liverpool {
 
 namespace Op {
 constexpr u32 Nop = 0x10;
+constexpr u32 SetBase = 0x11;
 constexpr u32 ClearState = 0x12;
 constexpr u32 IndexBufferSize = 0x13;
 constexpr u32 DispatchDirect = 0x15;

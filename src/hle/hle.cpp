@@ -22,6 +22,7 @@ namespace Np { void RegisterNp(); }
 namespace Font { void RegisterFont(); }
 namespace AvPlayer { void RegisterAvPlayer(); }
 namespace MiscServices { void RegisterMiscServices(); }
+namespace AudioOut { void RegisterAudioOut(); }
 
 namespace {
 
@@ -110,6 +111,7 @@ void RegisterAll() {
     Font::RegisterFont();
     AvPlayer::RegisterAvPlayer();
     MiscServices::RegisterMiscServices();
+    AudioOut::RegisterAudioOut();
 }
 
 } // namespace Hle

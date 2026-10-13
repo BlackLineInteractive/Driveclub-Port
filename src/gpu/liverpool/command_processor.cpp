@@ -69,6 +69,9 @@ bool Compare(u32 func, u32 value, u32 ref) {
 
 } // namespace
 
+thread_local CommandProcessor::Ring* CommandProcessor::t_ring = nullptr;
+thread_local RegFile* CommandProcessor::t_regs = nullptr;
+
 CommandProcessor::CommandProcessor() {
     trace = std::getenv("DC_CP_TRACE") != nullptr;
     ClearState();
@@ -157,6 +160,8 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
     char name[32];
     std::snprintf(name, sizeof(name), ring.index == 0 ? "GPU gfx" : "GPU compute %u", ring.index);
     pthread_setname_np(name);
+    t_ring = &ring;
+    t_regs = ring.index == 0 ? &regs : &ring.regs;
     for (;;) {
         Job job;
         {
@@ -205,11 +210,15 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
     }
 }
 
+RegFile& CommandProcessor::CurRegs() {
+    return t_regs ? *t_regs : regs;
+}
+
 void CommandProcessor::SetRegs(u32 index, const u32* values, u32 count) {
     if (index + count > RegFile::kSize) {
         return;
     }
-    std::memcpy(regs.Data() + index, values, count * 4);
+    std::memcpy(CurRegs().Data() + index, values, count * 4);
 }
 
 void CommandProcessor::SyncRenderer() {
@@ -301,7 +310,7 @@ void CommandProcessor::RunConstantEngine(const std::function<bool()>& done) {
     }
 }
 
-void CommandProcessor::Draw(bool indexed, u32 count, u32 index_offset) {
+void CommandProcessor::Draw(bool indexed, u32 count, u32 index_offset, u32 first_vertex, u32 instances) {
     ++stats.draws;
     if (!renderer || count == 0) {
         return;
@@ -309,11 +318,23 @@ void CommandProcessor::Draw(bool indexed, u32 count, u32 index_offset) {
     DrawCall dc;
     dc.indexed = indexed;
     dc.count = count;
-    dc.instances = num_instances;
+    dc.instances = instances ? instances : num_instances;
     dc.index_base = index_base;
     dc.index_offset = index_offset;
     dc.index_size = index_size;
-    renderer->Draw(regs, dc);
+    dc.first_vertex = first_vertex;
+    renderer->Draw(CurRegs(), dc);
+}
+
+// Indirect draw/dispatch arguments live at the SET_BASE address + offset.
+const u32* CommandProcessor::IndirectArgs(u32 offset, u32 dwords) {
+    const Ring* ring = t_ring;
+    const u64 addr = (ring ? ring->indirect_base : 0) + offset;
+    if (!addr) {
+        return nullptr;
+    }
+    (void)dwords;
+    return reinterpret_cast<const u32*>(addr);
 }
 
 void CommandProcessor::Interrupt(u32 irq) {
@@ -323,6 +344,7 @@ void CommandProcessor::Interrupt(u32 irq) {
 }
 
 void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int depth) {
+    RegFile& regs = CurRegs();
     const u32* p = cmds.data();
     const u32* end = p + cmds.size();
 
@@ -471,22 +493,43 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
 
         case Op::DrawIndex2:
             index_base = u64(body[1]) | (u64(body[2] & 0xFFFF) << 32);
-            Draw(true, body[3], 0);
+            Draw(true, body[3], 0, 0, 0);
             break;
         case Op::DrawIndexOffset2:
-            Draw(true, body[2], body[1]);
+            Draw(true, body[2], body[1], 0, 0);
             break;
         case Op::DrawIndexAuto:
-            Draw(false, body[0], 0);
+            Draw(false, body[0], 0, 0, 0);
             break;
-        case Op::DrawIndirect:
-        case Op::DrawIndexIndirect:
-            ++stats.draws;
-            if (!warned_indirect) {
-                warned_indirect = true;
-                DC_WARN("gpu: indirect draws are not implemented yet");
+        case Op::SetBase:
+            if (t_ring) {
+                t_ring->indirect_base = u64(body[1] & ~7u) | (u64(body[2] & 0xFFFF) << 32);
             }
             break;
+        case Op::DrawIndirect:
+        case Op::DrawIndexIndirect: {
+            // DrawIndirect args: vertex count, instances, first vertex, first instance.
+            // DrawIndexIndirect: index count, instances, first index, base vertex, first instance.
+            const bool indexed = op == Op::DrawIndexIndirect;
+            const u32* a = IndirectArgs(body[0], indexed ? 5 : 4);
+            if (!a) {
+                break;
+            }
+            const u32 base_vtx_loc = body[1] & 0xFFFF;
+            const u32 start_inst_loc = body[2] & 0xFFFF;
+            if (base_vtx_loc) {
+                regs[kShRegBase + base_vtx_loc] = indexed ? a[3] : a[2];
+            }
+            if (start_inst_loc) {
+                regs[kShRegBase + start_inst_loc] = indexed ? a[4] : a[3];
+            }
+            if (indexed) {
+                Draw(true, a[0], a[2], 0, a[1]);
+            } else {
+                Draw(false, a[0], 0, a[2], a[1]);
+            }
+            break;
+        }
 
         case Op::DispatchDirect:
             ++stats.dispatches;
@@ -494,9 +537,14 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 renderer->Dispatch(regs, body[0], body[1], body[2]);
             }
             break;
-        case Op::DispatchIndirect:
+        case Op::DispatchIndirect: {
             ++stats.dispatches;
+            const u32* a = IndirectArgs(body[0], 3);
+            if (renderer && a) {
+                renderer->Dispatch(regs, a[0], a[1], a[2]);
+            }
             break;
+        }
 
         default:
             if (trace) {

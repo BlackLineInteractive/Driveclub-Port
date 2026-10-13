@@ -27,6 +27,7 @@ struct DrawCall {
     GuestAddr index_base = 0;        // INDEX_BASE packet
     std::uint32_t index_offset = 0;  // in indices (DRAW_INDEX_OFFSET_2)
     std::uint32_t index_size = 2;    // bytes per index: 2 or 4
+    std::uint32_t first_vertex = 0;  // non-indexed draws (indirect)
 };
 
 // What sceVideoOutSubmitFlip asks to show.

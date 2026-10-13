@@ -59,14 +59,15 @@ int Run(int argc, char** argv) {
         return 0;
     }
 
-    Core::Signals::Install(
-        [](u64 address) { return Core::Loader::Linker::Instance()->Describe(address); });
-    Core::Runtime::StartGame(linker);
-
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+    // SDL first, on the main thread: guest threads use its audio right away.
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
         DC_ERROR("SDL_Init: %s", SDL_GetError());
         return 1;
     }
+
+    Core::Signals::Install(
+        [](u64 address) { return Core::Loader::Linker::Instance()->Describe(address); });
+    Core::Runtime::StartGame(linker);
 
     SDL_Window* window =
         SDL_CreateWindow("Driveclub Native", kWindowWidth, kWindowHeight,

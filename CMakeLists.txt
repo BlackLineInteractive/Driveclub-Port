@@ -101,6 +101,8 @@ add_executable(driveclub
     src/hle/avplayer/avplayer.h
     src/hle/avplayer/avplayer.cpp
     src/hle/services/misc_services.h
+    src/hle/audio_out/audio_out.h
+    src/hle/audio_out/audio_out.cpp
     src/hle/services/misc_services.cpp
     src/hle/nid_db.inc
 )
