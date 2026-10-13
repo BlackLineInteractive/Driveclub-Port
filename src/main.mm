@@ -21,6 +21,7 @@
 #include "core/signals.h"
 #include "hle/hle.h"
 #include "hle/kernel/kernel.h"
+#include "hle/pad/pad.h"
 #include "hle/video_out/video_out.h"
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_presenter.h"
@@ -98,12 +99,103 @@ int Run(int argc, char** argv) {
                 presenter.Resize(ev.window.data1, ev.window.data2);
                 break;
             case SDL_EVENT_KEY_DOWN:
-                if (ev.key.key == SDLK_V) {
-                    config.vsync = !config.vsync;
-                    presenter.SetVsync(config.vsync);
-                    DC_INFO("vsync: %d", config.vsync);
+            case SDL_EVENT_KEY_UP: {
+                const bool pressed = (ev.type == SDL_EVENT_KEY_DOWN);
+                switch (ev.key.key) {
+                case SDLK_V:
+                    if (pressed) {
+                        config.vsync = !config.vsync;
+                        presenter.SetVsync(config.vsync);
+                        DC_INFO("vsync: %d", config.vsync);
+                    }
+                    break;
+                case SDLK_RETURN:
+                case SDLK_SPACE:
+                case SDLK_K:
+                    Hle::Pad::SetButton(Hle::Pad::kCross, pressed);
+                    break;
+                case SDLK_ESCAPE:
+                case SDLK_TAB:
+                    Hle::Pad::SetButton(Hle::Pad::kOptions, pressed);
+                    break;
+                case SDLK_L:
+                    Hle::Pad::SetButton(Hle::Pad::kCircle, pressed);
+                    break;
+                case SDLK_J:
+                    Hle::Pad::SetButton(Hle::Pad::kSquare, pressed);
+                    break;
+                case SDLK_I:
+                    Hle::Pad::SetButton(Hle::Pad::kTriangle, pressed);
+                    break;
+                case SDLK_UP:
+                case SDLK_W:
+                    Hle::Pad::SetButton(Hle::Pad::kUp, pressed);
+                    break;
+                case SDLK_DOWN:
+                case SDLK_S:
+                    Hle::Pad::SetButton(Hle::Pad::kDown, pressed);
+                    break;
+                case SDLK_LEFT:
+                case SDLK_A:
+                    Hle::Pad::SetButton(Hle::Pad::kLeft, pressed);
+                    break;
+                case SDLK_RIGHT:
+                case SDLK_D:
+                    Hle::Pad::SetButton(Hle::Pad::kRight, pressed);
+                    break;
+                case SDLK_Q:
+                    Hle::Pad::SetButton(Hle::Pad::kL1, pressed);
+                    break;
+                case SDLK_E:
+                    Hle::Pad::SetButton(Hle::Pad::kR1, pressed);
+                    break;
+                default:
+                    break;
                 }
                 break;
+            }
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+                const bool pressed = (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
+                switch (ev.gbutton.button) {
+                case SDL_GAMEPAD_BUTTON_SOUTH:
+                    Hle::Pad::SetButton(Hle::Pad::kCross, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_EAST:
+                    Hle::Pad::SetButton(Hle::Pad::kCircle, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_WEST:
+                    Hle::Pad::SetButton(Hle::Pad::kSquare, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_NORTH:
+                    Hle::Pad::SetButton(Hle::Pad::kTriangle, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_START:
+                    Hle::Pad::SetButton(Hle::Pad::kOptions, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_DPAD_UP:
+                    Hle::Pad::SetButton(Hle::Pad::kUp, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
+                    Hle::Pad::SetButton(Hle::Pad::kDown, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
+                    Hle::Pad::SetButton(Hle::Pad::kLeft, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
+                    Hle::Pad::SetButton(Hle::Pad::kRight, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
+                    Hle::Pad::SetButton(Hle::Pad::kL1, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
+                    Hle::Pad::SetButton(Hle::Pad::kR1, pressed);
+                    break;
+                default:
+                    break;
+                }
+                break;
+            }
             default:
                 break;
             }

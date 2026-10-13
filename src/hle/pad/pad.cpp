@@ -2,6 +2,7 @@
 
 #include "hle/pad/pad.h"
 
+#include <atomic>
 #include <cstring>
 
 #include "common/log.h"
@@ -40,11 +41,18 @@ s32 scePadClose(s32 handle) {
     return 0;
 }
 
+static std::atomic<u32> g_buttons{0};
+static std::atomic<u8> g_left_x{128};
+static std::atomic<u8> g_left_y{128};
+static std::atomic<u8> g_right_x{128};
+static std::atomic<u8> g_right_y{128};
+
 s32 scePadReadState(s32 handle, OrbisPadData* data) {
     if (data) {
         std::memset(data, 0, sizeof(*data));
-        data->leftStick = {128, 128};
-        data->rightStick = {128, 128};
+        data->buttons = g_buttons.load();
+        data->leftStick = {g_left_x.load(), g_left_y.load()};
+        data->rightStick = {g_right_x.load(), g_right_y.load()};
         data->orientation[3] = 1.0f;
         data->acceleration[2] = 9.8f;
         data->connected = true;
@@ -57,8 +65,9 @@ s32 scePadRead(s32 handle, OrbisPadData* data, s32 count) {
     if (data && count > 0) {
         for (s32 i = 0; i < count; ++i) {
             std::memset(&data[i], 0, sizeof(OrbisPadData));
-            data[i].leftStick = {128, 128};
-            data[i].rightStick = {128, 128};
+            data[i].buttons = g_buttons.load();
+            data[i].leftStick = {g_left_x.load(), g_left_y.load()};
+            data[i].rightStick = {g_right_x.load(), g_right_y.load()};
             data[i].orientation[3] = 1.0f;
             data[i].acceleration[2] = 9.8f;
             data[i].connected = true;
@@ -97,6 +106,24 @@ s32 scePadResetOrientation(s32 handle) {
 }
 
 } // namespace
+
+void SetButton(u32 button, bool pressed) {
+    if (pressed) {
+        g_buttons.fetch_or(button);
+    } else {
+        g_buttons.fetch_and(~button);
+    }
+}
+
+void SetStick(bool right, u8 x, u8 y) {
+    if (right) {
+        g_right_x.store(x);
+        g_right_y.store(y);
+    } else {
+        g_left_x.store(x);
+        g_left_y.store(y);
+    }
+}
 
 void RegisterPad() {
     constexpr const char* lib = "libScePad";

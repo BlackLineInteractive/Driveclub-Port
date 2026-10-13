@@ -60,6 +60,28 @@ struct OrbisPadControllerInformation {
     u8 reserve[8] = {0};
 };
 
+enum Button : u32 {
+    kL3 = 0x2,
+    kR3 = 0x4,
+    kOptions = 0x8,
+    kUp = 0x10,
+    kRight = 0x20,
+    kDown = 0x40,
+    kLeft = 0x80,
+    kL2 = 0x100,
+    kR2 = 0x200,
+    kL1 = 0x400,
+    kR1 = 0x800,
+    kTriangle = 0x1000,
+    kCircle = 0x2000,
+    kCross = 0x4000,
+    kSquare = 0x8000,
+    kTouchPad = 0x100000,
+};
+
+void SetButton(u32 button, bool pressed);
+void SetStick(bool right, u8 x, u8 y);
+
 void RegisterPad();
 
 } // namespace Hle::Pad

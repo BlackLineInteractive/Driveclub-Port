@@ -13,19 +13,32 @@ namespace Hle::AvPlayer {
 
 namespace {
 
+using AvPlayerEventCallback = void (*)(void* p, s32 event, s32 src_id, void* data);
+
 struct PlayerContext {
     uint32_t handle = 1;
     bool active = false;
     uint64_t current_time_ms = 0;
+    void* object_ptr = nullptr;
+    AvPlayerEventCallback event_cb = nullptr;
 };
 
 static PlayerContext g_player;
 
 void* sceAvPlayerInit(void* init_data) {
-    (void)init_data;
-    DC_INFO("sceAvPlayerInit()");
     g_player.active = false;
     g_player.current_time_ms = 0;
+    g_player.object_ptr = nullptr;
+    g_player.event_cb = nullptr;
+    if (init_data) {
+        void** ptrs = reinterpret_cast<void**>(init_data);
+        g_player.object_ptr = ptrs[10];
+        g_player.event_cb = reinterpret_cast<AvPlayerEventCallback>(ptrs[11]);
+        DC_INFO("sceAvPlayerInit: object_ptr=%p event_cb=%p", g_player.object_ptr,
+                reinterpret_cast<void*>(g_player.event_cb));
+    } else {
+        DC_INFO("sceAvPlayerInit()");
+    }
     return &g_player;
 }
 
@@ -50,6 +63,10 @@ s32 sceAvPlayerClose(void* handle) {
 
 s32 sceAvPlayerAddSource(void* handle, const char* filename) {
     DC_INFO("sceAvPlayerAddSource(handle=%p, file=%s)", handle, filename ? filename : "null");
+    if (g_player.event_cb) {
+        DC_INFO("sceAvPlayerAddSource: emitting StateStop (1) event to skip movie");
+        g_player.event_cb(g_player.object_ptr, 1 /*StateStop*/, 0, nullptr);
+    }
     return 0;
 }
 
