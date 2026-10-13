@@ -1,0 +1,7 @@
+{
+    "git.repositoryScanMaxDepth": 0,
+    "git.autoRepositoryDetection": false,
+    "git.ignoredRepositories": [
+        "shadps4"
+    ]
+}
