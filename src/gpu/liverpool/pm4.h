@@ -40,10 +40,13 @@ constexpr u32 SetConfigReg = 0x68;
 constexpr u32 SetContextReg = 0x69;
 constexpr u32 SetShReg = 0x76;
 constexpr u32 SetUconfigReg = 0x79;
+constexpr u32 LoadConstRam = 0x80;
 constexpr u32 WriteConstRam = 0x81;
+constexpr u32 DumpConstRam = 0x83;
 constexpr u32 IncrementCeCounter = 0x84;
 constexpr u32 IncrementDeCounter = 0x85;
 constexpr u32 WaitOnCeCounter = 0x86;
+constexpr u32 WaitOnDeCounterDiff = 0x88;
 } // namespace Op
 
 // Register file windows (dword indices); SET_*_REG offsets are relative.

@@ -1,6 +1,7 @@
 #include "gpu/liverpool/command_processor.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 
 #include <pthread.h>
@@ -120,14 +121,13 @@ void CommandProcessor::Push(u32 index, Job job) {
     r.cv.notify_one();
 }
 
-void CommandProcessor::SubmitGraphics(std::vector<std::span<const u32>> dcbs,
-                                      std::function<void()> after) {
+void CommandProcessor::SubmitGraphics(std::vector<CmdBuffers> bufs, std::function<void()> after) {
     ++stats.submits;
-    Push(0, {std::move(dcbs), std::move(after)});
+    Push(0, {std::move(bufs), std::move(after)});
 }
 
 void CommandProcessor::SubmitCompute(u32 queue, std::span<const u32> acb) {
-    Push(queue, {{acb}, {}});
+    Push(queue, {{CmdBuffers{acb, {}}}, {}});
 }
 
 void CommandProcessor::WaitIdle() {
@@ -163,7 +163,17 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
             ring.busy = true;
         }
         for (const auto& buf : job.buffers) {
-            Execute(buf, ring.index != 0, 0);
+            if (ring.index == 0) {
+                ce.stack.clear();
+                if (!buf.ccb.empty()) {
+                    ce.stack.push_back(buf.ccb);
+                }
+                ce.ce_counter = ce.de_counter = 0;
+            }
+            Execute(buf.dcb, ring.index != 0, 0);
+            if (ring.index == 0) {
+                RunConstantEngine([] { return false; }); // whatever the CE has left
+            }
         }
         if (renderer) {
             renderer->OnSubmit();
@@ -189,6 +199,89 @@ void CommandProcessor::SetRegs(u32 index, const u32* values, u32 count) {
 void CommandProcessor::SyncRenderer() {
     if (renderer) {
         renderer->WaitIdle();
+    }
+    ce.dumped.clear();
+}
+
+void CommandProcessor::RunConstantEngine(const std::function<bool()>& done) {
+    while (!ce.stack.empty() && !done()) {
+        std::span<const u32>& cur = ce.stack.back();
+        if (cur.empty()) {
+            ce.stack.pop_back();
+            continue;
+        }
+        const u32 header = cur[0];
+        const u32 type = HeaderType(header);
+        if (header == 0 || type == 2) {
+            cur = cur.subspan(1);
+            continue;
+        }
+        if (type != 3) {
+            DC_WARN("gpu: CE: unsupported packet type %u", type);
+            ce.stack.clear();
+            return;
+        }
+        const u32 n = HeaderBodyDwords(header);
+        if (n + 1 > cur.size()) {
+            ce.stack.pop_back();
+            continue;
+        }
+        const u32* body = cur.data() + 1;
+        switch (HeaderOpcode(header)) {
+        case Op::WriteConstRam: {
+            const u32 off = (body[0] & 0xFFFF) / 4;
+            for (u32 k = 0; k + 1 < n && off + k < ce.ram.size(); ++k) {
+                ce.ram[off + k] = body[1 + k];
+            }
+            break;
+        }
+        case Op::LoadConstRam: {
+            const u32* src = Ptr<const u32>(body[0], body[1]);
+            const u32 count = body[2] & 0x7FFF;
+            const u32 off = (body[3] & 0xFFFF) / 4;
+            if (src && off + count <= ce.ram.size()) {
+                std::memcpy(ce.ram.data() + off, src, count * 4);
+            }
+            break;
+        }
+        case Op::DumpConstRam: {
+            const u32 off = (body[0] & 0xFFFF) / 4;
+            const u32 count = body[1] & 0x7FFF;
+            u32* dst = Ptr<u32>(body[2], body[3]);
+            if (!dst || off + count > ce.ram.size()) {
+                break;
+            }
+            // The renderer may still have to read what an earlier dump put at
+            // this address: let it finish before the ring slot is reused.
+            const u64 addr = reinterpret_cast<u64>(dst);
+            if (std::find(ce.dumped.begin(), ce.dumped.end(), addr) != ce.dumped.end()) {
+                SyncRenderer();
+            }
+            ce.dumped.push_back(addr);
+            std::memcpy(dst, ce.ram.data() + off, count * 4);
+            break;
+        }
+        case Op::IncrementCeCounter:
+            ++ce.ce_counter;
+            break;
+        case Op::WaitOnDeCounterDiff:
+            if (ce.ce_counter - ce.de_counter >= body[0]) {
+                return; // blocked until the DE catches up; retried later
+            }
+            break;
+        case Op::IndirectBufferConst: {
+            const u32* ib = Ptr<const u32>(body[0], body[1] & 0xFFFF);
+            const u32 size = body[2] & 0xFFFFF;
+            cur = cur.subspan(n + 1);
+            if (ib && size) {
+                ce.stack.push_back({ib, size});
+            }
+            continue;
+        }
+        default:
+            break;
+        }
+        cur = cur.subspan(n + 1);
     }
 }
 
@@ -333,6 +426,15 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             }
             break;
         }
+
+        case Op::WaitOnCeCounter:
+            if (!compute) {
+                RunConstantEngine([&] { return ce.ce_counter > ce.de_counter; });
+            }
+            break;
+        case Op::IncrementDeCounter:
+            ++ce.de_counter;
+            break;
 
         case Op::IndexType:
             index_size = (body[0] & 3) == 1 ? 4 : 2;

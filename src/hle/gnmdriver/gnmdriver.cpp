@@ -315,22 +315,35 @@ s32 sceGnmInsertPopMarker(u32* cmdbuf, u32 size) {
 }
 
 // ---------------------------------------------------------- Submit & Execution ----
+// Pairs each draw command buffer with its constant command buffer.
+std::vector<Gpu::Liverpool::CommandProcessor::CmdBuffers> CollectBuffers(u32 count, const u32* dcb_ptrs[],
+                                                                       const u32 dcb_sizes[],
+                                                                       const u32* ccb_ptrs[],
+                                                                       const u32 ccb_sizes[]) {
+    std::vector<Gpu::Liverpool::CommandProcessor::CmdBuffers> bufs;
+    bufs.reserve(count);
+    for (u32 i = 0; i < count; ++i) {
+        Gpu::Liverpool::CommandProcessor::CmdBuffers b;
+        if (dcb_ptrs && dcb_sizes && dcb_ptrs[i] && dcb_sizes[i] > 0) {
+            b.dcb = {reinterpret_cast<const u32*>(dcb_ptrs[i]), dcb_sizes[i] / 4};
+        }
+        if (ccb_ptrs && ccb_sizes && ccb_ptrs[i] && ccb_sizes[i] > 0) {
+            b.ccb = {reinterpret_cast<const u32*>(ccb_ptrs[i]), ccb_sizes[i] / 4};
+        }
+        if (!b.dcb.empty() || !b.ccb.empty()) {
+            bufs.push_back(b);
+        }
+    }
+    return bufs;
+}
+
 s32 sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_ptrs[], const u32 dcb_sizes[],
                                const u32* ccb_ptrs[], const u32 ccb_sizes[]) {
-    (void)ccb_ptrs;
-    (void)ccb_sizes;
     static u64 submit_count = 0;
     if (++submit_count % 60 == 1) {
         DC_INFO("gnm: submit #%llu (count=%u)", submit_count, count);
     }
-    std::vector<std::span<const u32>> dcbs;
-    dcbs.reserve(count);
-    for (u32 i = 0; i < count; ++i) {
-        if (dcb_ptrs && dcb_sizes && dcb_sizes[i] > 0) {
-            dcbs.emplace_back(reinterpret_cast<const u32*>(dcb_ptrs[i]), dcb_sizes[i] / 4);
-        }
-    }
-    Instance().SubmitGraphics(std::move(dcbs));
+    Instance().SubmitGraphics(CollectBuffers(count, dcb_ptrs, dcb_sizes, ccb_ptrs, ccb_sizes));
     return 0;
 }
 
@@ -349,8 +362,6 @@ void FlipOnGpuThread(u32 vo_handle, u32 buf_idx, s64 flip_arg) {
 s32 sceGnmSubmitAndFlipCommandBuffers(u32 count, const u32* dcb_ptrs[], const u32 dcb_sizes[],
                                       const u32* ccb_ptrs[], const u32 ccb_sizes[],
                                       u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
-    (void)ccb_ptrs;
-    (void)ccb_sizes;
     (void)flip_mode;
     static u64 flip_count = 0;
     if (++flip_count % 60 == 1) {
@@ -359,15 +370,7 @@ s32 sceGnmSubmitAndFlipCommandBuffers(u32 count, const u32* dcb_ptrs[], const u3
     }
     VideoOut::Driver::Instance().MarkFlipPending(vo_handle, buf_idx);
 
-    std::vector<std::span<const u32>> dcbs;
-    dcbs.reserve(count);
-    for (u32 i = 0; i < count; ++i) {
-        if (dcb_ptrs && dcb_sizes && dcb_sizes[i] > 0) {
-            dcbs.emplace_back(reinterpret_cast<const u32*>(dcb_ptrs[i]), dcb_sizes[i] / 4);
-        }
-    }
-
-    Instance().SubmitGraphics(std::move(dcbs), [vo_handle, buf_idx, flip_arg] {
+    Instance().SubmitGraphics(CollectBuffers(count, dcb_ptrs, dcb_sizes, ccb_ptrs, ccb_sizes), [vo_handle, buf_idx, flip_arg] {
         FlipOnGpuThread(vo_handle, buf_idx, flip_arg);
     });
     return 0;

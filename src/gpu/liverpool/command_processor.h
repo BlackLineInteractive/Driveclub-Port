@@ -42,9 +42,16 @@ public:
     CommandProcessor();
     ~CommandProcessor();
 
-    // Graphics ring: draw command buffers (+ constant buffers, ignored for
-    // now). `after` runs on the GPU thread once they are done (used for flips).
-    void SubmitGraphics(std::vector<std::span<const u32>> dcbs, std::function<void()> after = {});
+    // One draw command buffer and the constant command buffer that feeds it
+    // (run by the constant engine, CE, alongside the draw engine, DE).
+    struct CmdBuffers {
+        std::span<const u32> dcb;
+        std::span<const u32> ccb;
+    };
+
+    // Graphics ring. `after` runs on the GPU thread once the buffers are done
+    // (used for flips).
+    void SubmitGraphics(std::vector<CmdBuffers> bufs, std::function<void()> after = {});
     // Compute ring `queue` (1-based Gnm vqid).
     void SubmitCompute(u32 queue, std::span<const u32> acb);
 
@@ -60,8 +67,19 @@ public:
 
 private:
     struct Job {
-        std::vector<std::span<const u32>> buffers;
+        std::vector<CmdBuffers> buffers;
         std::function<void()> after;
+    };
+
+    // Constant engine: fills its 48 KB RAM from the CCB and dumps it to
+    // memory (descriptor tables) for the DE. It runs ahead of the DE, synced
+    // through two counters; here it runs on demand whenever the DE waits.
+    struct ConstantEngine {
+        std::vector<std::span<const u32>> stack; // CCB + IB_CONST nesting
+        u64 ce_counter = 0;
+        u64 de_counter = 0;
+        std::vector<u32> ram = std::vector<u32>(0xC000 / 4, 0);
+        std::vector<u64> dumped; // dump targets since the renderer last went idle
     };
 
     // One hardware ring: the graphics ring or a compute queue. Rings run in
@@ -85,8 +103,11 @@ private:
     void Draw(bool indexed, u32 count, u32 index_offset);
     void SyncRenderer();
     void ClearState();
+    // Runs the CE until `done()` holds, it blocks on the DE, or its CCB ends.
+    void RunConstantEngine(const std::function<bool()>& done);
 
     RegFile regs;
+    ConstantEngine ce;
     // Draw state set by packets rather than registers.
     u64 index_base = 0;
     u32 index_size = 2;
