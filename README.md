@@ -1,5 +1,9 @@
 # Driveclub Native
 
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/blacklineinteractive)
+[![Patreon](https://img.shields.io/badge/Patreon-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/BlacklineInteractive)
+[![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtube.com/@blacklineinteractive)
+
 ![Driveclub Native Boot](media/DRIVECLUB.webp)
 ![Tamil Nadu Event Loading](media/DCPS4.webp)
 
@@ -76,3 +80,9 @@ This project is licensed under the **GNU General Public License v2.0 or later (G
 
 - [shadPS4](https://github.com/shadps4-emu/shadPS4) - PS4 emulator, the primary source of knowledge on ELF loading, HLE libraries, PM4, and GCN shader recompilation. Its Vulkan renderer can serve as a backend for Windows/Linux. Note: shadPS4 is distributed under GPL-2.0.
 - [OpenGNM](https://ps4-opengnm.github.io/opengnm/) - documentation on PS4 Gnm and GCN shaders.
+
+## Community & Support
+
+- **Ko-fi**: [ko-fi.com/blacklineinteractive](https://ko-fi.com/blacklineinteractive)
+- **Patreon**: [patreon.com/BlacklineInteractive](https://www.patreon.com/BlacklineInteractive)
+- **YouTube**: [youtube.com/@blacklineinteractive](https://youtube.com/@blacklineinteractive)
