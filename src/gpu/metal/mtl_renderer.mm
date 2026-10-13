@@ -750,6 +750,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         }
     }
     if (!any_color && !depth) {
+        if (trace) DC_INFO("gpu:   skipped: no attachments");
         return;
     }
 
@@ -775,6 +776,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
                                                     Bits(r[Reg::SPI_SHADER_PGM_RSRC2_PS], 1, 5), 0)
                                        : nullptr;
     if (!vs || (ps_addr && any_color && !ps)) {
+        if (trace) DC_INFO("gpu:   skipped: shader decode failed");
         return;
     }
 
@@ -841,6 +843,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         ffn = GetFunction(*ps, fo, ps_key);
     }
     if (!vfn || (ps && !ffn)) {
+        if (trace) DC_INFO("gpu:   skipped: shader compile failed");
         return;
     }
 
@@ -899,6 +902,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         pipelines[pkey] = pso;
     }
     if (!pso) {
+        if (trace) DC_INFO("gpu:   skipped: no pipeline");
         return;
     }
 
@@ -908,6 +912,16 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     sc = Intersect(sc, ScissorReg(r[Reg::PA_SC_WINDOW_SCISSOR_TL], r[Reg::PA_SC_WINDOW_SCISSOR_BR]));
     sc = Intersect(sc, ScissorReg(r[Reg::PA_SC_GENERIC_SCISSOR_TL], r[Reg::PA_SC_GENERIC_SCISSOR_BR]));
     sc = Intersect(sc, ScissorReg(r[Reg::PA_SC_VPORT_SCISSOR_0_TL], r[Reg::PA_SC_VPORT_SCISSOR_0_TL + 1]));
+    if (trace) {
+        DC_INFO("gpu:   vte=%#x vp=[%g %g | %g %g | %g %g] scissor=(%d,%d)-(%d,%d) [scr %#x %#x win %#x %#x gen %#x %#x vp %#x %#x mode0 %#x] pass=%ux%u clip=%#x su=%#x",
+                r[Reg::PA_CL_VTE_CNTL], r.F(Reg::PA_CL_VPORT_XSCALE), r.F(Reg::PA_CL_VPORT_XSCALE + 1),
+                r.F(Reg::PA_CL_VPORT_XSCALE + 2), r.F(Reg::PA_CL_VPORT_XSCALE + 3), r.F(Reg::PA_CL_VPORT_XSCALE + 4),
+                r.F(Reg::PA_CL_VPORT_XSCALE + 5), sc.x0, sc.y0, sc.x1, sc.y1, r[Reg::PA_SC_SCREEN_SCISSOR_TL],
+                r[Reg::PA_SC_SCREEN_SCISSOR_BR], r[Reg::PA_SC_WINDOW_SCISSOR_TL], r[Reg::PA_SC_WINDOW_SCISSOR_BR],
+                r[Reg::PA_SC_GENERIC_SCISSOR_TL], r[Reg::PA_SC_GENERIC_SCISSOR_BR], r[Reg::PA_SC_VPORT_SCISSOR_0_TL],
+                r[Reg::PA_SC_VPORT_SCISSOR_0_TL + 1], r[0xA292], pass_width, pass_height,
+                r[Reg::PA_CL_CLIP_CNTL], r[Reg::PA_SU_SC_MODE_CNTL]);
+    }
     if (sc.x1 <= sc.x0 || sc.y1 <= sc.y0) {
         return;
     }

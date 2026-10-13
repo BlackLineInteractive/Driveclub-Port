@@ -62,7 +62,30 @@ bool Compare(u32 func, u32 value, u32 ref) {
 
 } // namespace
 
-CommandProcessor::CommandProcessor() = default;
+CommandProcessor::CommandProcessor() {
+    ClearState();
+}
+
+// CLEAR_STATE: context registers back to their power-on values. Most are 0;
+// these are the ones whose default matters (from AMD's CIK clear-state table).
+void CommandProcessor::ClearState() {
+    std::memset(regs.Data() + kContextRegBase, 0, 0x400 * 4);
+    regs[Reg::PA_SC_SCREEN_SCISSOR_BR] = 0x40004000;
+    regs[Reg::PA_SC_WINDOW_SCISSOR_TL] = 0x80000000;
+    regs[Reg::PA_SC_WINDOW_SCISSOR_BR] = 0x40004000;
+    regs[0xA083] = 0xFFFF; // PA_SC_CLIPRECT_RULE
+    for (u32 k = 0; k < 4; ++k) {
+        regs[0xA085 + 2 * k] = 0x20002000; // PA_SC_CLIPRECT_n_BR
+    }
+    regs[0xA08C] = 0xAA99AAAA; // PA_SC_EDGERULE
+    regs[Reg::PA_SC_GENERIC_SCISSOR_TL] = 0x80000000;
+    regs[Reg::PA_SC_GENERIC_SCISSOR_BR] = 0x40004000;
+    for (u32 k = 0; k < 16; ++k) {
+        regs[Reg::PA_SC_VPORT_SCISSOR_0_TL + 2 * k] = 0x80000000;
+        regs[Reg::PA_SC_VPORT_SCISSOR_0_TL + 2 * k + 1] = 0x40004000;
+        regs[Reg::PA_SC_VPORT_ZMIN_0 + 2 * k + 1] = 0x3F800000; // ZMAX = 1.0
+    }
+}
 
 CommandProcessor::~CommandProcessor() {
     for (auto& r : rings) {
@@ -226,6 +249,9 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
 
         switch (op) {
         case Op::Nop:
+            break;
+        case Op::ClearState:
+            ClearState();
             break;
 
         case Op::SetContextReg:
