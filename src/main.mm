@@ -13,6 +13,7 @@
 #include <SDL3/SDL_metal.h>
 
 #include "common/log.h"
+#include "core/address_space.h"
 #include "core/loader/linker.h"
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_presenter.h"
@@ -28,6 +29,8 @@ int Run(int argc, char** argv) {
         return 1;
     }
     const bool load_only = argc > 2 && std::strcmp(argv[2], "--load-only") == 0;
+
+    Core::AddressSpace::Init();
 
     Core::Loader::Linker linker;
     if (!linker.LoadGame(argv[1])) {

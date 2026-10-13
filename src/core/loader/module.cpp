@@ -5,6 +5,7 @@
 #include <sys/mman.h>
 
 #include "common/log.h"
+#include "core/address_space.h"
 #include "core/loader/self.h"
 
 namespace Core::Loader {
@@ -45,7 +46,7 @@ std::unique_ptr<Module> Module::Load(const std::filesystem::path& path, VAddr ba
 
 Module::~Module() {
     if (size != 0) {
-        munmap(reinterpret_cast<void*>(base), size);
+        AddressSpace::Unmap(base, size);
     }
 }
 
@@ -60,16 +61,11 @@ bool Module::MapSegments(const ElfImage& image, std::string& error) {
     }
     size = AlignUp(end, kPageSize);
 
-    // Guest addresses are host addresses, so the module must land exactly at
-    // `base`. A hint without MAP_FIXED never clobbers an existing mapping.
-    void* want = reinterpret_cast<void*>(base);
-    void* got = mmap(want, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (got != want) {
-        if (got != MAP_FAILED) {
-            munmap(got, size);
-        }
+    // Guest addresses are host addresses, so the module lands exactly at
+    // `base`, inside the guest ranges reserved at process start.
+    if (!AddressSpace::Map(base, size, AddressSpace::Prot::ReadWrite)) {
         size = 0;
-        error = "guest address range is not free";
+        error = "cannot map guest address range";
         return false;
     }
 

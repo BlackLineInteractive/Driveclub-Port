@@ -24,6 +24,8 @@ add_executable(driveclub
     src/main.mm
     src/common/log.h
     src/common/types.h
+    src/core/address_space.cpp
+    src/core/address_space.h
     src/core/loader/elf_types.h
     src/core/loader/linker.cpp
     src/core/loader/linker.h
@@ -48,10 +50,16 @@ target_compile_options(driveclub PRIVATE
     $<$<CONFIG:Release>:-O3 -march=native>
 )
 
-# Guest code is mapped at its PS4 addresses (executable at 0x400000), which
-# sit inside the default 4 GB __PAGEZERO. Shrink it to free that range, and
-# move our own image far above every guest region so ASLR cannot slide it in.
-target_link_options(driveclub PRIVATE -Wl,-no_pie,-pagezero_size,0x4000,-image_base,0x700000000000)
+# Guest memory is mapped at its PS4 addresses (executable at 0x400000), which
+# sit inside the default 4 GB __PAGEZERO. Shrink it, move our own image above
+# every guest range, and pin the zero-fill reservations from address_space.cpp
+# to the guest ranges so the kernel maps them before any library can.
+target_link_options(driveclub PRIVATE
+    -Wl,-no_pie,-pagezero_size,0x4000,-image_base,0x700000000000
+    -Wl,-segaddr,GUEST_SYSMGD,0x400000
+    -Wl,-segaddr,GUEST_SYSRSV,0x7FFFFC000
+    -Wl,-segaddr,GUEST_USER,0x7000000000
+)
 
 target_link_libraries(driveclub PRIVATE
     SDL3::SDL3
