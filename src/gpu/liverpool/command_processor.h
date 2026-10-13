@@ -83,6 +83,7 @@ private:
     void Interrupt(u32 irq);
     void SetRegs(u32 index, const u32* values, u32 count);
     void Draw(bool indexed, u32 count, u32 index_offset);
+    void SyncRenderer();
 
     RegFile regs;
     // Draw state set by packets rather than registers.

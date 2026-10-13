@@ -51,6 +51,11 @@ public:
     // End of one guest submission: hand recorded work to the host GPU.
     virtual void OnSubmit() = 0;
 
+    // Blocks until all recorded work has executed. Called before the guest
+    // can observe GPU progress (fences, labels), since it may then reuse the
+    // memory that work reads.
+    virtual void WaitIdle() = 0;
+
     // Called on the GPU thread once the frame's command buffers are done.
     virtual void Flip(const FlipInfo& flip) = 0;
 };

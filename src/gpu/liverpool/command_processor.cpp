@@ -163,6 +163,12 @@ void CommandProcessor::SetRegs(u32 index, const u32* values, u32 count) {
     std::memcpy(regs.Data() + index, values, count * 4);
 }
 
+void CommandProcessor::SyncRenderer() {
+    if (renderer) {
+        renderer->WaitIdle();
+    }
+}
+
 void CommandProcessor::Draw(bool indexed, u32 count, u32 index_offset) {
     ++stats.draws;
     if (!renderer || count == 0) {
@@ -245,6 +251,7 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
         }
 
         case Op::EventWriteEop: {
+            SyncRenderer();
             const u32 data_control = body[2];
             WriteFence((data_control >> 29) & 7, body[1], data_control & 0xFFFF, body[3],
                        body[4]);
@@ -255,6 +262,7 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             break;
         }
         case Op::ReleaseMem: {
+            SyncRenderer();
             const u32 dw2 = body[1];
             WriteFence((dw2 >> 29) & 7, body[2], body[3], body[4], body[5]);
             const u32 int_sel = (dw2 >> 24) & 7;
@@ -264,6 +272,7 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             break;
         }
         case Op::EventWriteEos: {
+            SyncRenderer();
             const u32 cmd = (body[2] >> 29) & 7;
             if (cmd == 2) { // signal fence
                 *Ptr<u32>(body[1], body[2] & 0xFFFF) = body[3];

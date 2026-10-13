@@ -48,6 +48,7 @@ struct Program {
     Stage stage = Stage::Vertex;
     u64 address = 0;      // guest address of the main program
     u64 fetch_address = 0; // inlined fetch subroutine, if any
+    int fetch_ud = -1;     // user-data index holding its address
     u64 hash = 0;         // of the code bytes (plus fetch code)
     u32 num_user_sgprs = 0;
     u32 vgpr_comp_cnt = 0; // VS: how many system VGPRs follow the vertex index
@@ -82,6 +83,7 @@ struct BuildInput {
     const u32* user_data; // the stage's 16 user-data registers
     u32 num_user_sgprs;
     u32 vgpr_comp_cnt;
+    const u32* code = nullptr; // tools: decode from here instead of guest memory
 };
 
 // Decodes and analyzes a program. Returns null if the code is unreadable.

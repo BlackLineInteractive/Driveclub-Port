@@ -223,6 +223,7 @@ bool InlineFetch(Program& p, const BuildInput& in) {
             f.pc += kFetchPcBase;
         }
         p.fetch_address = target;
+        p.fetch_ud = lo.ud;
         p.code.erase(p.code.begin() + static_cast<long>(idx));
         p.code.insert(p.code.begin() + static_cast<long>(idx), fetch.begin(), fetch.end());
         return true;
@@ -242,7 +243,7 @@ u32 Program::ImageSlot(u32 pc) const {
 }
 
 std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
-    if (!Readable(in.address, 64)) {
+    if (!in.code && !Readable(in.address, 64)) {
         return nullptr;
     }
     auto p = std::make_unique<Program>();
@@ -251,7 +252,7 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
     p->num_user_sgprs = in.num_user_sgprs;
     p->vgpr_comp_cnt = in.vgpr_comp_cnt;
 
-    const u32* code = reinterpret_cast<const u32*>(in.address);
+    const u32* code = in.code ? in.code : reinterpret_cast<const u32*>(in.address);
     p->code = DecodeProgram(code);
     if (p->code.empty()) {
         return nullptr;
