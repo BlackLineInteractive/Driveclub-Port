@@ -62,6 +62,7 @@ enum class OutType : u8 { Float, Uint, Sint };
 struct MslOptions {
     // Vertex.
     bool rect_list = false; // expand RECTLIST: 3 vertices -> 2 triangles
+    bool debug_capture = false; // write positions to buffer(6) (debugging)
     // Fragment.
     std::array<u32, 32> ps_input_cntl{}; // SPI_PS_INPUT_CNTL_n
     u32 vs_param_mask = 0;               // params the paired VS exports

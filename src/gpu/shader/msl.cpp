@@ -1192,7 +1192,8 @@ std::string Emitter::Run() {
                ") {\n    VsOut out = {};\n" + decl + wrapped + "}\n\n";
         const std::string args = "ud, mem" + TexArgs();
         src += "vertex VsOut main0(uint vid [[vertex_id]], uint iid [[instance_id]], " + mem_params +
-               ", constant DcDraw& draw [[buffer(4)]]" + TexParams(true) + ") {\n";
+               ", constant DcDraw& draw [[buffer(4)]]" + (o.debug_capture ? ", device float4* dbg [[buffer(6)]]" : "") +
+               TexParams(true) + ") {\n";
         src += "    DcMem mem = {gm0, gm1, &gmap};\n    VsOut o;\n";
         if (o.rect_list) {
             src += "    uint r_ = vid / 6u, c_ = vid % 6u;\n";
@@ -1211,7 +1212,14 @@ std::string Emitter::Run() {
         } else {
             src += "    o = dc_run(vid, iid, " + args + ");\n";
         }
-        src += "    o.pos = dc_viewport(o.pos, draw);\n    return o;\n}\n";
+        if (o.debug_capture) {
+            src += "    if (vid < 32u) { dbg[vid * 2u] = o.pos; }\n";
+        }
+        src += "    o.pos = dc_viewport(o.pos, draw);\n";
+        if (o.debug_capture) {
+            src += "    if (vid < 32u) { dbg[vid * 2u + 1u] = o.pos; }\n";
+        }
+        src += "    return o;\n}\n";
     } else if (p.stage == Stage::Fragment) {
         src += "struct PsIn {\n    float4 pos [[position]];\n    bool ff [[front_facing]];\n";
         for (u32 k : ps_params) {

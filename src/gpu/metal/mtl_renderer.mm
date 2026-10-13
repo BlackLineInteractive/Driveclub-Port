@@ -163,6 +163,8 @@ struct MetalRenderer::Impl {
     const char* dump_dir = nullptr;
     const char* dump_frames = nullptr; // DC_DUMP_FRAMES=dir: every flip as a PPM
     bool debug_clear = false;          // DC_DEBUG_CLEAR: new targets start dark blue
+    u64 debug_vsout = 0;               // DC_DEBUG_VSOUT=<vs address>: dump its first positions
+    id<MTLBuffer> debug_vs_buf = nil;
     id<MTLFunction> debug_fs = nil;    // DC_DEBUG_FLAT: every pixel shader outputs magenta
     bool trace = false;
     u64 draw_count = 0;
@@ -180,6 +182,9 @@ struct MetalRenderer::Impl {
         dump_dir = std::getenv("DC_DUMP_SHADERS");
         dump_frames = std::getenv("DC_DUMP_FRAMES");
         debug_clear = std::getenv("DC_DEBUG_CLEAR") != nullptr;
+        if (const char* v = std::getenv("DC_DEBUG_VSOUT")) {
+            debug_vsout = std::strtoull(v, nullptr, 16);
+        }
         trace = std::getenv("DC_GPU_TRACE") != nullptr;
 
         void* view = Core::Memory::DirectHostView();
@@ -855,9 +860,12 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     const bool rect = prim == PrimType::RectList;
     Shader::MslOptions vo;
     vo.rect_list = rect;
+    const bool capture = debug_vsout && vs_addr == debug_vsout && !debug_vs_buf;
+    vo.debug_capture = capture;
     vo.textures = vs_types;
     u64 vs_key = Hash(vs->hash);
     vs_key = Hash(rect, vs_key);
+    vs_key = Hash(capture, vs_key);
     vs_key = Fnv(vs_types.data(), vs_types.size() * sizeof(TextureType), vs_key);
     id<MTLFunction> vfn = GetFunction(*vs, vo, vs_key);
 
@@ -1003,7 +1011,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
 
     // ---- bindings ----
     if (std::getenv("DC_DEBUG_MEMTEST")) {
-        MemTest(u64(vs_ud[4]) | (u64(vs_ud[5] & 0xFFFF) << 32));
+        MemTest(vs_addr);
     }
     UpdateMemMap();
     [enc setVertexBytes:vs_ud length:64 atIndex:Shader::Binding::UserData];
@@ -1030,6 +1038,13 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         }
     }
 
+    if (capture) {
+        debug_vs_buf = [device newBufferWithLength:64 * 16 options:MTLResourceStorageModeShared];
+        [enc setVertexBuffer:debug_vs_buf offset:0 atIndex:6];
+        DC_INFO("gpu: capturing VS %#llx ud: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+                vs_addr, vs_ud[0], vs_ud[1], vs_ud[2], vs_ud[3], vs_ud[4], vs_ud[5], vs_ud[6], vs_ud[7], vs_ud[8],
+                vs_ud[9], vs_ud[10], vs_ud[11], vs_ud[12], vs_ud[13], vs_ud[14], vs_ud[15]);
+    }
     // ---- primitive assembly ----
     const u32 base_vertex = r[Reg::VGT_INDX_OFFSET];
     const NSUInteger instances = std::max<u32>(dc.instances, 1);
@@ -1177,6 +1192,16 @@ void MetalRenderer::Impl::Flip(const FlipInfo& f) {
         [e setFragmentBytes:scale length:sizeof(scale) atIndex:0];
         [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [e endEncoding];
+    }
+    if (debug_vs_buf) {
+        Commit(true);
+        EnsureCommandBuffer();
+        const float* d = static_cast<const float*>(debug_vs_buf.contents);
+        for (u32 v = 0; v < 8; ++v) {
+            DC_INFO("gpu: vs out %u: raw (%g %g %g %g) -> clip (%g %g %g %g)", v, d[v * 8], d[v * 8 + 1], d[v * 8 + 2],
+                    d[v * 8 + 3], d[v * 8 + 4], d[v * 8 + 5], d[v * 8 + 6], d[v * 8 + 7]);
+        }
+        debug_vsout = 0;
     }
     if (src && dump_frames) {
         DumpFrame(dst);
