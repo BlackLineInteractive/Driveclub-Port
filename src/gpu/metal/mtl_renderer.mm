@@ -386,17 +386,17 @@ struct MetalRenderer::Impl {
         for (const auto& u : unsupported) {
             ReportOnce("shader op not translated: " + u);
         }
-        MTLCompileOptions* opts = [MTLCompileOptions new];
-        opts.mathMode = MTLMathModeSafe;
-        opts.languageVersion = MTLLanguageVersion3_0;
-        NSError* err = nil;
-        id<MTLLibrary> lib = [device newLibraryWithSource:@(src.c_str()) options:opts error:&err];
         if (dump_dir) {
             char path[512];
             std::snprintf(path, sizeof(path), "%s/%s_%016llx_%016llx.metal", dump_dir,
                           p.stage == Stage::Vertex ? "vs" : p.stage == Stage::Fragment ? "ps" : "cs", p.hash, key);
             std::ofstream(path) << src;
         }
+        MTLCompileOptions* opts = [MTLCompileOptions new];
+        opts.mathMode = MTLMathModeSafe;
+        opts.languageVersion = MTLLanguageVersion3_0;
+        NSError* err = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:@(src.c_str()) options:opts error:&err];
         id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
         if (!fn) {
             DC_ERROR("gpu: MSL compile failed for shader %#llx: %s", p.address,
