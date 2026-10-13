@@ -1,53 +1,123 @@
-import struct, sys, collections
-d=open(sys.argv[1],'rb').read()
-n=struct.unpack_from('<H',d,24)[0]
-segs={}
-for i in range(n):
-    p,o,s,m=struct.unpack_from('<QQQQ',d,32+i*32)
-    if p&0x800: segs[(p>>20)&0xfff]=(o,s)
-E=32+n*32
-phoff,=struct.unpack_from('<Q',d,E+0x20); phnum,=struct.unpack_from('<H',d,E+0x38)
-entry,=struct.unpack_from('<Q',d,E+0x18)
-print('entry',hex(entry))
-ph=[]
-for i in range(phnum):
-    t,f,o,va,pa,fs,ms,al=struct.unpack_from('<IIQQQQQQ',d,E+phoff+i*56)
-    ph.append((t,f,o,va,fs,ms)); print(i,hex(t),'flags',f,'va',hex(va),'filesz',hex(fs),'memsz',hex(ms))
-def seg(t):
-    for i,p in enumerate(ph):
-        if p[0]==t: o,s=segs[i]; return d[o:o+s],p
-dynlib,pd=seg(0x61000000)
-pdyn=[p for p in ph if p[0]==2][0]
-dyn=dynlib[pdyn[2]-pd[2]:pdyn[2]-pd[2]+pdyn[4]]
-tags=collections.defaultdict(list)
-for i in range(0,len(dyn),16):
-    t,v=struct.unpack_from('<qQ',dyn,i); tags[t].append(v)
-strtab=tags[0x61000035][0]; strsz=tags[0x61000037][0]
-def s(off): e=dynlib.index(b'\0',strtab+off); return dynlib[strtab+off:e].decode()
-mods={}
-for v in tags[0x6100000F]: mods[v>>48]=s(v&0xffffffff)
-libs={}
-for v in tags[0x61000015]: libs[v>>48]=s(v&0xffffffff)
-print('NEEDED', [s(v) for v in tags[1]])
-symtab=tags[0x61000039][0]; symsz=tags[0x6100003f][0]
-cnt=collections.Counter()
-import base64
-alpha='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-'
-for i in range(0,symsz,24):
-    nm,info,oth,shn,val,sz=struct.unpack_from('<IBBHQQ',dynlib,symtab+i)
-    name=s(nm)
-    if '#' in name and shn==0:
-        _,l,m=name.split('#'); li=0
-        for c in l: li=li*64+alpha.index(c)
-        cnt[libs.get(li,l)]+=1
-print('IMPORTS per library:')
-for k,v in cnt.most_common(): print(f'  {v:5d} {k}')
-print('total',sum(cnt.values()))
-if len(sys.argv)>2:
-    for i in range(0,symsz,24):
-        nm,info,oth,shn,val,sz=struct.unpack_from('<IBBHQQ',dynlib,symtab+i)
-        name=s(nm)
-        if '#' in name and shn==0:
-            n,l,m=name.split('#'); li=0
-            for c in l: li=li*64+alpha.index(c)
-            if libs.get(li)==sys.argv[2]: print('NID',n)
+#!/usr/bin/env python3
+"""Inspect a PS4 (f)SELF: program headers, needed modules, imports per library.
+
+Usage:
+    tools/elfinfo.py extracted/Image0/eboot.bin
+    tools/elfinfo.py extracted/Image0/eboot.bin --lib libSceGnmDriver   # list NIDs
+"""
+
+import argparse
+import collections
+import struct
+import sys
+
+PT_DYNAMIC = 0x2
+PT_SCE_DYNLIBDATA = 0x61000000
+
+DT_NEEDED = 0x1
+DT_SCE_IMPORT_LIB = 0x61000015
+DT_SCE_STRTAB = 0x61000035
+DT_SCE_SYMTAB = 0x61000039
+DT_SCE_SYMTABSZ = 0x6100003F
+
+NID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-"
+
+SEG_ENCRYPTED = 0x2
+SEG_BLOCKED = 0x800
+
+
+def decode_index(text):
+    value = 0
+    for c in text:
+        value = value * 64 + NID_ALPHABET.index(c)
+    return value
+
+
+class Self:
+    def __init__(self, data):
+        self.data = data
+        if struct.unpack_from("<I", data, 0)[0] != 0x1D3D154F:
+            sys.exit("not a SELF file")
+        seg_count = struct.unpack_from("<H", data, 24)[0]
+
+        # Blocked SELF segments carry the bytes of ELF program header #id.
+        self.blobs = {}
+        self.encrypted = False
+        for i in range(seg_count):
+            flags, offset, size, _ = struct.unpack_from("<QQQQ", data, 32 + i * 32)
+            self.encrypted |= bool(flags & SEG_ENCRYPTED)
+            if flags & SEG_BLOCKED:
+                self.blobs[(flags >> 20) & 0xFFF] = data[offset:offset + size]
+
+        elf = 32 + seg_count * 32
+        self.entry = struct.unpack_from("<Q", data, elf + 0x18)[0]
+        phoff = struct.unpack_from("<Q", data, elf + 0x20)[0]
+        phnum = struct.unpack_from("<H", data, elf + 0x38)[0]
+        self.phdrs = [struct.unpack_from("<IIQQQQQQ", data, elf + phoff + i * 56)
+                      for i in range(phnum)]
+
+    def phdr(self, ptype):
+        for i, ph in enumerate(self.phdrs):
+            if ph[0] == ptype:
+                return i, ph
+        sys.exit(f"missing program header {ptype:#x}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("path")
+    ap.add_argument("--lib", help="print the NIDs imported from this library")
+    args = ap.parse_args()
+
+    with open(args.path, "rb") as f:
+        s = Self(f.read())
+    if s.encrypted:
+        sys.exit("segments are encrypted: a decrypted dump is required")
+
+    print(f"entry {s.entry:#x}")
+    for ptype, flags, _, vaddr, _, filesz, memsz, _ in s.phdrs:
+        print(f"  phdr {ptype:#010x} flags {flags} va {vaddr:#x} filesz {filesz:#x} memsz {memsz:#x}")
+
+    idx, dynlib_ph = s.phdr(PT_SCE_DYNLIBDATA)
+    dynlib = s.blobs[idx]
+    _, dyn_ph = s.phdr(PT_DYNAMIC)
+    start = dyn_ph[2] - dynlib_ph[2]  # PT_DYNAMIC lives inside the dynlib blob
+    dyn = dynlib[start:start + dyn_ph[5]]
+
+    tags = collections.defaultdict(list)
+    for off in range(0, len(dyn), 16):
+        tag, val = struct.unpack_from("<qQ", dyn, off)
+        tags[tag].append(val)
+
+    strtab = tags[DT_SCE_STRTAB][0]
+
+    def string(off):
+        begin = strtab + off
+        return dynlib[begin:dynlib.index(b"\0", begin)].decode()
+
+    libs = {v >> 48: string(v & 0xFFFFFFFF) for v in tags[DT_SCE_IMPORT_LIB]}
+    print("needed:", ", ".join(string(v) for v in tags[DT_NEEDED]))
+
+    symtab = tags[DT_SCE_SYMTAB][0]
+    symsz = tags[DT_SCE_SYMTABSZ][0]
+    counts = collections.Counter()
+    for off in range(0, symsz, 24):
+        name_off, _, _, shndx, _, _ = struct.unpack_from("<IBBHQQ", dynlib, symtab + off)
+        name = string(name_off)
+        if shndx != 0 or name.count("#") != 2:
+            continue
+        nid, lib, _ = name.split("#")
+        lib_name = libs.get(decode_index(lib), lib)
+        counts[lib_name] += 1
+        if args.lib == lib_name:
+            print("NID", nid)
+
+    if not args.lib:
+        print("imports per library:")
+        for lib, n in counts.most_common():
+            print(f"  {n:5d} {lib}")
+        print(f"total {sum(counts.values())}")
+
+
+if __name__ == "__main__":
+    main()
