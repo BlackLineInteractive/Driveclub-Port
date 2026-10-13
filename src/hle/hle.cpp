@@ -8,6 +8,8 @@
 namespace Hle {
 
 void RegisterKernel();
+namespace VideoOut { void RegisterVideoOut(); }
+namespace GnmDriver { void RegisterGnmDriver(); }
 
 namespace {
 
@@ -82,6 +84,8 @@ void Register(std::string_view library, std::string_view nid, void* function) {
 
 void RegisterAll() {
     RegisterKernel();
+    VideoOut::RegisterVideoOut();
+    GnmDriver::RegisterGnmDriver();
 }
 
 } // namespace Hle

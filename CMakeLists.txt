@@ -43,6 +43,9 @@ add_executable(driveclub
     src/core/tls.cpp
     src/core/tls.h
     src/gpu/renderer.h
+    src/gpu/liverpool/pm4.h
+    src/gpu/liverpool/command_processor.h
+    src/gpu/liverpool/command_processor.cpp
     src/gpu/metal/mtl_device.h
     src/gpu/metal/mtl_device.mm
     src/gpu/metal/mtl_presenter.h
@@ -58,6 +61,10 @@ add_executable(driveclub
     src/hle/kernel/pthread.cpp
     src/hle/kernel/sync.cpp
     src/hle/kernel/time.cpp
+    src/hle/video_out/video_out.h
+    src/hle/video_out/video_out.cpp
+    src/hle/gnmdriver/gnmdriver.h
+    src/hle/gnmdriver/gnmdriver.cpp
     src/hle/nid_db.inc
 )
 
