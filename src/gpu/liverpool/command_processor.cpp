@@ -226,6 +226,12 @@ void CommandProcessor::SetRegs(u32 index, const u32* values, u32 count) {
 }
 
 void CommandProcessor::AfterGpu(std::function<void()> fn) {
+    static const bool tmp_sync = std::getenv("DC_TMP_SYNCFENCE") != nullptr;
+    if (tmp_sync) {
+        SyncRenderer();
+        fn();
+        return;
+    }
     if (renderer) {
         renderer->Signal(std::move(fn));
     } else {

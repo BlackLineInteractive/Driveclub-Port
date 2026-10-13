@@ -454,7 +454,8 @@ struct MetalRenderer::Impl {
 
     // Points user-data pointers that land in a CE dump at a snapshot of it.
     void PatchUserData(u32* ud) {
-        if (const_dumps.empty()) {
+        static const bool off = std::getenv("DC_TMP_NOSNAP") != nullptr;
+        if (const_dumps.empty() || off) {
             return;
         }
         for (u32 k = 0; k + 1 < 16; ++k) {
