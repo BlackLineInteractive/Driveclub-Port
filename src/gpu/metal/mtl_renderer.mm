@@ -555,7 +555,7 @@ struct MetalRenderer::Impl {
             return false;
         }
         const u32 value = static_cast<u32>(src);
-        if (src_sel == 2 && dst_sel != 1 && value != ~0u && MarkMetaCleared(dst, bytes)) {
+        if (src_sel == 2 && dst_sel != 1 && value != ~0u && !expanding_htile && MarkMetaCleared(dst, bytes)) {
             EndPass(); // the next pass over the surface loads its clear value
         }
         EndPass();
@@ -1382,6 +1382,8 @@ struct MetalRenderer::Impl {
 
     // A fill or a clear shader rewrote metadata in [addr, addr + bytes):
     // the surfaces it describes now read as their clear value.
+    bool expanding_htile = false;
+
     bool MarkMetaCleared(u64 addr, u64 bytes) {
         bool any = false;
         for (const auto& [meta, m] : metas) {
@@ -2244,7 +2246,9 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
         const u32 stride = (ud[k + 1] >> 16) & 0x3FFF;
         const u64 bytes = u64(ud[k + 2]) * (stride ? stride : 1);
         if (bytes && bytes < (64ull << 20)) {
+            expanding_htile = true; // our own fill, not the game clearing depth
             DmaData(0, base, 2, 0xFFFC000Fu, static_cast<u32>(bytes & ~3ull));
+            expanding_htile = false;
         }
         k += 3;
     }
