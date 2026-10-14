@@ -6,6 +6,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
+#include <deque>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -93,6 +94,10 @@ vertex V copy_vs(uint vid [[vertex_id]]) {
     return o;
 }
 fragment float4 debug_fs() { return float4(1.0, 0.0, 1.0, 1.0); }
+kernel void fill32(device uint* dst [[buffer(0)]], constant uint2& vc [[buffer(1)]],
+                   uint i [[thread_position_in_grid]]) {
+    if (i < vc.y) dst[i] = vc.x;
+}
 fragment float4 copy_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]],
                         constant float2& scale [[buffer(0)]]) {
     constexpr sampler s(filter::nearest, address::clamp_to_edge);
@@ -112,6 +117,8 @@ struct MetalRenderer::Impl {
     u64 mem_split = 0;
     id<MTLBuffer> mem_map = nil;
     u64 mem_map_gen = ~0ull;
+    std::vector<Core::Memory::DirectRange> mem_ranges; // sorted by start
+    id<MTLComputePipelineState> fill_pipeline = nil;
 
     // ---- recording ----
     id<MTLCommandBuffer> cmd = nil;
@@ -126,6 +133,16 @@ struct MetalRenderer::Impl {
     std::vector<id<MTLBuffer>> chunks;
     id<MTLBuffer> chunk = nil;
     u64 chunk_off = 0;
+    u32 work_since_commit = 0; // draws + dispatches in the open command buffer
+    static constexpr u32 kCommitEvery = 400;
+
+    // Signals: an event value encoded between passes, so fences do not cut
+    // command buffers. Callbacks run in order on the listener's queue.
+    id<MTLSharedEvent> signal_event = nil;
+    MTLSharedEventListener* signal_listener = nil;
+    u64 signal_value = 0;
+    std::mutex signal_lock;
+    std::deque<std::pair<u64, std::function<void()>>> signal_queue;
 
     // ---- caches ----
     struct ShaderEntry {
@@ -215,6 +232,7 @@ struct MetalRenderer::Impl {
     id<MTLBuffer> debug_vs_buf = nil;
     id<MTLFunction> debug_fs = nil;    // DC_DEBUG_FLAT: every pixel shader outputs magenta
     bool trace = false;
+    u64 trace_frame = 0;               // DC_TRACE_FRAME=n: DC_GPU_TRACE for flip n only
     bool stats = false;                // DC_GPU_STATS: per-second GPU time and submit counts
     bool profile = false;              // DC_GPU_PROFILE: GPU time per shader (one command buffer per call)
     struct ProfileEntry {
@@ -250,6 +268,9 @@ struct MetalRenderer::Impl {
             debug_vsout = std::strtoull(v, nullptr, 16);
         }
         trace = std::getenv("DC_GPU_TRACE") != nullptr;
+        if (const char* e = std::getenv("DC_TRACE_FRAME")) {
+            trace_frame = std::strtoull(e, nullptr, 10);
+        }
         if (const char* e = std::getenv("DC_DUMP_TEXTURE")) {
             dump_texture = std::strtoull(e, nullptr, 16);
         }
@@ -257,6 +278,9 @@ struct MetalRenderer::Impl {
         stats = std::getenv("DC_GPU_STATS") != nullptr;
         profile = std::getenv("DC_GPU_PROFILE") != nullptr;
         compiler = std::make_unique<ShaderCompiler>(device, 4);
+        signal_event = [device newSharedEvent];
+        signal_listener = [[MTLSharedEventListener alloc]
+            initWithDispatchQueue:dispatch_queue_create("gpu signals", DISPATCH_QUEUE_SERIAL)];
 
         void* view = Core::Memory::DirectHostView();
         const u64 total = Core::Memory::kDirectSize;
@@ -303,6 +327,7 @@ struct MetalRenderer::Impl {
         pd.fragmentFunction = [lib newFunctionWithName:@"copy_fs"];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         copy_pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&err];
+        fill_pipeline = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fill32"] error:&err];
         if (!copy_pipeline) {
             DC_ERROR("gpu: copy pipeline: %s", err.localizedDescription.UTF8String);
         }
@@ -322,8 +347,9 @@ struct MetalRenderer::Impl {
             return;
         }
         mem_map_gen = gen;
-        auto ranges = Core::Memory::DirectMappings();
-        std::sort(ranges.begin(), ranges.end(), [](const auto& x, const auto& y) { return x.start < y.start; });
+        mem_ranges = Core::Memory::DirectMappings();
+        std::sort(mem_ranges.begin(), mem_ranges.end(), [](const auto& x, const auto& y) { return x.start < y.start; });
+        const auto& ranges = mem_ranges;
         // Largest page size at which no page holds two mappings.
         u32 shift = Shader::GpuMemMap::kMaxShift;
         for (; shift > Shader::GpuMemMap::kMinShift; --shift) {
@@ -358,6 +384,81 @@ struct MetalRenderer::Impl {
         }
         // A fresh buffer: work already recorded keeps reading the old table.
         mem_map = [device newBufferWithBytes:table.data() length:table.size() * 4 options:MTLResourceStorageModeShared];
+    }
+
+    // Guest range [va, va + size) as a range of one of the `mem` buffers.
+    bool Locate(u64 va, u64 size, id<MTLBuffer>* buf, u64* off) {
+        UpdateMemMap();
+        auto it = std::upper_bound(mem_ranges.begin(), mem_ranges.end(), va,
+                                   [](u64 a, const auto& r) { return a < r.start; });
+        if (it == mem_ranges.begin()) {
+            return false;
+        }
+        --it;
+        if (va + size > it->start + it->size) {
+            return false;
+        }
+        const u64 phys = it->phys + (va - it->start);
+        if (phys + size <= mem_split) {
+            *buf = mem[0];
+            *off = phys;
+        } else if (phys >= mem_split) {
+            *buf = mem[1];
+            *off = phys - mem_split;
+        } else {
+            return false;
+        }
+        return *buf != nil;
+    }
+
+    // CP DMA on the host GPU, in order with the work around it.
+    bool DmaData(u32 dst_sel, u64 dst, u32 src_sel, u64 src, u32 bytes) {
+        if ((bytes & 3) || (dst & 3) || (src_sel != 2 && (src & 3))) {
+            return false;
+        }
+        id<MTLBuffer> dbuf = nil, sbuf = nil;
+        u64 doff = 0, soff = 0;
+        if (dst_sel == 1) {
+            if (dst + bytes > gds.length) {
+                return false;
+            }
+            dbuf = gds;
+            doff = dst;
+        } else if (!Locate(dst, bytes, &dbuf, &doff)) {
+            return false;
+        }
+        if (src_sel == 1) {
+            if (src + bytes > gds.length) {
+                return false;
+            }
+            sbuf = gds;
+            soff = src;
+        } else if (src_sel != 2 && !Locate(src, bytes, &sbuf, &soff)) {
+            return false;
+        }
+        EndPass();
+        EnsureCommandBuffer();
+        const u32 value = static_cast<u32>(src);
+        if (sbuf) {
+            id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+            [b copyFromBuffer:sbuf sourceOffset:soff toBuffer:dbuf destinationOffset:doff size:bytes];
+            [b endEncoding];
+        } else if (value == (value & 0xFF) * 0x01010101u) {
+            id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+            [b fillBuffer:dbuf range:NSMakeRange(doff, bytes) value:static_cast<u8>(value)];
+            [b endEncoding];
+        } else if (fill_pipeline) {
+            const u32 vc[2] = {value, bytes / 4};
+            id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+            [e setComputePipelineState:fill_pipeline];
+            [e setBuffer:dbuf offset:doff atIndex:0];
+            [e setBytes:vc length:sizeof(vc) atIndex:1];
+            [e dispatchThreads:MTLSizeMake(bytes / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [e endEncoding];
+        } else {
+            return false;
+        }
+        return true;
     }
 
     // ================= recording =================
@@ -412,6 +513,7 @@ struct MetalRenderer::Impl {
         [cmd commit];
         last_committed = cmd;
         cmd = nil;
+        work_since_commit = 0;
         if (wait) {
             WaitLast();
         }
@@ -537,10 +639,33 @@ struct MetalRenderer::Impl {
     void Signal(std::function<void()> done) {
         EndPass();
         EnsureCommandBuffer();
-        [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
-          done();
-        }];
-        Commit(false);
+        const u64 v = ++signal_value;
+        {
+            std::scoped_lock lk(signal_lock);
+            signal_queue.emplace_back(v, std::move(done));
+        }
+        [cmd encodeSignalEvent:signal_event value:v];
+        [signal_event notifyListener:signal_listener
+                             atValue:v
+                               block:^(id<MTLSharedEvent> e, uint64_t) {
+                                 RunSignals(e.signaledValue);
+                               }];
+    }
+
+    // Listener queue: runs, in order, the callbacks of every value reached.
+    void RunSignals(u64 reached) {
+        for (;;) {
+            std::function<void()> fn;
+            {
+                std::scoped_lock lk(signal_lock);
+                if (signal_queue.empty() || signal_queue.front().first > reached) {
+                    return;
+                }
+                fn = std::move(signal_queue.front().second);
+                signal_queue.pop_front();
+            }
+            fn();
+        }
     }
 
     // Command buffers on one queue complete in order: the last one is enough.
@@ -919,6 +1044,9 @@ struct MetalRenderer::Impl {
 
     void BeginPass(RenderTarget* colors[8], RenderTarget* depth, bool clear_depth, float depth_value) {
         EndPass();
+        if (work_since_commit >= kCommitEvery) {
+            Commit(false); // keep the host GPU busy while the rest is recorded
+        }
         EnsureCommandBuffer();
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
         PassState ps;
@@ -1078,6 +1206,7 @@ struct MetalRenderer::Impl {
 void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     ++draw_count;
     ++stat_draws;
+    ++work_since_commit;
     const u64 vs_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS);
     const u64 ps_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS);
     const u32 cb_mode = Bits(r[Reg::CB_COLOR_CONTROL], 4, 3);
@@ -1570,6 +1699,9 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
     }
 
     EndPass();
+    if (++work_since_commit >= kCommitEvery) {
+        Commit(false);
+    }
     EnsureCommandBuffer();
     u32 cud[16];
     std::memcpy(cud, ud, sizeof(cud));
@@ -1597,6 +1729,9 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
 
 void MetalRenderer::Impl::Flip(const FlipInfo& f) {
     ++frame_count;
+    if (trace_frame) {
+        trace = frame_count == trace_frame;
+    }
     if (stats) {
         const auto now = std::chrono::steady_clock::now();
         const double dt = std::chrono::duration<double>(now - stat_t0).count();
@@ -1753,6 +1888,14 @@ void MetalRenderer::Flip(const FlipInfo& flip) {
     std::scoped_lock lk(impl->lock);
     @autoreleasepool {
         impl->Flip(flip);
+    }
+}
+
+bool MetalRenderer::DmaData(std::uint32_t dst_sel, std::uint64_t dst, std::uint32_t src_sel, std::uint64_t src,
+                            std::uint32_t bytes) {
+    std::scoped_lock lk(impl->lock);
+    @autoreleasepool {
+        return impl->DmaData(dst_sel, dst, src_sel, src, bytes);
     }
 }
 

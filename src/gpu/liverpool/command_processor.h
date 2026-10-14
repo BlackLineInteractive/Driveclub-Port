@@ -15,6 +15,7 @@
 #include <mutex>
 #include <span>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "common/types.h"
@@ -110,6 +111,11 @@ private:
     void SyncRenderer();
     // Runs `fn` once the renderer has executed everything recorded so far.
     void AfterGpu(std::function<void()> fn);
+    // AfterGpu for a fence/label write (`data_sel` as in EVENT_WRITE_EOP),
+    // remembered as pending until it lands; then `irq` if non-zero.
+    void FenceWrite(u32 data_sel, u64 addr, u32 lo, u32 hi, u32 irq);
+    // Value a recorded but not yet executed fence write will put at `addr`.
+    bool PendingFence(u64 addr, u32* value);
     void ClearState();
     // Runs the CE until `done()` holds, it blocks on the DE, or its CCB ends.
     void RunConstantEngine(const std::function<bool()>& done);
@@ -131,6 +137,12 @@ private:
     Gpu::Renderer* renderer = nullptr;
     Stats stats;
     std::function<void(u32)> on_irq;
+
+    // The host GPU runs everything recorded so far in order, so a ring that
+    // waits for a value one of these writes will produce only waits for work
+    // that is already ahead of it: the wait is satisfied without a round trip.
+    std::mutex fence_lock;
+    std::unordered_map<u64, u32> pending_fences; // dword address -> value
 
     std::mutex rings_lock;
     std::vector<std::unique_ptr<Ring>> rings;

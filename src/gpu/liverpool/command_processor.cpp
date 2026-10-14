@@ -197,9 +197,6 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
                 RunConstantEngine([] { return false; }); // whatever the CE has left
             }
         }
-        if (renderer) {
-            renderer->OnSubmit();
-        }
         if (job.after) {
             job.after();
         }
@@ -214,6 +211,9 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
                 }
             });
             flip_label = {};
+        }
+        if (renderer) {
+            renderer->OnSubmit(); // hand everything, signals included, to the host GPU
         }
         {
             std::scoped_lock lk(ring.lock);
@@ -240,6 +240,46 @@ void CommandProcessor::AfterGpu(std::function<void()> fn) {
     } else {
         fn();
     }
+}
+
+void CommandProcessor::FenceWrite(u32 data_sel, u64 addr, u32 lo, u32 hi, u32 irq) {
+    if (data_sel == kData32 || data_sel == kData64) {
+        std::scoped_lock lk(fence_lock);
+        pending_fences[addr] = lo;
+        if (data_sel == kData64) {
+            pending_fences[addr + 4] = hi;
+        }
+    }
+    AfterGpu([=, this] {
+        WriteFence(data_sel, static_cast<u32>(addr), static_cast<u32>(addr >> 32), lo, hi);
+        if (data_sel == kData32 || data_sel == kData64) {
+            std::scoped_lock lk(fence_lock);
+            // A later write to the same label may still be on its way.
+            auto it = pending_fences.find(addr);
+            if (it != pending_fences.end() && it->second == lo) {
+                pending_fences.erase(it);
+            }
+            if (data_sel == kData64) {
+                it = pending_fences.find(addr + 4);
+                if (it != pending_fences.end() && it->second == hi) {
+                    pending_fences.erase(it);
+                }
+            }
+        }
+        if (irq) {
+            Interrupt(irq);
+        }
+    });
+}
+
+bool CommandProcessor::PendingFence(u64 addr, u32* value) {
+    std::scoped_lock lk(fence_lock);
+    auto it = pending_fences.find(addr);
+    if (it == pending_fences.end()) {
+        return false;
+    }
+    *value = it->second;
+    return true;
 }
 
 void CommandProcessor::SyncRenderer() {
@@ -451,34 +491,22 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             const u32 data_control = body[2];
             const u32 int_sel = (data_control >> 24) & 3;
             const bool irq = int_sel == kIntOnly || int_sel == kIntWriteConfirm;
-            const u32 lo = body[1], d0 = body[3], d1 = body[4];
-            AfterGpu([=, this] {
-                WriteFence((data_control >> 29) & 7, lo, data_control & 0xFFFF, d0, d1);
-                if (irq) {
-                    Interrupt(kIrqGfxEop);
-                }
-            });
+            FenceWrite((data_control >> 29) & 7, u64(body[1]) | (u64(data_control & 0xFFFF) << 32), body[3], body[4],
+                       irq ? kIrqGfxEop : 0);
             break;
         }
         case Op::ReleaseMem: {
             const u32 dw2 = body[1];
             const u32 int_sel = (dw2 >> 24) & 7;
             const bool irq = int_sel == kIntWriteConfirm || int_sel == kIntUndocumented;
-            const u32 sel = (dw2 >> 29) & 7, lo = body[2], hi = body[3], d0 = body[4], d1 = body[5];
-            AfterGpu([=, this] {
-                WriteFence(sel, lo, hi, d0, d1);
-                if (irq) {
-                    Interrupt(compute ? 0 : kIrqGfxEop);
-                }
-            });
+            FenceWrite((dw2 >> 29) & 7, u64(body[2]) | (u64(body[3]) << 32), body[4], body[5],
+                       irq && !compute ? kIrqGfxEop : 0);
             break;
         }
         case Op::EventWriteEos: {
             const u32 cmd = (body[2] >> 29) & 7;
             if (cmd == 2) { // signal fence
-                u32* dst = Ptr<u32>(body[1], body[2] & 0xFFFF);
-                const u32 value = body[3];
-                AfterGpu([dst, value] { *dst = value; });
+                FenceWrite(kData32, u64(body[1]) | (u64(body[2] & 0xFFFF) << 32), body[3], 0, 0);
             }
             break;
         }
@@ -541,6 +569,17 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             const u32 mask = body[4];
             if (memory) {
                 const volatile u32* addr = Ptr<const u32>(body[1] & ~3u, body[2]);
+                if (Compare(func, *addr & mask, ref)) {
+                    break;
+                }
+                u32 pending = 0;
+                if (PendingFence(reinterpret_cast<u64>(addr), &pending) && Compare(func, pending & mask, ref)) {
+                    break;
+                }
+                // Whatever produces the value may sit in recorded host work.
+                if (renderer) {
+                    renderer->OnSubmit();
+                }
                 u32 iters = 0;
                 while (!Compare(func, *addr & mask, ref)) {
                     if (++iters > 1000000) {
