@@ -291,6 +291,7 @@ struct MetalRenderer::Impl {
     static constexpr u64 kChunk = 64 << 10;
     struct TextureEntry {
         id<MTLTexture> tex = nil;
+        id<MTLTexture> base_view = nil; // levels from the T# BASE_LEVEL
         std::vector<u64> chunks;
         u32 next_chunk = 0;
         bool hot = false;
@@ -1229,13 +1230,26 @@ struct MetalRenderer::Impl {
             key = Hash(t[k], key);
         }
         TextureEntry& e = textures[key];
+        // T# BASE_LEVEL..LAST_LEVEL: a view of those levels.
+        auto view = [&]() -> id<MTLTexture> {
+            if (base_level == 0 || base_level >= levels) {
+                return e.tex;
+            }
+            if (!e.base_view) {
+                e.base_view = [e.tex newTextureViewWithPixelFormat:e.tex.pixelFormat
+                                                        textureType:e.tex.textureType
+                                                             levels:NSMakeRange(base_level, levels - base_level)
+                                                             slices:NSMakeRange(0, e.tex.textureType == MTLTextureType2DArray ? e.tex.arrayLength : 1)];
+            }
+            return e.base_view;
+        };
         if (e.tex && e.frame == frame_count) {
-            return e.tex;
+            return view();
         }
         if (e.tex) {
             if (!TextureChanged(e, addr, size)) {
                 e.frame = frame_count;
-                return e.tex;
+                return view();
             }
             e.hot = true;
         }
@@ -1299,7 +1313,7 @@ struct MetalRenderer::Impl {
         e.frame = frame_count;
         e.addr = addr;
         e.size = size;
-        return e.tex;
+        return view();
     }
 
     id<MTLSamplerState> GetSampler(const u32 s[4]) {
