@@ -83,6 +83,12 @@ constexpr u32 kPipeInterleaveBytes = 256;
 
 Micro MicroType2D(u32 tile_index) {
     switch (tile_index) {
+    case 0x00: // Depth_2dThin_64
+    case 0x01: // Depth_2dThin_128
+    case 0x02: // Depth_2dThin_256
+    case 0x03: // Depth_2dThin_512
+    case 0x04: // Depth_2dThin_1K
+        return Micro::Depth;
     case 0x0A: return Micro::Display; // Display_2dThin
     case 0x0E: return Micro::Thin;    // Thin_2dThin
     default: return Micro::None;

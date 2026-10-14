@@ -1708,7 +1708,7 @@ std::string Emitter::Run() {
         src += "fragment PsOut main0(PsIn pin [[stage_in]], " + mem_params + probe_param + bounds_param + TexParams(true) +
                ") {\n";
         if (o.depth_bounds) {
-            src += "    { float z_ = dc_zb.read(uint2(pin.pos.xy)).x; if (z_ < dc_zbr.x || z_ > dc_zbr.y) discard_fragment(); }\n";
+            src += "    { float z_ = dc_zb.read(uint2(pin.pos.xy)).x; float bmin = min(dc_zbr.x, dc_zbr.y); float bmax = max(dc_zbr.x, dc_zbr.y); if (z_ < bmin || z_ > bmax) discard_fragment(); }\n";
         }
         src += "    DcMem mem = {gm0, gm1, &gmap};\n    PsOut out = {};\n    bool dc_exported = false;\n";
         src += "    uint dc_qlane = (uint(pin.pos.x) & 1u) | ((uint(pin.pos.y) & 1u) << 1);\n";
