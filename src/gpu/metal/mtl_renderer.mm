@@ -606,47 +606,60 @@ struct MetalRenderer::Impl {
         for (u32 k = 0; k < 9; ++k) {
             id<MTLTexture> t = pass_tex[k];
             pass_tex[k] = nil;
-            if (!t || !copy_pipeline || t.textureType != MTLTextureType2D) {
+            if (!t || !copy_pipeline) {
                 continue;
             }
-            const MTLPixelFormat f = t.pixelFormat;
-            if (k < 8 && (f == MTLPixelFormatRGBA8Uint || f == MTLPixelFormatR32Uint || f == MTLPixelFormatRG32Uint ||
-                          f == MTLPixelFormatRGBA32Uint || f == MTLPixelFormatR16Uint || f == MTLPixelFormatR8Uint ||
-                          f == MTLPixelFormatRG16Uint || f == MTLPixelFormatRGBA16Uint)) {
-                continue;
+            if (t.textureType == MTLTextureType2DArray) { // each slice (cube faces) on its own
+                for (NSUInteger sl = 0; sl < std::min<NSUInteger>(t.arrayLength, 12); ++sl) {
+                    DumpTexture([t newTextureViewWithPixelFormat:t.pixelFormat
+                                                     textureType:MTLTextureType2D
+                                                          levels:NSMakeRange(0, 1)
+                                                          slices:NSMakeRange(sl, 1)],
+                                k, pass_addr[k]);
+                }
+            } else if (t.textureType == MTLTextureType2D) {
+                DumpTexture(t, k, pass_addr[k]);
             }
-            const u32 w = std::max<u32>(1, static_cast<u32>(t.width) / 4), h = std::max<u32>(1, static_cast<u32>(t.height) / 4);
-            MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                         width:w
-                                                                                        height:h
-                                                                                     mipmapped:NO];
-            d.usage = MTLTextureUsageRenderTarget;
-            d.storageMode = MTLStorageModePrivate;
-            id<MTLTexture> dst = [device newTextureWithDescriptor:d];
-            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-            rp.colorAttachments[0].texture = dst;
-            rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-            id<MTLRenderCommandEncoder> e = [cmd renderCommandEncoderWithDescriptor:rp];
-            const float scale[2] = {1, 1};
-            [e setRenderPipelineState:dump_pipeline];
-            static const u32 dump_alpha = std::getenv("DC_DUMP_ALPHA") != nullptr; // pass dumps show alpha
-            [e setFragmentBytes:&dump_alpha length:4 atIndex:1];
-            [e setFragmentTexture:t atIndex:0];
-            [e setFragmentBytes:scale length:sizeof(scale) atIndex:0];
-            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-            [e endEncoding];
-            id<MTLBuffer> buf = [device newBufferWithLength:u64(w) * h * 4 options:MTLResourceStorageModeShared];
-            id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
-            [b copyFromTexture:dst sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                    sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0
-        destinationBytesPerRow:w * 4 destinationBytesPerImage:u64(w) * h * 4];
-            [b endEncoding];
-            char name[128];
-            std::snprintf(name, sizeof(name), "pass_%04zu_%s%u_%llx_d%llu", pass_dumps.size(), k == 8 ? "z" : "c",
-                          k, pass_addr[k], draw_count);
-            pass_dumps.push_back({buf, w, h, name});
         }
+    }
+
+    void DumpTexture(id<MTLTexture> t, u32 k, u64 addr) {
+        const MTLPixelFormat f = t.pixelFormat;
+        if (k < 8 && (f == MTLPixelFormatRGBA8Uint || f == MTLPixelFormatR32Uint || f == MTLPixelFormatRG32Uint ||
+                      f == MTLPixelFormatRGBA32Uint || f == MTLPixelFormatR16Uint || f == MTLPixelFormatR8Uint ||
+                      f == MTLPixelFormatRG16Uint || f == MTLPixelFormatRGBA16Uint)) {
+            return;
+        }
+        const u32 w = std::max<u32>(1, static_cast<u32>(t.width) / 4), h = std::max<u32>(1, static_cast<u32>(t.height) / 4);
+        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                     width:w
+                                                                                    height:h
+                                                                                 mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget;
+        d.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> dst = [device newTextureWithDescriptor:d];
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = dst;
+        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> e = [cmd renderCommandEncoderWithDescriptor:rp];
+        const float scale[2] = {1, 1};
+        [e setRenderPipelineState:dump_pipeline];
+        static const u32 dump_alpha = std::getenv("DC_DUMP_ALPHA") != nullptr; // pass dumps show alpha
+        [e setFragmentBytes:&dump_alpha length:4 atIndex:1];
+        [e setFragmentTexture:t atIndex:0];
+        [e setFragmentBytes:scale length:sizeof(scale) atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [e endEncoding];
+        id<MTLBuffer> buf = [device newBufferWithLength:u64(w) * h * 4 options:MTLResourceStorageModeShared];
+        id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+        [b copyFromTexture:dst sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0
+    destinationBytesPerRow:w * 4 destinationBytesPerImage:u64(w) * h * 4];
+        [b endEncoding];
+        char name[128];
+        std::snprintf(name, sizeof(name), "pass_%04zu_%s%u_%llx_d%llu", pass_dumps.size(), k == 8 ? "z" : "c", k, addr, draw_count);
+        pass_dumps.push_back({buf, w, h, name});
     }
 
     void WritePassDumps() {
@@ -2291,7 +2304,8 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
     if (dump_passes && trace && dump_frames) {
         u32 n = 0;
         for (u32 k = 0; k < res.tex.size() && n < 8; ++k) {
-            if (cs->images[k].storage && res.tex[k].textureType == MTLTextureType2D) {
+            if (cs->images[k].storage && (res.tex[k].textureType == MTLTextureType2D ||
+                                          res.tex[k].textureType == MTLTextureType2DArray)) {
                 pass_tex[n] = res.tex[k];
                 pass_addr[n++] = addr;
             }
