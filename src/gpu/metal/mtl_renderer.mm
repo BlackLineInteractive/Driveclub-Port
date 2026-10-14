@@ -13,6 +13,7 @@
 #include <fstream>
 #include <mutex>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -244,6 +245,8 @@ struct MetalRenderer::Impl {
         id<MTLTexture> tex = nil;
         u64 addr = 0;
         u32 width = 0, height = 0;
+        u32 depth_or_layers = 1;
+        TexDim dim = TexDim::Tex2D;
         bool initialized = false;
         bool clear_pending = false; // fast-cleared (CMASK/HTILE): next pass clears
         MTLClearColor clear_color{};
@@ -981,7 +984,12 @@ struct MetalRenderer::Impl {
         d.pixelFormat = tt.sample == TexSample::Float ? MTLPixelFormatRGBA8Unorm
                       : tt.sample == TexSample::Uint ? MTLPixelFormatRGBA8Uint : MTLPixelFormatRGBA8Sint;
         d.width = d.height = 1;
-        d.usage = MTLTextureUsageShaderRead;
+        if (tt.dim == TexDim::Tex3D) {
+            d.depth = 1;
+        } else if (tt.dim == TexDim::Tex2DArray) {
+            d.arrayLength = 1;
+        }
+        d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         id<MTLTexture> t = [device newTextureWithDescriptor:d];
         const u32 white = zero ? 0u : tt.sample == TexSample::Float ? 0xFFFFFFFFu : 0x01010101u;
         [t replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0 withBytes:&white bytesPerRow:4 bytesPerImage:4];
@@ -1058,23 +1066,33 @@ struct MetalRenderer::Impl {
         }
 
         // Render-to-texture: sample the render target directly.
-        if (tt.dim == TexDim::Tex2D && !storage) {
-            if (RenderTarget* rt = Latest(color_targets, addr)) {
+        if (!storage) {
+            if (RenderTarget* rt = Latest(color_targets, addr, tt.dim)) {
                 return TargetView(*rt, base_level, last_level - base_level + 1);
             }
-            if (RenderTarget* rt = Latest(depth_targets, addr)) {
-                return rt->tex;
+            if (tt.dim == TexDim::Tex2D) {
+                if (RenderTarget* rt = Latest(depth_targets, addr, tt.dim)) {
+                    return rt->tex;
+                }
             }
         }
+
+        const u32 layers = tt.dim == TexDim::Tex2DArray ? std::max<u32>(last_array + 1, ttype == 11 ? 6 : 1)
+                         : tt.dim == TexDim::Tex3D ? depth : 1;
+
         if (storage) {
             // Written by shaders: keep it GPU-side like a render target, so
             // later draws sample what the compute pass produced.
-            if (tt.dim != TexDim::Tex2D || fi.format == MTLPixelFormatInvalid || fi.compressed) {
-                ReportOnce("storage image type/format not supported");
+            if (fi.format == MTLPixelFormatInvalid || fi.compressed) {
+                ReportOnce("storage image type/format not supported (dim=" +
+                           std::to_string(ttype) + " dfmt=" + std::to_string(dfmt) +
+                           " nfmt=" + std::to_string(nfmt) + " addr=" +
+                           std::to_string(addr) + " " + std::to_string(width) + "x" +
+                           std::to_string(height) + ")");
                 return Dummy(tt);
             }
             const MTLPixelFormat f = fi.format == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm : fi.format;
-            RenderTarget& target = GetColorTarget(addr, f, width, height, last_level + 1);
+            RenderTarget& target = GetColorTarget(addr, f, width, height, last_level + 1, tt.dim, layers);
             target.initialized = true;
             target.clear_pending = false;
             target.written = ++write_seq;
@@ -1086,8 +1104,6 @@ struct MetalRenderer::Impl {
                        " not supported");
             return Dummy(tt);
         }
-        const u32 layers = tt.dim == TexDim::Tex2DArray ? std::max<u32>(last_array + 1, ttype == 11 ? 6 : 1)
-                         : tt.dim == TexDim::Tex3D ? depth : 1;
         if (!Tiling::Supported(tiling)) {
             ReportOnce("texture tile mode " + std::to_string(tiling) + " not supported yet");
             return Dummy(tt);
@@ -1095,8 +1111,9 @@ struct MetalRenderer::Impl {
         const u32 width_el = fi.compressed ? (width + 3) / 4 : width;
         const u32 height_el = fi.compressed ? (height + 3) / 4 : height;
         const u32 pitch_el = fi.compressed ? (pitch + 3) / 4 : pitch;
+        const u32 thick = Tiling::Thickness(tiling);
         const u64 slice = Tiling::SliceSize(tiling, pitch_el, height_el, fi.bytes_per_block);
-        const u64 size = slice * layers;
+        const u64 size = (thick > 1) ? slice * ((layers + thick - 1) / thick) : slice * layers;
         if (!Readable(addr, size)) {
             ReportOnce("texture memory not mapped");
             return Dummy(tt);
@@ -1144,8 +1161,10 @@ struct MetalRenderer::Impl {
         const u64 image = row * height_el;
         std::vector<u8> linear(image);
         for (u32 l = 0; l < layers; ++l) {
-            Tiling::DetileSlice(tiling, src + slice * l, linear.data(), width_el, height_el, pitch_el,
-                                fi.bytes_per_block);
+            const u64 group_offset = slice * (l / thick);
+            const u32 z_in_group = l % thick;
+            Tiling::DetileSlice(tiling, src + group_offset, linear.data(), width_el, height_el, pitch_el,
+                                fi.bytes_per_block, z_in_group);
             if (dump_texture == addr && dump_frames && l == 0) { // DC_DUMP_TEXTURE=<addr>: raw linear bytes
                 char path[512];
                 std::snprintf(path, sizeof(path), "%s/tex_%llx_%ux%u_bpe%u_f%llu.raw", dump_frames, addr, width_el,
@@ -1202,13 +1221,16 @@ struct MetalRenderer::Impl {
 
     // ================= render targets =================
 
-    static RenderTarget* Latest(TargetMap& map, u64 addr) {
+    static RenderTarget* Latest(TargetMap& map, u64 addr, std::optional<TexDim> dim = std::nullopt) {
         auto it = map.find(addr);
         if (it == map.end()) {
             return nullptr;
         }
         RenderTarget* best = nullptr;
         for (auto& t : it->second) {
+            if (dim && t->dim != *dim) {
+                continue;
+            }
             if (!best || t->written > best->written) {
                 best = t.get();
             }
@@ -1216,36 +1238,52 @@ struct MetalRenderer::Impl {
         return best;
     }
 
-    id<MTLTexture> NewTargetTexture(MTLPixelFormat fmt, u32 width, u32 height, u32 levels, bool depth) {
-        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
-                                                                                     width:width
-                                                                                    height:height
-                                                                                 mipmapped:NO];
+    id<MTLTexture> NewTargetTexture(MTLPixelFormat fmt, u32 width, u32 height, u32 levels, bool depth,
+                                    TexDim dim = TexDim::Tex2D, u32 depth_or_layers = 1) {
+        MTLTextureDescriptor* d = [MTLTextureDescriptor new];
+        d.pixelFormat = fmt;
+        d.width = width;
+        d.height = height;
         d.mipmapLevelCount = levels;
-        d.usage = depth ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead
-                        : MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
-                              MTLTextureUsagePixelFormatView;
         d.storageMode = MTLStorageModePrivate;
+        if (dim == TexDim::Tex3D) {
+            d.textureType = MTLTextureType3D;
+            d.depth = std::max(depth_or_layers, 1u);
+            d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+        } else if (dim == TexDim::Tex2DArray) {
+            d.textureType = MTLTextureType2DArray;
+            d.arrayLength = std::max(depth_or_layers, 1u);
+            d.usage = depth ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead
+                            : MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+                                  MTLTextureUsagePixelFormatView;
+        } else {
+            d.textureType = MTLTextureType2D;
+            d.usage = depth ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead
+                            : MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+                                  MTLTextureUsagePixelFormatView;
+        }
         return [device newTextureWithDescriptor:d];
     }
 
     RenderTarget& GetTarget(TargetMap& map, u64 addr, MTLPixelFormat fmt, u32 width, u32 height, bool depth,
-                            u32 levels = 1) {
+                            u32 levels = 1, TexDim dim = TexDim::Tex2D, u32 depth_or_layers = 1) {
         auto& list = map[addr];
         const u32 max_levels = 1 + static_cast<u32>(std::log2(std::max(width, height)));
         levels = std::clamp<u32>(levels, 1, max_levels);
         for (auto& t : list) {
-            if (t->width != width || t->height != height || t->tex.pixelFormat != fmt) {
+            if (t->width != width || t->height != height || t->tex.pixelFormat != fmt ||
+                t->dim != dim || t->depth_or_layers != depth_or_layers) {
                 continue;
             }
             if (t->levels < levels) { // now used with a mip chain: grow, keeping what is there
-                id<MTLTexture> tex = NewTargetTexture(fmt, width, height, levels, depth);
+                id<MTLTexture> tex = NewTargetTexture(fmt, width, height, levels, depth, dim, depth_or_layers);
                 EndPass();
                 EnsureCommandBuffer();
                 id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+                const u32 slices = dim == TexDim::Tex2DArray ? depth_or_layers : 1;
                 for (u32 l = 0; l < t->levels; ++l) {
                     [b copyFromTexture:t->tex sourceSlice:0 sourceLevel:l toTexture:tex destinationSlice:0
-                      destinationLevel:l sliceCount:1 levelCount:1];
+                      destinationLevel:l sliceCount:slices levelCount:1];
                 }
                 [b endEncoding];
                 t->tex = tex;
@@ -1255,12 +1293,15 @@ struct MetalRenderer::Impl {
             return *t;
         }
         auto rt = std::make_unique<RenderTarget>();
-        rt->tex = NewTargetTexture(fmt, width, height, levels, depth);
+        rt->tex = NewTargetTexture(fmt, width, height, levels, depth, dim, depth_or_layers);
         rt->addr = addr;
         rt->width = width;
         rt->height = height;
         rt->levels = levels;
-        DC_INFO("gpu: %s target %#llx %ux%u fmt %lu", depth ? "depth" : "render", addr, width, height, (unsigned long)fmt);
+        rt->dim = dim;
+        rt->depth_or_layers = depth_or_layers;
+        DC_INFO("gpu: %s target %#llx %ux%u (dim=%d d/l=%u) fmt %lu", depth ? "depth" : "render", addr, width, height,
+                (int)dim, depth_or_layers, (unsigned long)fmt);
         list.push_back(std::move(rt));
         return *list.back();
     }
@@ -1280,16 +1321,18 @@ struct MetalRenderer::Impl {
         if (it != rt.views.end()) {
             return it->second;
         }
+        const NSUInteger slices = rt.tex.textureType == MTLTextureType2DArray ? rt.tex.arrayLength : 1;
         id<MTLTexture> v = [rt.tex newTextureViewWithPixelFormat:fmt
-                                                      textureType:MTLTextureType2D
+                                                      textureType:rt.tex.textureType
                                                            levels:NSMakeRange(base, count)
-                                                           slices:NSMakeRange(0, 1)];
+                                                           slices:NSMakeRange(0, slices)];
         rt.views[key] = v;
         return v;
     }
 
-    RenderTarget& GetColorTarget(u64 addr, MTLPixelFormat fmt, u32 width, u32 height, u32 levels = 1) {
-        return GetTarget(color_targets, addr, fmt, width, height, false, levels);
+    RenderTarget& GetColorTarget(u64 addr, MTLPixelFormat fmt, u32 width, u32 height, u32 levels = 1,
+                                 TexDim dim = TexDim::Tex2D, u32 depth_or_layers = 1) {
+        return GetTarget(color_targets, addr, fmt, width, height, false, levels, dim, depth_or_layers);
     }
 
     RenderTarget& GetDepthTarget(u64 addr, MTLPixelFormat fmt, u32 width, u32 height) {
@@ -1415,21 +1458,16 @@ struct MetalRenderer::Impl {
         return st;
     }
 
-    struct Bound {
-        id<MTLTexture> tex;
-        id<MTLSamplerState> smp;
+    struct Resources {
+        std::vector<id<MTLTexture>> tex;
+        std::vector<id<MTLSamplerState>> smp;
     };
     // Evaluates each image instruction's descriptors against the user data.
-    void Resolve(const Program& p, const u32* ud, std::vector<TextureType>& types, std::vector<Bound>& out) {
+    void Resolve(const Program& p, const u32* ud, std::vector<TextureType>& types, Resources& out) {
         for (const auto& img : p.images) {
-            u32 t[8], s[4] = {};
+            u32 t[8];
             for (u32 k = 0; k < 8; ++k) {
                 t[k] = Shader::ResolveSgpr(img.tsharp[k], ud);
-            }
-            if (img.has_sampler) {
-                for (u32 k = 0; k < 4; ++k) {
-                    s[k] = Shader::ResolveSgpr(img.ssharp[k], ud);
-                }
             }
             TextureType tt;
             id<MTLTexture> tex = GetTexture(t, &tt, img.storage);
@@ -1438,13 +1476,20 @@ struct MetalRenderer::Impl {
                         t[3], t[4], t[5], t[6], t[7], img.tsharp[0].kind, img.tsharp[0].ud, img.tsharp[0].offset);
             }
             if (trace) {
-                DC_INFO("gpu:   tex%zu addr=%#llx dfmt=%u nfmt=%u %ux%u tile=%u type=%u swz=%#x%s", out.size(),
+                DC_INFO("gpu:   tex%zu addr=%#llx dfmt=%u nfmt=%u %ux%u tile=%u type=%u swz=%#x%s", out.tex.size(),
                         (u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8, (t[1] >> 20) & 0x3F, (t[1] >> 26) & 0xF,
                         (t[2] & 0x3FFF) + 1, ((t[2] >> 14) & 0x3FFF) + 1, (t[3] >> 20) & 0x1F, t[3] >> 28,
                         t[3] & 0xFFF, img.storage ? " storage" : "");
             }
             types.push_back(tt);
-            out.push_back({tex, img.has_sampler ? GetSampler(s) : nil});
+            out.tex.push_back(tex);
+        }
+        for (const auto& ss : p.samplers) {
+            u32 s[4] = {};
+            for (u32 k = 0; k < 4; ++k) {
+                s[k] = Shader::ResolveSgpr(ss[k], ud);
+            }
+            out.smp.push_back(GetSampler(s));
         }
     }
 
@@ -1690,7 +1735,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
 
     // ---- resources ----
     std::vector<TextureType> vs_types, ps_types;
-    std::vector<Bound> vs_res, ps_res;
+    Resources vs_res, ps_res;
     Resolve(*vs, vs_ud, vs_types, vs_res);
     if (ps) {
         Resolve(*ps, ps_ud, ps_types, ps_res);
@@ -1895,22 +1940,22 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     [enc setVertexBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
     [enc setVertexBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
     [enc setVertexBytes:&consts length:sizeof(consts) atIndex:Shader::Binding::Draw];
-    for (u32 k = 0; k < vs_res.size(); ++k) {
-        [enc setVertexTexture:vs_res[k].tex atIndex:k];
-        if (vs_res[k].smp) {
-            [enc setVertexSamplerState:vs_res[k].smp atIndex:k];
-        }
+    for (u32 k = 0; k < vs_res.tex.size(); ++k) {
+        [enc setVertexTexture:vs_res.tex[k] atIndex:k];
+    }
+    for (u32 u = 0; u < vs_res.smp.size() && u < 16; ++u) {
+        [enc setVertexSamplerState:vs_res.smp[u] atIndex:u];
     }
     if (ps) {
         [enc setFragmentBytes:pud length:64 atIndex:Shader::Binding::UserData];
         [enc setFragmentBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
         [enc setFragmentBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
         [enc setFragmentBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
-        for (u32 k = 0; k < ps_res.size(); ++k) {
-            [enc setFragmentTexture:ps_res[k].tex atIndex:k];
-            if (ps_res[k].smp) {
-                [enc setFragmentSamplerState:ps_res[k].smp atIndex:k];
-            }
+        for (u32 k = 0; k < ps_res.tex.size(); ++k) {
+            [enc setFragmentTexture:ps_res.tex[k] atIndex:k];
+        }
+        for (u32 u = 0; u < ps_res.smp.size() && u < 16; ++u) {
+            [enc setFragmentSamplerState:ps_res.smp[u] atIndex:u];
         }
     }
 
@@ -2050,7 +2095,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
         RenderTarget* from = from_depth ? Latest(depth_targets, src) : Latest(color_targets, src);
         if (from && dst && dst != src) {
             RenderTarget& to = GetTarget(from_depth ? depth_targets : color_targets, dst, from->tex.pixelFormat,
-                                         from->width, from->height, from_depth);
+                                         from->width, from->height, from_depth, from->levels, from->dim, from->depth_or_layers);
             EndPass();
             EnsureCommandBuffer();
             id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
@@ -2082,7 +2127,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
         }
     }
     std::vector<TextureType> types;
-    std::vector<Bound> res;
+    Resources res;
     Resolve(*cs, ud, types, res);
 
     Shader::MslOptions o;
@@ -2150,11 +2195,11 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
     [e setBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
     [e setBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
     [e setBuffer:gds offset:0 atIndex:Shader::Binding::Gds];
-    for (u32 k = 0; k < res.size(); ++k) {
-        [e setTexture:res[k].tex atIndex:k];
-        if (res[k].smp) {
-            [e setSamplerState:res[k].smp atIndex:k];
-        }
+    for (u32 k = 0; k < res.tex.size(); ++k) {
+        [e setTexture:res.tex[k] atIndex:k];
+    }
+    for (u32 u = 0; u < res.smp.size() && u < 16; ++u) {
+        [e setSamplerState:res.smp[u] atIndex:u];
     }
     // LDS_SIZE is in 128-dword units on CI; Metal wants a multiple of 16 bytes.
     const u32 lds = std::max<u32>(16, Bits(rsrc2, 15, 9) * 512);
@@ -2163,9 +2208,9 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
     [e endEncoding];
     if (dump_passes && trace && dump_frames) {
         u32 n = 0;
-        for (u32 k = 0; k < res.size() && n < 8; ++k) {
-            if (cs->images[k].storage && res[k].tex.textureType == MTLTextureType2D) {
-                pass_tex[n] = res[k].tex;
+        for (u32 k = 0; k < res.tex.size() && n < 8; ++k) {
+            if (cs->images[k].storage && res.tex[k].textureType == MTLTextureType2D) {
+                pass_tex[n] = res.tex[k];
                 pass_addr[n++] = addr;
             }
         }

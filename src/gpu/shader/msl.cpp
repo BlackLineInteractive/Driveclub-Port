@@ -1056,7 +1056,8 @@ void Emitter::EmitBuffer(const Inst& i) {
 void Emitter::EmitImage(const Inst& i) {
     const u32 slot = p.ImageSlot(i.pc);
     const TextureType tt = slot < o.textures.size() ? o.textures[slot] : TextureType{};
-    const std::string t = "t" + N(slot), smp = "smp" + N(slot);
+    const u32 s_idx = slot < p.images.size() && p.images[slot].has_sampler ? p.images[slot].sampler_index : 0;
+    const std::string t = "t" + N(slot), smp = "smp" + N(std::min<u32>(s_idx, 15u));
     const auto op = static_cast<Mimg>(i.op);
     const bool frag = p.stage == Stage::Fragment;
     const char* vec = tt.sample == TexSample::Float ? "float4" : tt.sample == TexSample::Uint ? "uint4" : "int4";
@@ -1292,10 +1293,11 @@ std::string Emitter::TexParams(bool entry) const {
         const std::string access = p.images[k].storage ? ", access::read_write" : "";
         s += std::string(", ") + kind + "<" + comp + access + "> t" + N(k);
         if (entry) s += " [[texture(" + N(k) + ")]]";
-        if (p.images[k].has_sampler) {
-            s += ", sampler smp" + N(k);
-            if (entry) s += " [[sampler(" + N(k) + ")]]";
-        }
+    }
+    const u32 num_samplers = std::min<u32>(static_cast<u32>(p.samplers.size()), 16u);
+    for (u32 u = 0; u < num_samplers; ++u) {
+        s += ", sampler smp" + N(u);
+        if (entry) s += " [[sampler(" + N(u) + ")]]";
     }
     return s;
 }
@@ -1304,9 +1306,10 @@ std::string Emitter::TexArgs() const {
     std::string s;
     for (size_t k = 0; k < p.images.size(); ++k) {
         s += ", t" + N(k);
-        if (p.images[k].has_sampler) {
-            s += ", smp" + N(k);
-        }
+    }
+    const u32 num_samplers = std::min<u32>(static_cast<u32>(p.samplers.size()), 16u);
+    for (u32 u = 0; u < num_samplers; ++u) {
+        s += ", smp" + N(u);
     }
     return s;
 }

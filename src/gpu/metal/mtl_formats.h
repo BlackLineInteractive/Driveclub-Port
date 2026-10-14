@@ -125,7 +125,6 @@ inline TextureFormatInfo TextureFormat(u32 dfmt, u32 nfmt) {
     case 7: // 11_11_10 (R10 G11 B11): stored as R11G11B10, like the render targets
         t.format = MTLPixelFormatRG11B10Float;
         t.bytes_per_block = 4;
-        t.gpu_only = true;
         break;
     case 9:
         t.format = uint ? MTLPixelFormatRGB10A2Uint : MTLPixelFormatRGB10A2Unorm;

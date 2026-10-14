@@ -37,6 +37,35 @@ u32 MicroIndex(Micro type, u32 bytes_per_el, u32 x, u32 y) {
     return b[0] | (b[1] << 1) | (b[2] << 2) | (b[3] << 3) | (b[4] << 4) | (b[5] << 5);
 }
 
+// Index of element (x, y, z) inside an 8x8x4 thick micro tile.
+// Bit layout from shadPS4 tiling.comp ComputePixelIndexWithinMicroTile for
+// ADDR_SURF_THIN_MICRO_TILING (which is also used for thick with z bits).
+u32 MicroIndex3D(u32 bytes_per_el, u32 x, u32 y, u32 z) {
+    const u32 x0 = x & 1, x1 = (x >> 1) & 1, x2 = (x >> 2) & 1;
+    const u32 y0 = y & 1, y1 = (y >> 1) & 1, y2 = (y >> 2) & 1;
+    const u32 z0 = z & 1, z1 = (z >> 1) & 1;
+    u32 p0, p1, p2, p3, p4, p5, p6, p7;
+    // Bit ordering depends on bytes per element (from shadPS4 tiling.comp).
+    switch (bytes_per_el) {
+    case 1:
+    case 2:
+        p0 = x0; p1 = y0; p2 = x1; p3 = y1; p4 = z0; p5 = z1; break;
+    case 4:
+        p0 = x0; p1 = y0; p2 = x1; p3 = z0; p4 = y1; p5 = z1; break;
+    case 8:
+    case 16:
+    default:
+        p0 = x0; p1 = y0; p2 = z0; p3 = x1; p4 = y1; p5 = z1; break;
+    }
+    p6 = x2; p7 = y2;
+    return p0 | (p1 << 1) | (p2 << 2) | (p3 << 3) | (p4 << 4) | (p5 << 5) | (p6 << 6) | (p7 << 7);
+}
+
+// Tile mode 0x13 = Thick_1dThick (Array1DTiledThick), thickness 4.
+bool IsThick1D(u32 tile_index) {
+    return tile_index == 0x13;
+}
+
 u32 AlignUp(u32 v, u32 a) {
     return (v + a - 1) / a * a;
 }
@@ -124,7 +153,11 @@ bool IsLinear(u32 tile_index) {
 
 bool Supported(u32 tile_index) {
     return IsLinear(tile_index) || MicroType1D(tile_index) != Micro::None ||
-           MicroType2D(tile_index) != Micro::None;
+           MicroType2D(tile_index) != Micro::None || IsThick1D(tile_index);
+}
+
+u32 Thickness(u32 tile_index) {
+    return IsThick1D(tile_index) ? 4 : 1;
 }
 
 u64 SliceSize(u32 tile_index, u32 pitch_el, u32 height_el, u32 bytes_per_el) {
@@ -135,11 +168,13 @@ u64 SliceSize(u32 tile_index, u32 pitch_el, u32 height_el, u32 bytes_per_el) {
         const MacroParams m = Macro(bytes_per_el);
         return u64(AlignUp(pitch_el, m.pitch)) * AlignUp(height_el, m.height) * bytes_per_el;
     }
-    return u64(AlignUp(pitch_el, 8)) * AlignUp(height_el, 8) * bytes_per_el;
+    const u32 thick = Thickness(tile_index);
+    // Thick tiles: each micro tile holds 8x8xthick elements.
+    return u64(AlignUp(pitch_el, 8)) * AlignUp(height_el, 8) * bytes_per_el * thick;
 }
 
 void DetileSlice(u32 tile_index, const u8* src, u8* dst, u32 width_el, u32 height_el, u32 pitch_el,
-                 u32 bytes_per_el) {
+                 u32 bytes_per_el, u32 z) {
     const u64 row = u64(width_el) * bytes_per_el;
     if (IsLinear(tile_index)) {
         for (u32 y = 0; y < height_el; ++y) {
@@ -160,6 +195,30 @@ void DetileSlice(u32 tile_index, const u8* src, u8* dst, u32 width_el, u32 heigh
             u8* out = dst + y * row;
             for (u32 x = 0; x < width_el; ++x) {
                 std::memcpy(out + u64(x) * bytes_per_el, src + MacroOffset(x, y, pitch, m, order, bytes_per_el),
+                            bytes_per_el);
+            }
+        }
+        return;
+    }
+    if (IsThick1D(tile_index)) {
+        // Thick 1D tiling: 8x8x4 micro tiles, thin micro-tile type with z bits.
+        const u32 thick = 4;
+        const u32 tiles_x = AlignUp(pitch_el, 8) / 8;
+        const u64 tile_bytes = u64(8 * 8) * thick * bytes_per_el;
+        // Build a lookup table for the 8x8 plane at this z.
+        u32 order[64];
+        for (u32 y = 0; y < 8; ++y) {
+            for (u32 x = 0; x < 8; ++x) {
+                order[y * 8 + x] = MicroIndex3D(bytes_per_el, x, y, z);
+            }
+        }
+        for (u32 y = 0; y < height_el; ++y) {
+            const u8* tile_row = src + u64(y / 8) * tiles_x * tile_bytes;
+            u8* out = dst + y * row;
+            for (u32 x = 0; x < width_el; ++x) {
+                const u8* tile = tile_row + u64(x / 8) * tile_bytes;
+                std::memcpy(out + u64(x) * bytes_per_el,
+                            tile + u64(order[(y & 7) * 8 + (x & 7)]) * bytes_per_el,
                             bytes_per_el);
             }
         }
@@ -186,3 +245,4 @@ void DetileSlice(u32 tile_index, const u8* src, u8* dst, u32 width_el, u32 heigh
 }
 
 } // namespace Gpu::Liverpool::Tiling
+

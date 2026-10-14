@@ -42,6 +42,7 @@ struct ImageResource {
     bool has_sampler = false;
     bool storage = false; // image_store / atomics
     bool compare = false; // depth-compare sampling
+    u32 sampler_index = 0;
 };
 
 struct Program {
@@ -62,6 +63,7 @@ struct Program {
     // Image instruction pc -> index into `images`.
     std::vector<std::pair<u32, u32>> image_slot_by_pc;
     std::vector<ImageResource> images;
+    std::vector<std::array<SgprSource, 4>> samplers;
 
     // VS exports.
     u32 param_mask = 0;

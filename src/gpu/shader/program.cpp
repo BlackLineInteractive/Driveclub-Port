@@ -304,6 +304,16 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
                 for (u32 k = 0; k < 4; ++k) {
                     r.ssharp[k] = prov.Get(i.ssamp + k);
                 }
+                u32 s_idx = 0;
+                for (; s_idx < p->samplers.size(); ++s_idx) {
+                    if (p->samplers[s_idx] == r.ssharp) {
+                        break;
+                    }
+                }
+                if (s_idx == p->samplers.size()) {
+                    p->samplers.push_back(r.ssharp);
+                }
+                r.sampler_index = s_idx;
             }
             r.storage = i.op >= static_cast<u16>(Mimg::IMAGE_STORE) &&
                         i.op < static_cast<u16>(Mimg::IMAGE_SAMPLE) &&
@@ -322,6 +332,9 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
                 p->images[slot].storage |= r.storage;
                 p->images[slot].compare |= r.compare;
                 p->images[slot].has_sampler |= r.has_sampler;
+                if (r.has_sampler) {
+                    p->images[slot].sampler_index = r.sampler_index;
+                }
             }
             p->image_slot_by_pc.emplace_back(i.pc, slot);
             break;
