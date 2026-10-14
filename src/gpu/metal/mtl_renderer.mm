@@ -1157,7 +1157,14 @@ struct MetalRenderer::Impl {
         // Render-to-texture: sample the render target directly.
         if (!storage) {
             // As shadPS4's image views: the T# format (same texel size) and swizzle.
-            if (RenderTarget* rt = Latest(color_targets, addr, tt.dim)) {
+            if (RenderTarget* rt = Latest(color_targets, addr, tt.dim, width, height)) {
+                // An array read past the slices rendered so far: grow it (shadPS4 sizes
+                // images from the T#), the new slices read as zero until written.
+                if (tt.dim == TexDim::Tex2DArray && rt->depth_or_layers < base_array + slice_count &&
+                    rt->width == width && rt->height == height) {
+                    rt = &GetColorTarget(addr, rt->tex.pixelFormat, width, height, rt->levels, TexDim::Tex2DArray,
+                                         base_array + slice_count);
+                }
                 MTLPixelFormat view_fmt = MTLPixelFormatInvalid;
                 if (fi.format != MTLPixelFormatInvalid && !fi.compressed && fi.format != rt->tex.pixelFormat &&
                     PixelBytes(fi.format) && PixelBytes(fi.format) == PixelBytes(rt->tex.pixelFormat) &&
@@ -1171,7 +1178,7 @@ struct MetalRenderer::Impl {
                 return TargetView(*rt, base_level, last_level - base_level + 1, view_fmt, base_array, slice_count, swz);
             }
             if (tt.dim == TexDim::Tex2D) {
-                if (RenderTarget* rt = Latest(depth_targets, addr, tt.dim)) {
+                if (RenderTarget* rt = Latest(depth_targets, addr, tt.dim, width, height)) {
                     return swz == kIdentitySwizzle ? rt->tex : TargetView(*rt, 0, rt->levels, MTLPixelFormatInvalid, 0, 1, swz);
                 }
             }
@@ -1347,12 +1354,17 @@ struct MetalRenderer::Impl {
 
     // ================= render targets =================
 
-    static RenderTarget* Latest(TargetMap& map, u64 addr, std::optional<TexDim> dim = std::nullopt) {
+    // The variant at `addr` written last; with a size, the last one of that size if
+    // there is one (aliased memory holds surfaces of several sizes, and a T# means the
+    // one matching its own extent, like shadPS4's image lookup).
+    static RenderTarget* Latest(TargetMap& map, u64 addr, std::optional<TexDim> dim = std::nullopt, u32 width = 0,
+                                u32 height = 0) {
         auto it = map.find(addr);
         if (it == map.end()) {
             return nullptr;
         }
         RenderTarget* best = nullptr;
+        RenderTarget* sized = nullptr;
         for (auto& t : it->second) {
             if (dim && t->dim != *dim) {
                 continue;
@@ -1360,8 +1372,11 @@ struct MetalRenderer::Impl {
             if (!best || t->written > best->written) {
                 best = t.get();
             }
+            if (width && t->width == width && t->height == height && (!sized || t->written > sized->written)) {
+                sized = t.get();
+            }
         }
-        return best;
+        return sized ? sized : best;
     }
 
     id<MTLTexture> NewTargetTexture(MTLPixelFormat fmt, u32 width, u32 height, u32 levels, bool depth,
@@ -1683,6 +1698,10 @@ struct MetalRenderer::Impl {
                         (u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8, (t[1] >> 20) & 0x3F, (t[1] >> 26) & 0xF,
                         (t[2] & 0x3FFF) + 1, ((t[2] >> 14) & 0x3FFF) + 1, (t[3] >> 20) & 0x1F, t[3] >> 28,
                         t[3] & 0xFFF, img.storage ? " storage" : "");
+                DC_INFO("gpu:     bound: type %lu %lux%lu layers %lu levels %lu fmt %lu base_array %u last_array %u",
+                        (unsigned long)tex.textureType, (unsigned long)tex.width, (unsigned long)tex.height,
+                        (unsigned long)tex.arrayLength, (unsigned long)tex.mipmapLevelCount, (unsigned long)tex.pixelFormat,
+                        t[5] & 0x1FFF, (t[5] >> 13) & 0x1FFF);
             }
             if (img.compare && img.has_sampler && img.sampler_index < ssharps.size()) {
                 tt.compare = static_cast<u8>((ssharps[img.sampler_index][0] >> 12) & 7);
