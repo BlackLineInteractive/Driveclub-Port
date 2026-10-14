@@ -161,6 +161,12 @@ vertex V copy_vs(uint vid [[vertex_id]]) {
     return o;
 }
 fragment float4 debug_fs() { return float4(1.0, 0.0, 1.0, 1.0); }
+fragment float4 dump_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]]) {
+    constexpr sampler s(filter::nearest, address::clamp_to_edge);
+    float3 c = src.sample(s, in.uv).rgb;
+    if (any(isnan(c)) || any(isinf(c))) return float4(1.0, 0.0, 1.0, 1.0);
+    return float4(max(c, 0.0) / (1.0 + max(c, 0.0)) * 2.0, 1.0);
+}
 kernel void fill32(device uint* dst [[buffer(0)]], constant uint2& vc [[buffer(1)]],
                    uint i [[thread_position_in_grid]]) {
     if (i < vc.y) dst[i] = vc.x;
@@ -307,6 +313,7 @@ struct MetalRenderer::Impl {
 
     // ---- presentation ----
     id<MTLRenderPipelineState> copy_pipeline = nil;
+    id<MTLRenderPipelineState> dump_pipeline = nil; // DC_DUMP_PASSES: x / (1 + x), NaN/Inf magenta
     id<MTLTexture> frames[3] = {nil, nil, nil};
     u32 frame_index = 0;
     std::atomic<void*> latest_frame{nullptr};
@@ -427,6 +434,8 @@ struct MetalRenderer::Impl {
         pd.fragmentFunction = [lib newFunctionWithName:@"copy_fs"];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         copy_pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&err];
+        pd.fragmentFunction = [lib newFunctionWithName:@"dump_fs"];
+        dump_pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&err];
         fill_pipeline = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fill32"] error:&err];
         if (!copy_pipeline) {
             DC_ERROR("gpu: copy pipeline: %s", err.localizedDescription.UTF8String);
@@ -614,7 +623,7 @@ struct MetalRenderer::Impl {
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> e = [cmd renderCommandEncoderWithDescriptor:rp];
             const float scale[2] = {1, 1};
-            [e setRenderPipelineState:copy_pipeline];
+            [e setRenderPipelineState:dump_pipeline];
             [e setFragmentTexture:t atIndex:0];
             [e setFragmentBytes:scale length:sizeof(scale) atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -957,8 +966,10 @@ struct MetalRenderer::Impl {
 
     // ================= textures =================
 
-    id<MTLTexture> Dummy(TextureType tt) {
-        const u32 key = static_cast<u32>(tt.dim) | (static_cast<u32>(tt.sample) << 4);
+    // Stand-in for textures we cannot provide: white, or zero for what the
+    // hardware itself reads as zero (null or INVALID-format descriptors).
+    id<MTLTexture> Dummy(TextureType tt, bool zero = false) {
+        const u32 key = static_cast<u32>(tt.dim) | (static_cast<u32>(tt.sample) << 4) | (zero ? 0x100u : 0u);
         auto it = dummy_textures.find(key);
         if (it != dummy_textures.end()) {
             return it->second;
@@ -971,7 +982,7 @@ struct MetalRenderer::Impl {
         d.width = d.height = 1;
         d.usage = MTLTextureUsageShaderRead;
         id<MTLTexture> t = [device newTextureWithDescriptor:d];
-        const u32 white = tt.sample == TexSample::Float ? 0xFFFFFFFFu : 0x01010101u;
+        const u32 white = zero ? 0u : tt.sample == TexSample::Float ? 0xFFFFFFFFu : 0x01010101u;
         [t replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0 withBytes:&white bytesPerRow:4 bytesPerImage:4];
         dummy_textures[key] = t;
         return t;
@@ -1041,8 +1052,8 @@ struct MetalRenderer::Impl {
             tt.dim = TexDim::Tex2DArray;
         }
         *type_out = tt;
-        if (!addr || ttype < 8) {
-            return Dummy(tt);
+        if (!addr || ttype < 8 || dfmt == 0) {
+            return Dummy(tt, true);
         }
 
         // Render-to-texture: sample the render target directly.
@@ -1421,6 +1432,10 @@ struct MetalRenderer::Impl {
             }
             TextureType tt;
             id<MTLTexture> tex = GetTexture(t, &tt, img.storage);
+            if (trace && (t[0] == 0 || std::getenv("DC_TRACE_TSHARP"))) {
+                DC_INFO("gpu:   T# %08x %08x %08x %08x %08x %08x %08x %08x src kind %u ud %u off %u", t[0], t[1], t[2],
+                        t[3], t[4], t[5], t[6], t[7], img.tsharp[0].kind, img.tsharp[0].ud, img.tsharp[0].offset);
+            }
             if (trace) {
                 DC_INFO("gpu:   tex%zu addr=%#llx dfmt=%u nfmt=%u %ux%u tile=%u type=%u swz=%#x%s", out.size(),
                         (u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8, (t[1] >> 20) & 0x3F, (t[1] >> 26) & 0xF,
@@ -1467,6 +1482,22 @@ struct MetalRenderer::Impl {
         RenderTarget* colors[8] = {&rt};
         BeginPass(colors, nullptr, false, 1.0f);
         EndPass();
+    }
+
+    // True if `p` stores through the V# in user SGPRs ud..ud+3 and never loads from it.
+    static bool OnlyStoresTo(const Program& p, u32 ud) {
+        bool store = false;
+        for (const auto& i : p.code) {
+            if ((i.enc != Shader::Gcn::Enc::MUBUF && i.enc != Shader::Gcn::Enc::MTBUF) || i.srsrc != ud) {
+                continue;
+            }
+            const bool is_store = (i.op >= 4 && i.op <= 7) || (i.enc == Shader::Gcn::Enc::MUBUF && i.op >= 24 && i.op <= 31);
+            if (!is_store) {
+                return false;
+            }
+            store = true;
+        }
+        return store;
     }
 
     void Draw(const RegFile& r, const DrawCall& dc);
@@ -1560,11 +1591,11 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
 
     if (trace) {
         DC_INFO("gpu: draw #%llu prim=%#x count=%u idx=%d vs=%#llx ps=%#llx cb_mode=%u db_render=%#x "
-                "db_ctl=%#x cb0=%#llx info=%#x mask=%#x z=%#llx/%#llx zinfo=%#x",
+                "db_ctl=%#x cb0=%#llx info=%#x mask=%#x z=%#llx/%#llx zinfo=%#x blend0=%#x colfmt=%#x",
                 draw_count, static_cast<u32>(prim), dc.count, dc.indexed, vs_addr, ps_addr, cb_mode, db_render,
                 db_control, u64(r.ColorTarget(0, Reg::CB_BASE)) << 8, r.ColorTarget(0, Reg::CB_INFO),
                 r[Reg::CB_TARGET_MASK], u64(r[Reg::DB_Z_READ_BASE]) << 8, u64(r[Reg::DB_Z_WRITE_BASE]) << 8,
-                r[Reg::DB_Z_INFO]);
+                r[Reg::DB_Z_INFO], r[Reg::CB_BLEND0_CONTROL], r[Reg::SPI_SHADER_COL_FORMAT]);
     }
     if (!vs_addr) {
         return;
@@ -1816,7 +1847,8 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         [enc setDepthStencilState:GetDepthState(db_control & 0x7F)];
     }
     const u32 su = r[Reg::PA_SU_SC_MODE_CNTL];
-    const bool cull_front = su & 1, cull_back = (su >> 1) & 1;
+    static const bool no_cull = std::getenv("DC_NO_CULL") != nullptr;
+    const bool cull_front = (su & 1) && !no_cull, cull_back = ((su >> 1) & 1) && !no_cull;
     [enc setCullMode:(cull_front && cull_back) ? MTLCullModeNone
                      : cull_front ? MTLCullModeFront
                      : cull_back ? MTLCullModeBack : MTLCullModeNone];
@@ -1995,14 +2027,6 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
         return;
     }
     ++stat_dispatches;
-    // A shader writing straight to a CMASK/HTILE surface is a fast clear.
-    for (u32 k = 0; k + 1 < 16 && !metas.empty(); ++k) {
-        const u64 base = (u64(ud[k]) | (u64(ud[k + 1] & 0xFFF) << 32)) & kGpuAddrMask;
-        if (metas.count(base) && MarkMetaCleared(base, 1)) {
-            EndPass();
-            return;
-        }
-    }
     // The Gnm driver copies surfaces with a buffer-copy shader (V# source in
     // user data 0-3, destination in 4-7). Surfaces we render live only in
     // Metal textures, so copy the texture and give the destination one too.
@@ -2033,6 +2057,16 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
     Program* cs = GetProgram(Stage::Compute, addr, ud, Bits(rsrc2, 1, 5), Bits(rsrc2, 11, 2), rsrc2);
     if (!cs) {
         return;
+    }
+    // A shader that only stores to a CMASK/HTILE surface it gets straight
+    // from user data is a fast clear (others read metadata, e.g. HTILE for
+    // tile depth bounds, and run normally).
+    for (u32 k = 0; k + 3 < 16 && !metas.empty(); ++k) {
+        const u64 base = (u64(ud[k]) | (u64(ud[k + 1] & 0xFFF) << 32)) & kGpuAddrMask;
+        if (metas.count(base) && OnlyStoresTo(*cs, k) && MarkMetaCleared(base, 1)) {
+            EndPass();
+            return;
+        }
     }
     std::vector<TextureType> types;
     std::vector<Bound> res;
@@ -2114,6 +2148,16 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
     [e setThreadgroupMemoryLength:std::min<u32>(lds, 32768) atIndex:0];
     [e dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
     [e endEncoding];
+    if (dump_passes && trace && dump_frames) {
+        u32 n = 0;
+        for (u32 k = 0; k < res.size() && n < 8; ++k) {
+            if (cs->images[k].storage && res[k].tex.textureType == MTLTextureType2D) {
+                pass_tex[n] = res[k].tex;
+                pass_addr[n++] = addr;
+            }
+        }
+        DumpPass();
+    }
 }
 
 void MetalRenderer::Impl::Flip(const FlipInfo& f) {

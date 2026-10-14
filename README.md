@@ -6,6 +6,7 @@
 
 ![Driveclub Native Boot](media/DRIVECLUB.webp)
 ![Tamil Nadu Event Loading](media/DCPS4.webp)
+![In-Game Pause Menu](media/2026-10-14_03-11-22.png)
 
 A native port of **Driveclub** (PS4, CUSA00003 v1.05) to macOS with rendering via **Metal 3**.
 

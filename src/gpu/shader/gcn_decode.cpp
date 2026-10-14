@@ -175,6 +175,7 @@ bool Decode(const u32* code, u32 pc, Inst& i) {
             i.dst = Bits(w, 0, 8);
             i.abs = Bits(w, 8, 3);
             i.clamp = Bits(w, 11, 1);
+            i.sdst = 0xFFFF; // writes no scalar register (0 would read as s0)
         }
         return true;
     }
