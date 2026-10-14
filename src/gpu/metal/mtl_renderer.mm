@@ -511,6 +511,9 @@ struct MetalRenderer::Impl {
 
     // CP DMA on the host GPU, in order with the work around it.
     bool DmaData(u32 dst_sel, u64 dst, u32 src_sel, u64 src, u32 bytes) {
+        if (trace) {
+            DC_INFO("gpu: dma %u:%#llx <- %u:%#llx, %u bytes", dst_sel, dst, src_sel, src, bytes);
+        }
         if ((bytes & 3) || (dst & 3) || (src_sel != 2 && (src & 3))) {
             return false;
         }
@@ -1932,7 +1935,10 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
     const u32 ty = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_Y] & 0xFFFF);
     const u32 tz = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_Z] & 0xFFFF);
     if (trace) {
-        DC_INFO("gpu: dispatch cs=%#llx groups %ux%ux%u threads %ux%ux%u rsrc2=%#x", addr, gx, gy, gz, tx, ty, tz, rsrc2);
+        DC_INFO("gpu: dispatch cs=%#llx groups %ux%ux%u threads %ux%ux%u rsrc2=%#x ud=%08x %08x %08x %08x %08x %08x %08x "
+                "%08x %08x %08x %08x %08x %08x %08x %08x %08x",
+                addr, gx, gy, gz, tx, ty, tz, rsrc2, ud[0], ud[1], ud[2], ud[3], ud[4], ud[5], ud[6], ud[7], ud[8],
+                ud[9], ud[10], ud[11], ud[12], ud[13], ud[14], ud[15]);
     }
     if (!addr || !gx || !gy || !gz) {
         return;
