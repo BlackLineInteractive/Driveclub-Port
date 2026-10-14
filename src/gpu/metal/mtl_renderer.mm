@@ -1506,10 +1506,11 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
 
     if (trace) {
         DC_INFO("gpu: draw #%llu prim=%#x count=%u idx=%d vs=%#llx ps=%#llx cb_mode=%u db_render=%#x "
-                "db_ctl=%#x cb0=%#llx info=%#x mask=%#x",
+                "db_ctl=%#x cb0=%#llx info=%#x mask=%#x z=%#llx/%#llx zinfo=%#x",
                 draw_count, static_cast<u32>(prim), dc.count, dc.indexed, vs_addr, ps_addr, cb_mode, db_render,
                 db_control, u64(r.ColorTarget(0, Reg::CB_BASE)) << 8, r.ColorTarget(0, Reg::CB_INFO),
-                r[Reg::CB_TARGET_MASK]);
+                r[Reg::CB_TARGET_MASK], u64(r[Reg::DB_Z_READ_BASE]) << 8, u64(r[Reg::DB_Z_WRITE_BASE]) << 8,
+                r[Reg::DB_Z_INFO]);
     }
     if (!vs_addr) {
         return;
