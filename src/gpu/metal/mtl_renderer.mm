@@ -2230,6 +2230,22 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
             return;
         }
     }
+    // A shader reading HTILE (e.g. per-tile depth bounds for light culling)
+    // would see stale memory: depth lives in Metal textures. Give it expanded
+    // tiles with the full Z range, so nothing is culled by mistake.
+    for (u32 k = 0; k + 3 < 16 && !metas.empty(); ++k) {
+        const u64 base = (u64(ud[k]) | (u64(ud[k + 1] & 0xFFF) << 32)) & kGpuAddrMask;
+        auto m = metas.find(base);
+        if (m == metas.end() || !m->second.depth) {
+            continue;
+        }
+        const u32 stride = (ud[k + 1] >> 16) & 0x3FFF;
+        const u64 bytes = u64(ud[k + 2]) * (stride ? stride : 1);
+        if (bytes && bytes < (64ull << 20)) {
+            DmaData(0, base, 2, 0xFFFC000Fu, static_cast<u32>(bytes & ~3ull));
+        }
+        k += 3;
+    }
     std::vector<TextureType> types;
     Resources res;
     Resolve(*cs, ud, types, res);
