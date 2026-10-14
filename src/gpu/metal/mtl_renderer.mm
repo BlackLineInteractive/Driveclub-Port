@@ -337,6 +337,7 @@ struct MetalRenderer::Impl {
         std::string name;
     };
     std::vector<PassDump> pass_dumps;
+    std::vector<u64> peek_addrs; // DC_PEEK_CS=<cs>: its V# buffers, printed after the traced frame
     id<MTLTexture> pass_tex[9] = {};
     u64 pass_addr[9] = {};
     bool stats = false;                // DC_GPU_STATS: per-second GPU time and submit counts
@@ -2031,6 +2032,14 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
         return;
     }
     ++stat_dispatches;
+    if (trace) {
+        static const u64 peek_cs = std::getenv("DC_PEEK_CS") ? std::strtoull(std::getenv("DC_PEEK_CS"), nullptr, 16) : 0;
+        if (addr == peek_cs) {
+            for (u32 k = 0; k + 1 < 12; k += 4) {
+                peek_addrs.push_back((u64(ud[k]) | (u64(ud[k + 1] & 0xFFF) << 32)) & kGpuAddrMask);
+            }
+        }
+    }
     // The Gnm driver copies surfaces with a buffer-copy shader (V# source in
     // user data 0-3, destination in 4-7). Surfaces we render live only in
     // Metal textures, so copy the texture and give the destination one too.
@@ -2257,6 +2266,30 @@ void MetalRenderer::Impl::Flip(const FlipInfo& f) {
         Commit(true);
         EnsureCommandBuffer();
         WritePassDumps();
+    }
+    if (!peek_addrs.empty()) {
+        Commit(true);
+        EnsureCommandBuffer();
+        for (u64 a : peek_addrs) {
+            if (Readable(a, 32)) {
+                const float* v = reinterpret_cast<const float*>(a);
+                DC_INFO("gpu: peek %#llx: %g %g %g %g %g %g %g %g", a, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            }
+        }
+        peek_addrs.clear();
+    }
+    if (const char* peek = std::getenv("DC_PEEK"); peek && trace) { // debug: DC_PEEK=addr,addr: guest floats
+        Commit(true);
+        EnsureCommandBuffer();
+        for (const char* q = peek; *q;) {
+            char* end = nullptr;
+            const u64 a = std::strtoull(q, &end, 16);
+            if (Readable(a, 32)) {
+                const float* v = reinterpret_cast<const float*>(a);
+                DC_INFO("gpu: peek %#llx: %g %g %g %g %g %g %g %g", a, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            }
+            q = *end ? end + 1 : end;
+        }
     }
     Commit(false);
     if (src) {
