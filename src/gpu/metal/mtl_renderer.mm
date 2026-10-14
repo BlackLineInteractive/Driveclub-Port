@@ -1600,6 +1600,10 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     if (!vs_addr) {
         return;
     }
+    static const u64 skip_ps = std::getenv("DC_SKIP_PS") ? std::strtoull(std::getenv("DC_SKIP_PS"), nullptr, 16) : 0;
+    if (skip_ps && ps_addr == skip_ps) { // debug: drop one pixel shader's draws
+        return;
+    }
 
     // ---- attachments ----
     if (cb_mode == 2 || cb_mode == 5) { // fast-clear eliminate / FMASK decompress
