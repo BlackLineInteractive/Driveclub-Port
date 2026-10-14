@@ -1653,19 +1653,29 @@ std::string Emitter::Run() {
                TexParams(true) + ") {\n";
         src += "    DcMem mem = {gm0, gm1, &gmap};\n    VsOut o;\n";
         if (o.rect_list) {
+            // As shadPS4's rect list TCS: the vertex whose x matches one neighbour and y
+            // the other is the right-angle corner; the 4th vertex is opposite it. Triangles:
+            // the given one, then the two others with the 4th.
             src += "    uint r_ = vid / 6u, c_ = vid % 6u;\n";
-            src += "    uint k_ = c_ < 3u ? c_ : (c_ == 3u ? 2u : (c_ == 4u ? 1u : 3u));\n";
-            src += "    if (k_ < 3u) {\n        o = dc_run(r_ * 3u + k_, iid, " + args + ");\n    } else {\n";
-            src += "        VsOut a = dc_run(r_ * 3u, iid, " + args + ");\n";
-            src += "        VsOut b = dc_run(r_ * 3u + 1u, iid, " + args + ");\n";
-            src += "        VsOut c = dc_run(r_ * 3u + 2u, iid, " + args + ");\n";
-            src += "        o.pos = b.pos + c.pos - a.pos;\n";
+            src += "    if (c_ < 3u) {\n        o = dc_run(r_ * 3u + c_, iid, " + args + ");\n    } else {\n";
+            src += "        VsOut v_[3] = {dc_run(r_ * 3u, iid, " + args + "), dc_run(r_ * 3u + 1u, iid, " + args +
+                   "), dc_run(r_ * 3u + 2u, iid, " + args + ")};\n";
+            src += "        bool2 e_[3];\n";
+            src += "        for (uint i = 0u; i < 3u; ++i) e_[i] = v_[i].pos.xy == v_[(i + 1u) % 3u].pos.xy;\n";
+            src += "        float b_[3]; uint ci_ = 0u;\n";
+            src += "        for (uint i = 0u; i < 3u; ++i) {\n";
+            src += "            bool edge = (e_[i].x && e_[(i + 2u) % 3u].y) || (e_[i].y && e_[(i + 2u) % 3u].x);\n";
+            src += "            b_[i] = edge ? -1.0f : 1.0f; if (edge) ci_ = i;\n        }\n";
+            src += "        if (min(b_[0], min(b_[1], b_[2])) > 0.0f) b_[0] = -1.0f; // no right angle: v0\n";
+            src += "        if (c_ < 5u) {\n            o = v_[(ci_ + c_ - 2u) % 3u];\n        } else {\n";
+            src += "            o.pos = v_[0].pos * b_[0] + v_[1].pos * b_[1] + v_[2].pos * b_[2];\n";
             for (u32 k = 0; k < 32; ++k) {
                 if (p.param_mask & (1u << k)) {
-                    src += "        o.p" + N(k) + " = b.p" + N(k) + " + c.p" + N(k) + " - a.p" + N(k) + ";\n";
+                    src += "            o.p" + N(k) + " = v_[0].p" + N(k) + " * b_[0] + v_[1].p" + N(k) + " * b_[1] + v_[2].p" +
+                           N(k) + " * b_[2];\n";
                 }
             }
-            src += "    }\n";
+            src += "        }\n    }\n";
         } else {
             src += "    o = dc_run(vid, iid, " + args + ");\n";
         }
