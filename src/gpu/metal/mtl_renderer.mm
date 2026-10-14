@@ -1806,6 +1806,15 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         return;
     }
 
+    if (trace) { // DC_PEEK_PS=<ps>: its first two V# buffers, printed after the traced frame
+        static const u64 peek_ps = std::getenv("DC_PEEK_PS") ? std::strtoull(std::getenv("DC_PEEK_PS"), nullptr, 16) : 0;
+        if (ps_addr == peek_ps) {
+            for (u32 k = 0; k < 8; k += 4) {
+                peek_addrs.push_back((u64(ps_ud[k]) | (u64(ps_ud[k + 1] & 0xFFF) << 32)) & kGpuAddrMask);
+                peek_addrs.push_back(peek_addrs.back() + 64);
+            }
+        }
+    }
     // ---- resources ----
     std::vector<TextureType> vs_types, ps_types;
     Resources vs_res, ps_res;

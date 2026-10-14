@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <unordered_map>
@@ -1053,6 +1054,12 @@ void Emitter::EmitBuffer(const Inst& i) {
     Line("}");
 }
 
+// DC_NAN_PROBE: float outputs that are NaN turn magenta, infinite ones yellow.
+static bool NanProbe() {
+    static const bool on = std::getenv("DC_NAN_PROBE") != nullptr;
+    return on;
+}
+
 // Depth-compare result (1 or 0) for S# DEPTH_COMPARE_FUNC `func`: ref <op> texel.
 static std::string Compare(u8 func, const std::string& ref, const std::string& texel) {
     static const char* ops[8] = {nullptr, "<", "==", "<=", ">", "!=", ">=", nullptr};
@@ -1109,6 +1116,7 @@ void Emitter::EmitImage(const Inst& i) {
         if (tt.sample == TexSample::Float) {
             value = "float4(as_type<float>(" + comps[0] + "), as_type<float>(" + comps[1] + "), as_type<float>(" +
                     comps[2] + "), as_type<float>(" + comps[3] + "))";
+            if (NanProbe()) value = "dc_probe(" + value + ")";
         } else {
             value = std::string(vec) + "(uint4(" + comps[0] + ", " + comps[1] + ", " + comps[2] + ", " + comps[3] + "))";
         }
@@ -1277,14 +1285,15 @@ void Emitter::EmitExp(const Inst& i) {
             value = "float4(float2(as_type<half2>(" + a + ")), float2(as_type<half2>(" + b + ")))";
             break;
         }
-        if (type == OutType::Float) Line(dst + " = float4(" + value + ");");
+        if (type == OutType::Float) Line(dst + (NanProbe() ? " = dc_probe(float4(" + value + "));" : " = float4(" + value + ");"));
         else if (type == OutType::Uint) Line(dst + " = uint4(" + value + ");");
         else Line(dst + " = int4(" + value + ");");
         return;
     }
     if (type == OutType::Float) {
-        Line(dst + " = float4(" + comp(0, "0.0f") + ", " + comp(1, "0.0f") + ", " + comp(2, "0.0f") + ", " +
-             comp(3, "1.0f") + ");");
+        const std::string v4 = "float4(" + comp(0, "0.0f") + ", " + comp(1, "0.0f") + ", " + comp(2, "0.0f") + ", " +
+                               comp(3, "1.0f") + ")";
+        Line(dst + " = " + (NanProbe() ? "dc_probe(" + v4 + ")" : v4) + ";");
     } else {
         const char* t = type == OutType::Uint ? "uint4" : "int4";
         auto raw = [&](u32 k) { return (i.en & (1u << k)) ? VName(i.vsrc[k]) : std::string("0u"); };

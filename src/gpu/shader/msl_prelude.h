@@ -229,6 +229,11 @@ static inline uint dc_f16_rtz(float f) {
     }
     return uint(as_type<ushort>(h));
 }
+static inline float4 dc_probe(float4 v) {
+    if (any(isnan(v))) return float4(1000.0f, 0.0f, 1000.0f, 1.0f);
+    if (any(isinf(v))) return float4(1000.0f, 1000.0f, 0.0f, 1.0f);
+    return v;
+}
 // The VALU clamp modifier: NaN becomes 0 (Metal's saturate keeps NaN).
 static inline float dc_sat(float f) { return f > 0.0f ? min(f, 1.0f) : 0.0f; }
 static inline float dc_f32(uint v) { return float(as_type<half>(ushort(v & 0xffffu))); }
