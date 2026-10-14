@@ -337,6 +337,7 @@ struct MetalRenderer::Impl {
     MTLPixelFormat fmt = MTLPixelFormatInvalid;
   };
   std::unordered_map<u64, MipAlias> mip_alias; // by level address
+  u64 resolving_shader = 0; // shader whose resources are being resolved (logs)
   std::vector<std::unique_ptr<RenderTarget>> retired; // merged into a parent
 
   // Render target sizes the Gnm driver hides in a NOP after the CB/DB
@@ -1418,8 +1419,48 @@ struct MetalRenderer::Impl {
                                    ? MTLPixelFormatRGBA8Unorm
                                    : fi.format;
       type_out->ufloat = f == MTLPixelFormatRG11B10Float;
+      // A new image starts as its guest memory (shadPS4 uploads an image
+      // before a shader writes it): a shader may write only part of it, and
+      // the rest is what the game put there (e.g. a color grading LUT).
+      id<MTLTexture> initial = nil;
+      if (!Latest(color_targets, addr, tt.dim, width, height) &&
+          !fi.gpu_only) {
+        TextureType mt;
+        initial = GetTexture(t, &mt, false);
+        if (initial.pixelFormat != f || initial.width != width >> base_level ||
+            initial.textureType != (tt.dim == TexDim::Tex3D
+                                        ? MTLTextureType3D
+                                    : tt.dim == TexDim::Tex2DArray
+                                        ? MTLTextureType2DArray
+                                        : MTLTextureType2D)) {
+          initial = nil;
+        }
+      }
       RenderTarget &target = GetColorTarget(addr, f, width, height,
                                             last_level + 1, tt.dim, layers);
+      if (initial && !target.initialized) {
+        EndPass();
+        EnsureCommandBuffer();
+        id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+        const NSUInteger n =
+            std::min<NSUInteger>(initial.mipmapLevelCount,
+                                 target.levels - std::min(base_level,
+                                                          target.levels - 1));
+        const NSUInteger slices =
+            tt.dim == TexDim::Tex2DArray
+                ? std::min<NSUInteger>(initial.arrayLength,
+                                       target.tex.arrayLength)
+                : 1;
+        [b copyFromTexture:initial
+                 sourceSlice:0
+                 sourceLevel:0
+                   toTexture:target.tex
+            destinationSlice:0
+            destinationLevel:base_level
+                  sliceCount:slices
+                  levelCount:n];
+        [b endEncoding];
+      }
       target.initialized = true;
       target.clear_pending = false;
       target.written = ++write_seq;
@@ -1715,9 +1756,10 @@ struct MetalRenderer::Impl {
     rt->levels = levels;
     rt->dim = dim;
     rt->depth_or_layers = depth_or_layers;
-    DC_INFO("gpu: %s target %#llx %ux%u (dim=%d d/l=%u) fmt %lu",
+    DC_INFO("gpu: %s target %#llx %ux%u (dim=%d d/l=%u) fmt %lu (shader %#llx)",
             depth ? "depth" : "render", addr, width, height, (int)dim,
-            depth_or_layers, (unsigned long)fmt);
+            depth_or_layers, (unsigned long)fmt,
+            (unsigned long long)resolving_shader);
     list.push_back(std::move(rt));
     return *list.back();
   }
@@ -2557,6 +2599,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   // ---- resources ----
   std::vector<TextureType> vs_types, ps_types;
   Resources vs_res, ps_res;
+  resolving_shader = ps_addr;
   Resolve(*vs, vs_ud, vs_types, vs_res);
   if (ps) {
     Resolve(*ps, ps_ud, ps_types, ps_res);
@@ -3161,9 +3204,10 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
       to.clear_color = from->clear_color;
       to.clear_depth = from->clear_depth;
       to.written = ++write_seq;
-      if (trace) {
-        DC_INFO("gpu:   surface copy %#llx -> %#llx (%ux%u)", src, dst,
-                from->width, from->height);
+      if (trace || from->dim != TexDim::Tex2D) {
+        DC_INFO("gpu:   surface copy %#llx -> %#llx (%ux%u dim %d layers %u fmt %lu)",
+                src, dst, from->width, from->height, (int)from->dim,
+                from->depth_or_layers, (unsigned long)from->tex.pixelFormat);
       }
       return;
     }
@@ -3205,6 +3249,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   }
   std::vector<TextureType> types;
   Resources res;
+  resolving_shader = addr;
   Resolve(*cs, ud, types, res);
 
   Shader::MslOptions o;
@@ -3359,12 +3404,13 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
     if (dt >= 1.0) {
       DC_INFO(
           "gpu stats: %.1f fps, gpu busy %.0f%%, wait %.0f%%, per frame: %.0f "
-          "draws %.0f dispatches %.1f commits %.1f waits %.1f MB hashed",
+          "draws %.0f dispatches %.1f commits %.1f waits %.1f MB hashed, "
+          "%zu pipelines compiling",
           frames / dt, gpu_ns.exchange(0) / 1e9 / dt * 100,
           stat_wait_s / dt * 100, stat_draws / double(frames),
           stat_dispatches / double(frames), stat_commits / double(frames),
           stat_waits / double(frames),
-          stat_hashed / double(frames) / (1 << 20));
+          stat_hashed / double(frames) / (1 << 20), pending.size());
       stat_hashed = 0;
       frames = stat_commits = stat_waits = stat_draws = stat_dispatches = 0;
       if (profile) {
