@@ -200,6 +200,7 @@ struct MetalRenderer::Impl {
     id<MTLRenderCommandEncoder> enc = nil;
     struct PassState {
         u64 color[8] = {};
+        u32 slice[8] = {};
         u64 depth = 0;
         bool operator==(const PassState&) const = default;
     } pass;
@@ -252,6 +253,7 @@ struct MetalRenderer::Impl {
         MTLClearColor clear_color{};
         double clear_depth = 1.0;
         u64 written = 0; // write_seq of the last pass/dispatch writing it
+        u32 bind_slice = 0; // array slice the CB registers point at (CB_COLOR_VIEW)
         u32 levels = 1;  // mip levels (compute shaders build mip chains in place)
         std::unordered_map<u64, id<MTLTexture>> views; // (base, count, format) -> view
     };
@@ -604,7 +606,7 @@ struct MetalRenderer::Impl {
         for (u32 k = 0; k < 9; ++k) {
             id<MTLTexture> t = pass_tex[k];
             pass_tex[k] = nil;
-            if (!t || !copy_pipeline) {
+            if (!t || !copy_pipeline || t.textureType != MTLTextureType2D) {
                 continue;
             }
             const MTLPixelFormat f = t.pixelFormat;
@@ -1049,6 +1051,7 @@ struct MetalRenderer::Impl {
         const u32 depth = (t[4] & 0x1FFF) + 1;
         const u32 pitch = ((t[4] >> 13) & 0x3FFF) + 1;
         const u32 last_array = (t[5] >> 13) & 0x1FFF;
+        const u32 base_array = std::min<u32>(t[5] & 0x1FFF, last_array);
         const u32 base_level = (t[3] >> 12) & 0xF;
         const u32 last_level = std::max(base_level, (t[3] >> 16) & 0xF);
 
@@ -1065,10 +1068,16 @@ struct MetalRenderer::Impl {
             return Dummy(tt, true);
         }
 
+        // Slices a descriptor of an array covers (a cube is 6 faces from its base).
+        const u32 slice_count = tt.dim != TexDim::Tex2DArray ? 1
+                              : ttype == 11 ? std::max<u32>(6, last_array - base_array + 1)
+                                            : last_array - base_array + 1;
+
         // Render-to-texture: sample the render target directly.
         if (!storage) {
             if (RenderTarget* rt = Latest(color_targets, addr, tt.dim)) {
-                return TargetView(*rt, base_level, last_level - base_level + 1);
+                return TargetView(*rt, base_level, last_level - base_level + 1, MTLPixelFormatInvalid, base_array,
+                                  slice_count);
             }
             if (tt.dim == TexDim::Tex2D) {
                 if (RenderTarget* rt = Latest(depth_targets, addr, tt.dim)) {
@@ -1077,7 +1086,7 @@ struct MetalRenderer::Impl {
             }
         }
 
-        const u32 layers = tt.dim == TexDim::Tex2DArray ? std::max<u32>(last_array + 1, ttype == 11 ? 6 : 1)
+        const u32 layers = tt.dim == TexDim::Tex2DArray ? base_array + slice_count
                          : tt.dim == TexDim::Tex3D ? depth : 1;
 
         if (storage) {
@@ -1096,7 +1105,7 @@ struct MetalRenderer::Impl {
             target.initialized = true;
             target.clear_pending = false;
             target.written = ++write_seq;
-            return TargetView(target, base_level, 1);
+            return TargetView(target, base_level, 1, MTLPixelFormatInvalid, base_array, slice_count);
         }
 
         if (fi.format == MTLPixelFormatInvalid || fi.gpu_only) {
@@ -1270,24 +1279,29 @@ struct MetalRenderer::Impl {
         auto& list = map[addr];
         const u32 max_levels = 1 + static_cast<u32>(std::log2(std::max(width, height)));
         levels = std::clamp<u32>(levels, 1, max_levels);
+        const bool array = dim == TexDim::Tex2DArray;
         for (auto& t : list) {
-            if (t->width != width || t->height != height || t->tex.pixelFormat != fmt ||
-                t->dim != dim || t->depth_or_layers != depth_or_layers) {
+            // Arrays are one surface whatever slice range a descriptor covers: they grow.
+            if (t->width != width || t->height != height || t->tex.pixelFormat != fmt || t->dim != dim ||
+                (!array && t->depth_or_layers != depth_or_layers)) {
                 continue;
             }
-            if (t->levels < levels) { // now used with a mip chain: grow, keeping what is there
-                id<MTLTexture> tex = NewTargetTexture(fmt, width, height, levels, depth, dim, depth_or_layers);
+            const u32 want_layers = array ? std::max(t->depth_or_layers, depth_or_layers) : t->depth_or_layers;
+            if (t->levels < levels || t->depth_or_layers < want_layers) { // grow, keeping what is there
+                const u32 new_levels = std::max(t->levels, levels);
+                id<MTLTexture> tex = NewTargetTexture(fmt, width, height, new_levels, depth, dim, want_layers);
                 EndPass();
                 EnsureCommandBuffer();
                 id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
-                const u32 slices = dim == TexDim::Tex2DArray ? depth_or_layers : 1;
+                const u32 slices = array ? t->depth_or_layers : 1;
                 for (u32 l = 0; l < t->levels; ++l) {
                     [b copyFromTexture:t->tex sourceSlice:0 sourceLevel:l toTexture:tex destinationSlice:0
                       destinationLevel:l sliceCount:slices levelCount:1];
                 }
                 [b endEncoding];
                 t->tex = tex;
-                t->levels = levels;
+                t->levels = new_levels;
+                t->depth_or_layers = want_layers;
                 t->views.clear();
             }
             return *t;
@@ -1306,26 +1320,30 @@ struct MetalRenderer::Impl {
         return *list.back();
     }
 
-    // Levels [base, base + count) of `rt` (the texture itself when that is all of it).
-    id<MTLTexture> TargetView(RenderTarget& rt, u32 base, u32 count, MTLPixelFormat fmt = MTLPixelFormatInvalid) {
+    // Levels [base, base + count) and, for arrays, slices [sbase, sbase + scount)
+    // of `rt` (the texture itself when that is all of it).
+    id<MTLTexture> TargetView(RenderTarget& rt, u32 base, u32 count, MTLPixelFormat fmt = MTLPixelFormatInvalid,
+                              u32 sbase = 0, u32 scount = ~0u) {
         if (fmt == MTLPixelFormatInvalid) {
             fmt = rt.tex.pixelFormat;
         }
         base = std::min(base, rt.levels - 1);
         count = std::clamp<u32>(count, 1, rt.levels - base);
-        if (base == 0 && count == rt.levels && fmt == rt.tex.pixelFormat) {
+        const u32 total = rt.tex.textureType == MTLTextureType2DArray ? static_cast<u32>(rt.tex.arrayLength) : 1;
+        sbase = std::min(sbase, total - 1);
+        scount = std::clamp<u32>(scount, 1, total - sbase);
+        if (base == 0 && count == rt.levels && sbase == 0 && scount == total && fmt == rt.tex.pixelFormat) {
             return rt.tex;
         }
-        const u64 key = base | (u64(count) << 8) | (u64(fmt) << 16);
+        const u64 key = base | (u64(count) << 8) | (u64(fmt) << 16) | (u64(sbase) << 32) | (u64(scount) << 46);
         auto it = rt.views.find(key);
         if (it != rt.views.end()) {
             return it->second;
         }
-        const NSUInteger slices = rt.tex.textureType == MTLTextureType2DArray ? rt.tex.arrayLength : 1;
         id<MTLTexture> v = [rt.tex newTextureViewWithPixelFormat:fmt
                                                       textureType:rt.tex.textureType
                                                            levels:NSMakeRange(base, count)
-                                                           slices:NSMakeRange(0, slices)];
+                                                           slices:NSMakeRange(sbase, scount)];
         rt.views[key] = v;
         return v;
     }
@@ -1402,6 +1420,7 @@ struct MetalRenderer::Impl {
             }
             RenderTarget& rt = *colors[k];
             rp.colorAttachments[k].texture = rt.tex;
+            rp.colorAttachments[k].slice = rt.bind_slice;
             rp.colorAttachments[k].loadAction = rt.initialized && !rt.clear_pending ? MTLLoadActionLoad : MTLLoadActionClear;
             rp.colorAttachments[k].clearColor = rt.clear_pending ? rt.clear_color
                                               : debug_clear ? MTLClearColorMake(0.1, 0.1, 0.3, 1) : MTLClearColorMake(0, 0, 0, 0);
@@ -1410,6 +1429,7 @@ struct MetalRenderer::Impl {
             rt.clear_pending = false;
             rt.written = seq;
             ps.color[k] = reinterpret_cast<u64>(&rt);
+            ps.slice[k] = rt.bind_slice;
             w = std::min(w, rt.width);
             h = std::min(h, rt.height);
         }
@@ -1506,7 +1526,20 @@ struct MetalRenderer::Impl {
             height = cb_extent[k] >> 16;
         }
         const ColorFormatInfo cf = ColorTargetFormat(ColorInfo::Format(info), ColorInfo::NumberType(info));
-        RenderTarget& rt = GetColorTarget(base, cf.format, std::max(width, 1u), std::max(height, 1u));
+        width = std::max(width, 1u);
+        height = std::max(height, 1u);
+        // Rendering into one slice of an array (cube faces): CB_COLOR_VIEW.SLICE_START.
+        const u32 view = r.ColorTarget(k, Reg::CB_VIEW);
+        const u32 slice_start = view & 0x7FF, slice_max = (view >> 13) & 0x7FF;
+        bool array = slice_start || slice_max;
+        if (!array) {
+            if (RenderTarget* a = Latest(color_targets, base, TexDim::Tex2DArray)) {
+                array = a->width == width && a->height == height && a->tex.pixelFormat == cf.format;
+            }
+        }
+        RenderTarget& rt = array ? GetColorTarget(base, cf.format, width, height, 1, TexDim::Tex2DArray, slice_start + 1)
+                                 : GetColorTarget(base, cf.format, width, height);
+        rt.bind_slice = array ? slice_start : 0;
         rt.clear_color = ClearColor(info, r.ColorTarget(k, Reg::CB_CLEAR_WORD0), r.ColorTarget(k, Reg::CB_CLEAR_WORD1));
         if (ColorInfo::FastClear(info)) {
             NoteMeta(u64(r.ColorTarget(k, Reg::CB_CMASK)) << 8, base, false);
@@ -1718,6 +1751,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     PassState want;
     for (u32 k = 0; k < 8; ++k) {
         want.color[k] = reinterpret_cast<u64>(colors[k]);
+        want.slice[k] = colors[k] ? colors[k]->bind_slice : 0;
     }
     want.depth = reinterpret_cast<u64>(depth);
     if (depth_clear && depth) {
