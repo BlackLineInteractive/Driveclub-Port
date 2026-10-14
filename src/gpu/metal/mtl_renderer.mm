@@ -321,6 +321,15 @@ struct MetalRenderer::Impl {
     id<MTLFunction> debug_fs = nil;    // DC_DEBUG_FLAT: every pixel shader outputs magenta
     bool trace = false;
     u64 trace_frame = 0;               // DC_TRACE_FRAME=n: DC_GPU_TRACE for flip n only
+    bool dump_passes = false;          // DC_DUMP_PASSES: with DC_TRACE_FRAME, every pass's targets
+    struct PassDump {
+        id<MTLBuffer> buf;
+        u32 w, h;
+        std::string name;
+    };
+    std::vector<PassDump> pass_dumps;
+    id<MTLTexture> pass_tex[9] = {};
+    u64 pass_addr[9] = {};
     bool stats = false;                // DC_GPU_STATS: per-second GPU time and submit counts
     bool profile = false;              // DC_GPU_PROFILE: GPU time per shader (one command buffer per call)
     struct ProfileEntry {
@@ -356,6 +365,7 @@ struct MetalRenderer::Impl {
             debug_vsout = std::strtoull(v, nullptr, 16);
         }
         trace = std::getenv("DC_GPU_TRACE") != nullptr;
+        dump_passes = std::getenv("DC_DUMP_PASSES") != nullptr;
         if (const char* e = std::getenv("DC_TRACE_FRAME")) {
             trace_frame = std::strtoull(e, nullptr, 10);
         }
@@ -564,8 +574,73 @@ struct MetalRenderer::Impl {
         if (enc) {
             [enc endEncoding];
             enc = nil;
+            if (dump_passes && trace && dump_frames) {
+                DumpPass();
+            }
         }
         pass = {};
+    }
+
+    // DC_DUMP_PASSES: small BGRA copies of the targets of the pass just ended.
+    void DumpPass() {
+        for (u32 k = 0; k < 9; ++k) {
+            id<MTLTexture> t = pass_tex[k];
+            pass_tex[k] = nil;
+            if (!t || !copy_pipeline) {
+                continue;
+            }
+            const MTLPixelFormat f = t.pixelFormat;
+            if (k < 8 && (f == MTLPixelFormatRGBA8Uint || f == MTLPixelFormatR32Uint || f == MTLPixelFormatRG32Uint ||
+                          f == MTLPixelFormatRGBA32Uint || f == MTLPixelFormatR16Uint || f == MTLPixelFormatR8Uint ||
+                          f == MTLPixelFormatRG16Uint || f == MTLPixelFormatRGBA16Uint)) {
+                continue;
+            }
+            const u32 w = std::max<u32>(1, static_cast<u32>(t.width) / 4), h = std::max<u32>(1, static_cast<u32>(t.height) / 4);
+            MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                         width:w
+                                                                                        height:h
+                                                                                     mipmapped:NO];
+            d.usage = MTLTextureUsageRenderTarget;
+            d.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> dst = [device newTextureWithDescriptor:d];
+            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = dst;
+            rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> e = [cmd renderCommandEncoderWithDescriptor:rp];
+            const float scale[2] = {1, 1};
+            [e setRenderPipelineState:copy_pipeline];
+            [e setFragmentTexture:t atIndex:0];
+            [e setFragmentBytes:scale length:sizeof(scale) atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [e endEncoding];
+            id<MTLBuffer> buf = [device newBufferWithLength:u64(w) * h * 4 options:MTLResourceStorageModeShared];
+            id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+            [b copyFromTexture:dst sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0
+        destinationBytesPerRow:w * 4 destinationBytesPerImage:u64(w) * h * 4];
+            [b endEncoding];
+            char name[128];
+            std::snprintf(name, sizeof(name), "pass_%04zu_%s%u_%llx_d%llu", pass_dumps.size(), k == 8 ? "z" : "c",
+                          k, pass_addr[k], draw_count);
+            pass_dumps.push_back({buf, w, h, name});
+        }
+    }
+
+    void WritePassDumps() {
+        for (const auto& pd : pass_dumps) {
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/%s.ppm", dump_frames, pd.name.c_str());
+            std::ofstream out(path, std::ios::binary);
+            out << "P6\n" << pd.w << " " << pd.h << "\n255\n";
+            const auto* px = static_cast<const u8*>(pd.buf.contents);
+            for (u64 i = 0; i < u64(pd.w) * pd.h; ++i) {
+                const char rgb[3] = {static_cast<char>(px[i * 4 + 2]), static_cast<char>(px[i * 4 + 1]),
+                                     static_cast<char>(px[i * 4])};
+                out.write(rgb, 3);
+            }
+        }
+        pass_dumps.clear();
     }
 
     void Commit(bool wait) {
@@ -1248,6 +1323,14 @@ struct MetalRenderer::Impl {
         rp.renderTargetHeight = h;
         enc = [cmd renderCommandEncoderWithDescriptor:rp];
         pass = ps;
+        if (dump_passes && trace) {
+            for (u32 k = 0; k < 8; ++k) {
+                pass_tex[k] = colors[k] ? colors[k]->tex : nil;
+                pass_addr[k] = colors[k] ? colors[k]->addr : 0;
+            }
+            pass_tex[8] = depth ? depth->tex : nil;
+            pass_addr[8] = depth ? depth->addr : 0;
+        }
     }
 
     // ================= draws =================
@@ -2036,6 +2119,11 @@ void MetalRenderer::Impl::Flip(const FlipInfo& f) {
     }
     if (src && dump_frames && frame_count % dump_every == 0) {
         DumpFrame(dst);
+    }
+    if (!pass_dumps.empty()) {
+        Commit(true);
+        EnsureCommandBuffer();
+        WritePassDumps();
     }
     Commit(false);
     if (src) {
