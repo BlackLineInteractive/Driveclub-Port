@@ -119,7 +119,7 @@ u32 sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 
     const u32 left = (cmdbuf + kHwInitPacketSize) - p;
     if (left > 1) {
-        WriteNop(p, left - 2);
+        WriteNop(p, left - 1); // header + body fill the block exactly
     }
     return kHwInitPacketSize;
 }
@@ -135,7 +135,7 @@ u32 sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 
     const u32 left = (cmdbuf + kHwInitPacketSize) - p;
     if (left > 1) {
-        WriteNop(p, left - 2);
+        WriteNop(p, left - 1); // header + body fill the block exactly
     }
     return kHwInitPacketSize;
 }
@@ -253,8 +253,8 @@ s32 sceGnmInsertWaitFlipDone(u32* cmdbuf, u32 size, s32 vo_handle, u32 buf_idx) 
         return -1;
     }
 
-    // Packet Type 3: WaitRegMem, 5 body dwords
-    cmdbuf[0] = Type3(Op::WaitRegMem, 5);
+    // WAIT_REG_MEM: 6 body dwords, filling the 7 the caller reserved
+    cmdbuf[0] = Type3(Op::WaitRegMem, 6);
     cmdbuf[1] = 0x13u; // function: equal, memory poll
     const u64 poll_addr = (label_addr + buf_idx * sizeof(u64)) & ~3ULL;
     cmdbuf[2] = static_cast<u32>(poll_addr);

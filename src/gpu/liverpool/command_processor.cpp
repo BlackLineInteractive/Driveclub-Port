@@ -235,12 +235,6 @@ void CommandProcessor::SetRegs(u32 index, const u32* values, u32 count) {
 }
 
 void CommandProcessor::AfterGpu(std::function<void()> fn) {
-    static const bool tmp_sync = std::getenv("DC_TMP_SYNCFENCE") != nullptr;
-    if (tmp_sync) {
-        SyncRenderer();
-        fn();
-        return;
-    }
     if (renderer) {
         renderer->Signal(std::move(fn));
     } else {
@@ -370,9 +364,14 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
     const u32* p = cmds.data();
     const u32* end = p + cmds.size();
 
+    const u32* recent[4] = {}; // last packets, for desync reports
     while (p < end) {
         const u32 header = *p;
         const u32 type = HeaderType(header);
+        if (type == 3) {
+            std::memmove(recent, recent + 1, sizeof(recent) - sizeof(recent[0]));
+            recent[3] = p;
+        }
         if (header == 0 || type == 2) { // filler / trailing padding
             ++p;
             continue;
@@ -392,7 +391,16 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             continue;
         }
         if (type != 3) {
-            DC_WARN("gpu: unsupported PM4 packet type %u (header %#x)", type, header);
+            DC_WARN("gpu: unsupported PM4 packet type %u (header %#x) at +%#zx of %#zx dwords", type, header,
+                    static_cast<size_t>(p - cmds.data()), cmds.size());
+            DC_WARN("gpu:   around: %08x %08x %08x %08x [%08x] %08x %08x %08x", p[-4], p[-3], p[-2], p[-1], p[0], p[1],
+                    p[2], p[3]);
+            for (const u32* q : recent) {
+                if (q) {
+                    DC_WARN("gpu:   after +%#zx: %08x %08x %08x %08x %08x %08x", static_cast<size_t>(q - cmds.data()),
+                            q[0], q[1], q[2], q[3], q[4], q[5]);
+                }
+            }
             return;
         }
         const u32 op = HeaderOpcode(header);
