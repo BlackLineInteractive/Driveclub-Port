@@ -343,6 +343,15 @@ struct MetalRenderer::Impl {
     };
     std::vector<PassDump> pass_dumps;
     std::vector<u64> peek_addrs; // DC_PEEK_CS=<cs>: its V# buffers, printed after the traced frame
+    // DC_PROBE=<shader>:<pc>:<x>,<y>: registers of one fragment (compute: group x, thread y)
+    // before instruction pc, for every draw/dispatch of the traced frame using that shader.
+    struct Probe {
+        u64 shader = 0;
+        u32 pc = ~0u, x = 0, y = 0;
+    } probe;
+    id<MTLBuffer> probe_buf = nil;
+    std::vector<std::string> probe_slots; // what each slot of probe_buf belongs to
+    static constexpr u32 kProbeSlots = 64;
     id<MTLTexture> pass_tex[9] = {};
     u64 pass_addr[9] = {};
     bool stats = false;                // DC_GPU_STATS: per-second GPU time and submit counts
@@ -388,6 +397,15 @@ struct MetalRenderer::Impl {
             dump_texture = std::strtoull(e, nullptr, 16);
         }
         sync_shaders = std::getenv("DC_SYNC_SHADERS") != nullptr;
+        if (const char* e = std::getenv("DC_PROBE")) {
+            char* q = nullptr;
+            probe.shader = std::strtoull(e, &q, 16);
+            probe.pc = *q == ':' ? std::strtoul(q + 1, &q, 16) : 0;
+            probe.x = *q == ':' ? (q[1] == '*' ? ~0u : std::strtoul(q + 1, &q, 10)) : 0; // '*': any pixel
+            probe.y = *q == ',' ? std::strtoul(q + 1, &q, 10) : 0;
+            probe_buf = [device newBufferWithLength:kProbeSlots * Shader::kProbeWords * 4 options:MTLResourceStorageModeShared];
+            std::memset(probe_buf.contents, 0, probe_buf.length);
+        }
         stats = std::getenv("DC_GPU_STATS") != nullptr;
         profile = std::getenv("DC_GPU_PROFILE") != nullptr;
         compiler = std::make_unique<ShaderCompiler>(device, 4);
@@ -1618,6 +1636,50 @@ struct MetalRenderer::Impl {
         return store;
     }
 
+    // Probe slot for this draw/dispatch of the probed shader, or -1.
+    int ProbeSlot(u64 shader, const std::string& what) {
+        if (!probe_buf || !trace || shader != probe.shader || probe_slots.size() >= kProbeSlots) {
+            return -1;
+        }
+        probe_slots.push_back(what);
+        return static_cast<int>(probe_slots.size() - 1);
+    }
+
+    void PrintProbes() {
+        const u32* d = static_cast<const u32*>(probe_buf.contents);
+        for (size_t k = 0; k < probe_slots.size(); ++k) {
+            const u32* w = d + k * Shader::kProbeWords;
+            if (!w[0]) {
+                DC_INFO("probe %zu (%s): not reached", k, probe_slots[k].c_str());
+                continue;
+            }
+            DC_INFO("probe %zu (%s) at %u,%u: exec=%#x vcc=%#x m0=%#x", k, probe_slots[k].c_str(), w[4], w[5], w[1], w[2], w[3]);
+            std::string line;
+            for (u32 n = 0; n < 96; ++n) {
+                float f;
+                std::memcpy(&f, &w[8 + n], 4);
+                char b[64];
+                std::snprintf(b, sizeof(b), " v%u=%08x(%g)", n, w[8 + n], f);
+                line += b;
+                if (n % 6 == 5) {
+                    DC_INFO("probe  %s", line.c_str());
+                    line.clear();
+                }
+            }
+            for (u32 n = 0; n < 104; ++n) {
+                char b[32];
+                std::snprintf(b, sizeof(b), " s%u=%08x", n, w[104 + n]);
+                line += b;
+                if (n % 8 == 7) {
+                    DC_INFO("probe  %s", line.c_str());
+                    line.clear();
+                }
+            }
+        }
+        probe_slots.clear();
+        std::memset(probe_buf.contents, 0, probe_buf.length);
+    }
+
     void Draw(const RegFile& r, const DrawCall& dc);
     void Dispatch(const RegFile& r, u32 x, u32 y, u32 z);
     void Flip(const FlipInfo& f);
@@ -1817,6 +1879,21 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
                 peek_addrs.push_back((u64(ps_ud[k]) | (u64(ps_ud[k + 1] & 0xFFF) << 32)) & kGpuAddrMask);
                 peek_addrs.push_back(peek_addrs.back() + 64);
             }
+            // DC_PEEK_PS_AT=<ud>:<byte offset>,...: 8 floats at V#(ud)+off, read when the draw is recorded
+            if (const char* at = std::getenv("DC_PEEK_PS_AT")) {
+                for (const char* q = at; *q;) {
+                    char* e = nullptr;
+                    const u32 n = std::strtoul(q, &e, 10);
+                    const u32 off = *e == ':' ? std::strtoul(e + 1, &e, 16) : 0;
+                    const u64 a = ((u64(ps_ud[n & 15]) | (u64(ps_ud[(n + 1) & 15] & 0xFFF) << 32)) & kGpuAddrMask) + off;
+                    if (Readable(a, 32)) {
+                        const float* v = reinterpret_cast<const float*>(a);
+                        DC_INFO("gpu:   peek ud%u+%#x: %g %g %g %g %g %g %g %g", n, off, v[0], v[1], v[2], v[3], v[4],
+                                v[5], v[6], v[7]);
+                    }
+                    q = *e ? e + 1 : e;
+                }
+            }
         }
     }
     // ---- resources ----
@@ -1836,6 +1913,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     }
 
     // ---- functions ----
+    const int probe_slot = ps ? ProbeSlot(ps_addr, "draw " + std::to_string(draw_count)) : -1;
     const bool rect = prim == PrimType::RectList;
     Shader::MslOptions vo;
     vo.rect_list = rect;
@@ -1860,7 +1938,13 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         }
         fo.textures = ps_types;
         fo.depth_target = depth != nullptr;
+        if (probe_slot >= 0) {
+            fo.probe_pc = probe.pc;
+            fo.probe_x = probe.x;
+            fo.probe_y = probe.y;
+        }
         ps_key = Hash(ps->hash);
+        ps_key = Hash(fo.probe_pc, ps_key);
         ps_key = Hash(fo.depth_target, ps_key);
         ps_key = Fnv(fo.ps_input_cntl.data(), sizeof(fo.ps_input_cntl), ps_key);
         ps_key = Hash(fo.vs_param_mask, ps_key);
@@ -1942,7 +2026,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
                 done_cv.notify_all();
             });
         }
-        if (!sync_shaders) {
+        if (!sync_shaders && probe_slot < 0) { // probed draws must run: wait
             if (trace) DC_INFO("gpu:   skipped: pipeline compiling");
             return;
         }
@@ -2052,6 +2136,9 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         }
         for (u32 u = 0; u < ps_res.smp.size() && u < 16; ++u) {
             [enc setFragmentSamplerState:ps_res.smp[u] atIndex:u];
+        }
+        if (probe_slot >= 0) {
+            [enc setFragmentBuffer:probe_buf offset:u64(probe_slot) * Shader::kProbeWords * 4 atIndex:Shader::kProbeBinding];
         }
     }
 
@@ -2258,7 +2345,14 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
 
     Shader::MslOptions o;
     o.textures = types;
+    const int probe_slot = ProbeSlot(addr, "dispatch " + std::to_string(stat_dispatches));
+    if (probe_slot >= 0) {
+        o.probe_pc = probe.pc;
+        o.probe_x = probe.x;
+        o.probe_y = probe.y;
+    }
     u64 key = Hash(cs->hash);
+    key = Hash(o.probe_pc, key);
     key = Hash(rsrc2, key);
     key = Fnv(types.data(), types.size() * sizeof(TextureType), key);
     const u32 group = tx * ty * tz;
@@ -2326,6 +2420,9 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
     }
     for (u32 u = 0; u < res.smp.size() && u < 16; ++u) {
         [e setSamplerState:res.smp[u] atIndex:u];
+    }
+    if (probe_slot >= 0) {
+        [e setBuffer:probe_buf offset:u64(probe_slot) * Shader::kProbeWords * 4 atIndex:Shader::kProbeBinding];
     }
     // LDS_SIZE is in 128-dword units on CI; Metal wants a multiple of 16 bytes.
     const u32 lds = std::max<u32>(16, Bits(rsrc2, 15, 9) * 512);
@@ -2438,6 +2535,11 @@ void MetalRenderer::Impl::Flip(const FlipInfo& f) {
         Commit(true);
         EnsureCommandBuffer();
         WritePassDumps();
+    }
+    if (probe_buf && !probe_slots.empty()) {
+        Commit(true);
+        EnsureCommandBuffer();
+        PrintProbes();
     }
     if (!peek_addrs.empty()) {
         Commit(true);

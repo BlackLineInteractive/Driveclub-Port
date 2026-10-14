@@ -219,6 +219,9 @@ private:
 };
 
 void Emitter::Emit(const Inst& i) {
+    if (i.pc == o.probe_pc && p.stage != Stage::Vertex) {
+        body += "    /*DC_PROBE*/\n";
+    }
     switch (i.enc) {
     case Enc::SOP2: EmitSop2(i); break;
     case Enc::SOPK: EmitSopk(i); break;
@@ -1519,6 +1522,31 @@ std::string Emitter::Run() {
         dl("uint v" + N(k) + " = " + vinit[k] + ";");
     }
 
+    // Register probe: the marker left in front of the probed instruction.
+    const bool probe = o.probe_pc != ~0u && p.stage != Stage::Vertex && body.find("/*DC_PROBE*/") != std::string::npos;
+    if (probe) {
+        // x == ~0: the first invocation to get there (any pixel / lane).
+        const bool any = o.probe_x == ~0u;
+        std::string dump = any ? "    if (atomic_exchange_explicit((device atomic_uint*)&dbg[7], 1u, memory_order_relaxed) == 0u) {"
+                         : p.stage == Stage::Fragment
+                             ? "    if (uint(pin.pos.x) == " + N(o.probe_x) + "u && uint(pin.pos.y) == " + N(o.probe_y) + "u) {"
+                             : "    if (dc_gid.x == " + N(o.probe_x) + "u && dc_lidx == " + N(o.probe_y) + "u) {";
+        dump += " dbg[0] = 1u; dbg[1] = exec_lo; dbg[2] = vcc_lo; dbg[3] = m0r;";
+        dump += p.stage == Stage::Fragment ? " dbg[4] = uint(pin.pos.x); dbg[5] = uint(pin.pos.y);"
+                                           : " dbg[4] = dc_gid.x; dbg[5] = dc_lidx;";
+        for (u32 k = 0; k < std::min<u32>(max_vgpr, 96); ++k) {
+            dump += " dbg[" + N(8 + k) + "] = v" + N(k) + ";";
+        }
+        for (u32 k = 0; k < std::min<u32>(std::max(max_sgpr, nud), 104); ++k) {
+            dump += " dbg[" + N(104 + k) + "] = s" + N(k) + ";";
+        }
+        dump += " }\n";
+        for (size_t at; (at = body.find("    /*DC_PROBE*/\n")) != std::string::npos;) {
+            body.replace(at, std::strlen("    /*DC_PROBE*/\n"), dump);
+        }
+    }
+    const std::string probe_param = probe ? ", device uint* dbg [[buffer(" + N(kProbeBinding) + ")]]" : "";
+
     std::string wrapped;
     if (structured) {
         wrapped = "    uint tgt_ = 0u;\n" + body;
@@ -1599,7 +1627,7 @@ std::string Emitter::Run() {
             src += "    float depth [[depth(any)]];\n";
         }
         src += "};\n\n";
-        src += "fragment PsOut main0(PsIn pin [[stage_in]], " + mem_params + TexParams(true) + ") {\n";
+        src += "fragment PsOut main0(PsIn pin [[stage_in]], " + mem_params + probe_param + TexParams(true) + ") {\n";
         src += "    DcMem mem = {gm0, gm1, &gmap};\n    PsOut out = {};\n    bool dc_exported = false;\n";
         src += "    uint dc_qlane = (uint(pin.pos.x) & 1u) | ((uint(pin.pos.y) & 1u) << 1);\n";
         src += "    (void)mem; (void)dc_qlane;\n";
@@ -1607,7 +1635,7 @@ std::string Emitter::Run() {
     } else {
         src += "kernel void main0(uint3 dc_tid [[thread_position_in_threadgroup]], "
                "uint3 dc_gid [[threadgroup_position_in_grid]], uint dc_lidx [[thread_index_in_threadgroup]], " +
-               mem_params + ", device uint* gds [[buffer(5)]], threadgroup uint* lds [[threadgroup(0)]]" + TexParams(true) +
+               mem_params + ", device uint* gds [[buffer(5)]], threadgroup uint* lds [[threadgroup(0)]]" + probe_param + TexParams(true) +
                ") {\n";
         src += "    DcMem mem = {gm0, gm1, &gmap};\n    uint dc_lane = dc_lidx & 63u;\n";
         src += "    (void)mem; (void)dc_lane; (void)lds; (void)gds;\n";

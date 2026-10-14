@@ -63,6 +63,9 @@ struct TextureType {
 
 enum class OutType : u8 { Float, Uint, Sint };
 
+constexpr u32 kProbeWords = 256;
+constexpr u32 kProbeBinding = 7;
+
 struct MslOptions {
     // Vertex.
     bool rect_list = false; // expand RECTLIST: 3 vertices -> 2 triangles
@@ -74,6 +77,13 @@ struct MslOptions {
     u32 col_format = 0;                  // SPI_SHADER_COL_FORMAT
     std::array<OutType, 8> mrt_type{};
     bool depth_target = true; // false drops depth exports (no depth attachment)
+    // Register probe (debugging): before the instruction at `probe_pc`, the
+    // fragment at pixel (probe_x, probe_y) -- for compute, the lane with
+    // threadgroup x == probe_x and thread index == probe_y -- writes its
+    // registers to buffer(7): [0] hit, [1] exec, [2] vcc, [3] m0, [8 + n] vN
+    // (n < 96), [104 + n] sN (n < 104). kProbeWords per slot.
+    u32 probe_pc = ~0u;
+    u32 probe_x = 0, probe_y = 0;
     // Both.
     std::vector<TextureType> textures; // per Program::images slot
 };
