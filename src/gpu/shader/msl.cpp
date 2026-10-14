@@ -15,8 +15,6 @@ using namespace Gcn;
 
 namespace {
 
-constexpr u32 kFetchPcBase = 0x100000;
-
 std::string Hex(u32 v) {
     char b[16];
     std::snprintf(b, sizeof(b), "0x%xu", v);

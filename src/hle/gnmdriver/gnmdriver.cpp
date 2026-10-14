@@ -356,6 +356,12 @@ void FlipOnGpuThread(u32 vo_handle, u32 buf_idx, s64 flip_arg) {
         if (flip.address) {
             r->Flip(flip);
         }
+        // The flip is done when the host GPU has finished the frame: games reuse
+        // the frame's buffers once they see it, and the GPU may still be reading.
+        r->Signal([vo_handle, buf_idx, flip_arg] {
+            VideoOut::Driver::Instance().OnFlipDone(static_cast<s32>(vo_handle), buf_idx, flip_arg);
+        });
+        return;
     }
     vo.OnFlipDone(static_cast<s32>(vo_handle), buf_idx, flip_arg);
 }

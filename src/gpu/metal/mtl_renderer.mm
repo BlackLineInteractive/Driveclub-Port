@@ -270,9 +270,14 @@ struct MetalRenderer::Impl {
   std::deque<std::pair<u64, std::function<void()>>> signal_queue;
 
   // ---- caches ----
+  // A program is reused only while its whole code (and fetch subroutine) is
+  // unchanged: streaming puts other shaders at freed addresses, and GCN
+  // programs often share their first instructions (shadPS4 keys shaders by a
+  // hash of all of the code).
   struct ShaderEntry {
     std::unique_ptr<Program> prog;
-    u32 head[4] = {};
+    std::vector<u32> code;
+    std::vector<u32> fetch;
   };
   std::unordered_map<u64, std::vector<ShaderEntry>> shaders;
   std::unordered_map<u64, id<MTLRenderPipelineState>> pipelines;
@@ -1097,13 +1102,16 @@ struct MetalRenderer::Impl {
     const u32 *code = reinterpret_cast<const u32 *>(addr);
     auto &list = shaders[addr ^ (static_cast<u64>(stage) << 60)];
     for (auto &e : list) {
-      if (std::memcmp(e.head, code, sizeof(e.head)) != 0) {
+      if (!Readable(addr, e.code.size() * 4) ||
+          std::memcmp(e.code.data(), code, e.code.size() * 4) != 0) {
         continue;
       }
       const Program &p = *e.prog;
       if (p.fetch_ud >= 0) {
         const u64 f = u64(ud[p.fetch_ud]) | (u64(ud[p.fetch_ud + 1]) << 32);
-        if (f != p.fetch_address) {
+        if (f != p.fetch_address || !Readable(f, e.fetch.size() * 4) ||
+            std::memcmp(e.fetch.data(), reinterpret_cast<const void *>(f),
+                        e.fetch.size() * 4) != 0) {
           continue;
         }
       }
@@ -1128,7 +1136,17 @@ struct MetalRenderer::Impl {
           .write(reinterpret_cast<const char *>(code), size);
     }
     ShaderEntry e;
-    std::memcpy(e.head, code, sizeof(e.head));
+    u32 bytes = 16;
+    for (const auto &i : prog->code) {
+      if (i.pc < Shader::kFetchPcBase) {
+        bytes = std::max<u32>(bytes, i.pc + i.size * 4);
+      }
+    }
+    e.code.assign(code, code + bytes / 4);
+    if (prog->fetch_address) {
+      const auto *f = reinterpret_cast<const u32 *>(prog->fetch_address);
+      e.fetch.assign(f, f + prog->fetch_bytes / 4);
+    }
     e.prog = std::move(prog);
     list.push_back(std::move(e));
     return list.back().prog.get();
@@ -3579,8 +3597,11 @@ void MetalRenderer::Dispatch(const RegFile &regs, std::uint32_t x,
 
 void MetalRenderer::OnSubmit() {
   std::scoped_lock lk(impl->lock);
+  // DC_SERIAL: wait for the GPU after every submit (debug: rules out CPU/GPU
+  // races on guest memory).
+  static const bool serial = std::getenv("DC_SERIAL") != nullptr;
   @autoreleasepool {
-    impl->Commit(false);
+    impl->Commit(serial);
   }
 }
 

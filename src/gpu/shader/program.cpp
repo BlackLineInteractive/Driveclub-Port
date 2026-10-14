@@ -12,10 +12,6 @@ using namespace Gcn;
 
 namespace {
 
-// Fetch-subroutine instructions get pcs in their own range so they never
-// collide with branch targets of the main program.
-constexpr u32 kFetchPcBase = 0x100000;
-
 bool Readable(u64 addr, u64 size) {
     Core::Memory::Vma vma;
     return addr && Core::Memory::Query(addr, false, &vma) && addr + size <= vma.start + vma.size;
@@ -225,6 +221,7 @@ bool InlineFetch(Program& p, const BuildInput& in) {
         }
         const u32* fcode = reinterpret_cast<const u32*>(target);
         auto fetch = DecodeProgram(fcode, 4096, true);
+        p.fetch_bytes = fetch.empty() ? 0 : fetch.back().pc + fetch.back().size * 4;
         if (!fetch.empty() && fetch.back().enc == Enc::SOP1 &&
             static_cast<Sop1>(fetch.back().op) == Sop1::S_SETPC_B64) {
             fetch.pop_back();

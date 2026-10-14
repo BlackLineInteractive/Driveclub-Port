@@ -46,11 +46,16 @@ struct ImageResource {
     u32 sampler_index = 0;
 };
 
+// Fetch-subroutine instructions get pcs in their own range so they never
+// collide with branch targets of the main program.
+constexpr u32 kFetchPcBase = 0x100000;
+
 struct Program {
     Stage stage = Stage::Vertex;
     u64 address = 0;      // guest address of the main program
     u64 fetch_address = 0; // inlined fetch subroutine, if any
     int fetch_ud = -1;     // user-data index holding its address
+    u32 fetch_bytes = 0;   // length of the fetch subroutine (with its S_SETPC)
     u64 hash = 0;         // of the code bytes (plus fetch code)
     u32 num_user_sgprs = 0;
     u32 vgpr_comp_cnt = 0; // VS: system VGPRs after the vertex index; CS: TIDIG_COMP_CNT
