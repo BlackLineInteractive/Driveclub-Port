@@ -1174,8 +1174,14 @@ void Emitter::EmitImage(const Inst& i) {
     const std::string lod = l ? vf(cur) : "";
 
     std::string coord;
+    std::string layer = r;
     if (tt.dim == TexDim::Tex3D) {
         coord = "float3(" + s + ", " + tc + ", " + r + ")";
+    } else if (tt.cube) {
+        // Cube math leaves face coordinates in [1, 2]; the face (or 8 * slice + face
+        // for cube arrays) indexes the faces stored as array layers.
+        coord = "float2(" + s + " - 1.0f, " + tc + " - 1.0f)";
+        layer = "(" + r + " - 2.0f * floor(" + r + " * 0.125f))";
     } else {
         coord = "float2(" + s + ", " + tc + ")";
     }
@@ -1187,7 +1193,7 @@ void Emitter::EmitImage(const Inst& i) {
     }
     std::string args = smp + ", " + coord;
     if (tt.dim == TexDim::Tex2DArray) {
-        args += ", uint(max(rint(" + r + "), 0.0f))";
+        args += ", uint(max(rint(" + layer + "), 0.0f))";
     }
     if (op == Mimg::IMAGE_GET_LOD) {
         if (!frag) {

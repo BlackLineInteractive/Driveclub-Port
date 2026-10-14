@@ -58,6 +58,7 @@ struct TextureType {
     TexDim dim = TexDim::Tex2D;
     TexSample sample = TexSample::Float;
     u8 compare = 3; // depth-compare sampling: S# DEPTH_COMPARE_FUNC (ref <op> texel), default LEQUAL
+    bool cube = false; // a cube (Tex2DArray of faces) sampled with V_CUBE* coordinates
     bool operator==(const TextureType&) const = default;
 };
 

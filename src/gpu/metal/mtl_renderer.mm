@@ -1097,6 +1097,7 @@ struct MetalRenderer::Impl {
             tt.dim = TexDim::Tex3D;
         } else if (ttype == 11 || ttype == 12 || ttype == 13 || ttype == 15) {
             tt.dim = TexDim::Tex2DArray;
+            tt.cube = ttype == 11 && !storage;
         }
         *type_out = tt;
         if (!addr || ttype < 8 || dfmt == 0) {
