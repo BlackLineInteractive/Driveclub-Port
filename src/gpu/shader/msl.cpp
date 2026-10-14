@@ -1478,7 +1478,7 @@ std::string Emitter::Run() {
             case 8: val = "as_type<uint>(pin.pos.x)"; break;
             case 9: val = "as_type<uint>(pin.pos.y)"; break;
             case 10: val = "as_type<uint>(pin.pos.z)"; break;
-            case 11: val = "as_type<uint>(pin.pos.w)"; break;
+            case 11: val = "as_type<uint>(1.0f / pin.pos.w)"; break; // GCN gives clip W, Metal 1/W
             case 12: val = "as_type<uint>(pin.ff ? 1.0f : -1.0f)"; break;
             default: break;
             }

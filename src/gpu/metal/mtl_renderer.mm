@@ -1642,6 +1642,10 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
                 db_control, u64(r.ColorTarget(0, Reg::CB_BASE)) << 8, r.ColorTarget(0, Reg::CB_INFO),
                 r[Reg::CB_TARGET_MASK], u64(r[Reg::DB_Z_READ_BASE]) << 8, u64(r[Reg::DB_Z_WRITE_BASE]) << 8,
                 r[Reg::DB_Z_INFO], r[Reg::CB_BLEND0_CONTROL], r[Reg::SPI_SHADER_COL_FORMAT]);
+        if (r.ColorTarget(0, Reg::CB_VIEW)) {
+            DC_INFO("gpu:   cb0 view=%#x attrib=%#x pitch=%#x slice=%#x", r.ColorTarget(0, Reg::CB_VIEW),
+                    r.ColorTarget(0, Reg::CB_ATTRIB), r.ColorTarget(0, Reg::CB_PITCH), r.ColorTarget(0, Reg::CB_SLICE));
+        }
     }
     if (!vs_addr) {
         return;
