@@ -62,6 +62,7 @@ inline ColorFormatInfo ColorTargetFormat(u32 cb_format, u32 number_type) {
         f = uint ? MTLPixelFormatRGBA32Uint : sint ? MTLPixelFormatRGBA32Sint : MTLPixelFormatRGBA32Float;
         break;
     case ColorFormat::C10_11_11: // R11 G11 B10, red in the low bits
+    case ColorFormat::C11_11_10: // R10 G11 B11: no Metal format, but targets stay on the GPU
         f = MTLPixelFormatRG11B10Float;
         break;
     case ColorFormat::C2_10_10_10:

@@ -41,6 +41,7 @@ constexpr u32 COMPUTE_USER_DATA_0 = 0x2E40;
 // ---- context state (SET_CONTEXT_REG window, 0xA000) ----
 constexpr u32 DB_RENDER_CONTROL = 0xA000;
 constexpr u32 DB_DEPTH_VIEW = 0xA002;
+constexpr u32 DB_HTILE_DATA_BASE = 0xA005;
 constexpr u32 DB_DEPTH_CLEAR = 0xA00B;
 constexpr u32 PA_SC_SCREEN_SCISSOR_TL = 0xA00C;
 constexpr u32 PA_SC_SCREEN_SCISSOR_BR = 0xA00D;
@@ -88,7 +89,8 @@ constexpr u32 VGT_PRIMITIVE_RESTART = 0xA2A5; // VGT_MULTI_PRIM_IB_RESET_EN
 constexpr u32 CB_COLOR0_BASE = 0xA318;
 constexpr u32 kColorTargetStride = 15; // CB_COLORn_* blocks are 15 dwords apart
 // Offsets inside one CB_COLORn block.
-constexpr u32 CB_BASE = 0, CB_PITCH = 1, CB_SLICE = 2, CB_VIEW = 3, CB_INFO = 4, CB_ATTRIB = 5;
+constexpr u32 CB_BASE = 0, CB_PITCH = 1, CB_SLICE = 2, CB_VIEW = 3, CB_INFO = 4, CB_ATTRIB = 5, CB_CMASK = 7,
+              CB_CLEAR_WORD0 = 11, CB_CLEAR_WORD1 = 12;
 
 // ---- user config (SET_UCONFIG_REG window, 0xC000) ----
 constexpr u32 VGT_PRIMITIVE_TYPE = 0xC242;
@@ -155,8 +157,14 @@ namespace ColorInfo {
 constexpr u32 Format(u32 info) { return Bits(info, 2, 5); }      // COLOR_FORMAT
 constexpr u32 NumberType(u32 info) { return Bits(info, 8, 3); }  // NUMBER_TYPE
 constexpr u32 CompSwap(u32 info) { return Bits(info, 11, 2); }   // COMP_SWAP
+constexpr bool FastClear(u32 info) { return Bits(info, 13, 1); } // CMASK holds fast-clear state
 constexpr u32 kNumberSrgb = 6; // CB NUMBER_TYPE differs from descriptor NUM_FORMAT here
 } // namespace ColorInfo
+
+// DB_Z_INFO fields.
+namespace ZInfo {
+constexpr bool TileSurface(u32 info) { return Bits(info, 29, 1); } // HTILE in use
+} // namespace ZInfo
 
 // CB_COLOR_FORMAT values.
 namespace ColorFormat {

@@ -24,6 +24,7 @@ public:
     void Signal(std::function<void()> done) override;
     void NoteConstDump(std::uint64_t addr, std::uint32_t bytes) override;
     void Flip(const FlipInfo& flip) override;
+    void OnContextRegs(const std::uint32_t* body, std::uint32_t body_dwords) override;
     bool DmaData(std::uint32_t dst_sel, std::uint64_t dst, std::uint32_t src_sel, std::uint64_t src,
                  std::uint32_t bytes) override;
     std::uint8_t* Gds() override;

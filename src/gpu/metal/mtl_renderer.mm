@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
@@ -20,6 +21,7 @@
 
 #include "common/log.h"
 #include "core/memory.h"
+#include "gpu/liverpool/pm4.h"
 #include "gpu/liverpool/registers.h"
 #include "gpu/liverpool/tiling.h"
 #include "gpu/metal/mtl_compiler.h"
@@ -42,6 +44,8 @@ using Shader::TextureType;
 namespace {
 
 constexpr u64 kUploadChunk = 4ull << 20;
+constexpr u64 kGpuAddrMask = (1ull << 40) - 1; // Liverpool virtual addresses are 40 bits
+constexpr u32 kNopSizeHint = 0xC0001000;        // one-dword NOP carrying a target size
 
 u64 Fnv(const void* data, size_t size, u64 h = 0xcbf29ce484222325ull) {
     const auto* p = static_cast<const u8*>(data);
@@ -72,6 +76,69 @@ Rect ScissorReg(u32 tl, u32 br) {
 }
 Rect Intersect(Rect a, Rect b) {
     return {std::max(a.x0, b.x0), std::max(a.y0, b.y0), std::min(a.x1, b.x1), std::min(a.y1, b.y1)};
+}
+
+float Half(u32 h) {
+    const u32 e = (h >> 10) & 0x1F, m = h & 0x3FF;
+    const float v = e == 0 ? std::ldexp(static_cast<float>(m), -24)
+                  : e == 31 ? (m ? NAN : INFINITY)
+                            : std::ldexp(static_cast<float>(m | 0x400), static_cast<int>(e) - 25);
+    return (h & 0x8000) ? -v : v;
+}
+
+// Unsigned small float with a 5-bit exponent and `mbits` of mantissa (R11G11B10).
+float SmallFloat(u32 v, u32 mbits) {
+    const u32 e = (v >> mbits) & 0x1F, m = v & ((1u << mbits) - 1);
+    if (e == 0) {
+        return std::ldexp(static_cast<float>(m), -14 - static_cast<int>(mbits));
+    }
+    return e == 31 ? INFINITY : std::ldexp(static_cast<float>(m | (1u << mbits)), static_cast<int>(e) - 15 - static_cast<int>(mbits));
+}
+
+// CB_COLOR_CLEAR_WORD0/1 (the target's packed format) as a Metal clear color.
+MTLClearColor ClearColor(u32 info, u32 w0, u32 w1) {
+    const u32 fmt = ColorInfo::Format(info), nt = ColorInfo::NumberType(info);
+    const bool snorm = nt == NumFormat::Snorm, integer = nt == NumFormat::Uint || nt == NumFormat::Sint;
+    auto n8 = [&](u32 v) { return integer ? double(v & 0xFF) : snorm ? std::max(-1.0, s8(v) / 127.0) : (v & 0xFF) / 255.0; };
+    auto n16 = [&](u32 v) {
+        v &= 0xFFFF;
+        return nt == NumFormat::Float ? double(Half(v)) : integer ? double(v) : snorm ? std::max(-1.0, s16(v) / 32767.0) : v / 65535.0;
+    };
+    auto f32 = [&](u32 v) {
+        float f;
+        std::memcpy(&f, &v, 4);
+        return integer ? double(v) : double(f);
+    };
+    double c[4] = {0, 0, 0, integer ? 1.0 : 1.0};
+    switch (fmt) {
+    case ColorFormat::C8: c[0] = n8(w0); break;
+    case ColorFormat::C8_8: c[0] = n8(w0); c[1] = n8(w0 >> 8); break;
+    case ColorFormat::C8_8_8_8:
+        for (u32 k = 0; k < 4; ++k) {
+            c[k] = n8(w0 >> (8 * k));
+        }
+        if (ColorInfo::CompSwap(info) == 1) { // BGRA in memory
+            std::swap(c[0], c[2]);
+        }
+        break;
+    case ColorFormat::C16: c[0] = n16(w0); break;
+    case ColorFormat::C16_16: c[0] = n16(w0); c[1] = n16(w0 >> 16); break;
+    case ColorFormat::C16_16_16_16: c[0] = n16(w0); c[1] = n16(w0 >> 16); c[2] = n16(w1); c[3] = n16(w1 >> 16); break;
+    case ColorFormat::C32: c[0] = f32(w0); break;
+    case ColorFormat::C32_32: c[0] = f32(w0); c[1] = f32(w1); break;
+    case ColorFormat::C10_11_11:
+        c[0] = SmallFloat(w0 & 0x7FF, 6); c[1] = SmallFloat((w0 >> 11) & 0x7FF, 6); c[2] = SmallFloat(w0 >> 22, 5);
+        break;
+    case ColorFormat::C11_11_10:
+        c[0] = SmallFloat(w0 & 0x3FF, 5); c[1] = SmallFloat((w0 >> 10) & 0x7FF, 6); c[2] = SmallFloat(w0 >> 21, 6);
+        break;
+    case ColorFormat::C2_10_10_10:
+        c[0] = (w0 & 0x3FF) / 1023.0; c[1] = ((w0 >> 10) & 0x3FF) / 1023.0; c[2] = ((w0 >> 20) & 0x3FF) / 1023.0;
+        c[3] = (w0 >> 30) / 3.0;
+        break;
+    default: break;
+    }
+    return MTLClearColorMake(c[0], c[1], c[2], c[3]);
 }
 
 struct PipelineKey {
@@ -164,14 +231,35 @@ struct MetalRenderer::Impl {
     std::unordered_map<u32, id<MTLDepthStencilState>> depth_states;
     std::unordered_map<u64, id<MTLSamplerState>> samplers;
 
+    // Guest surfaces rendered on the host GPU stay there. The same address can
+    // be bound with different sizes or formats (aliased memory); each variant
+    // keeps its own texture, and readers get the one written last.
     struct RenderTarget {
         id<MTLTexture> tex = nil;
         u64 addr = 0;
         u32 width = 0, height = 0;
         bool initialized = false;
+        bool clear_pending = false; // fast-cleared (CMASK/HTILE): next pass clears
+        MTLClearColor clear_color{};
+        double clear_depth = 1.0;
+        u64 written = 0; // write_seq of the last pass/dispatch writing it
     };
-    std::unordered_map<u64, RenderTarget> color_targets; // by address
-    std::unordered_map<u64, RenderTarget> depth_targets;
+    using TargetMap = std::unordered_map<u64, std::vector<std::unique_ptr<RenderTarget>>>;
+    TargetMap color_targets; // by address
+    TargetMap depth_targets;
+    u64 write_seq = 0;
+
+    // Fast-clear metadata surfaces (CMASK / HTILE) -> the surface they describe.
+    struct Meta {
+        u64 target = 0;
+        bool depth = false;
+    };
+    std::unordered_map<u64, Meta> metas;
+
+    // Render target sizes the Gnm driver hides in a NOP after the CB/DB
+    // register writes (width | height << 16); 0 when absent.
+    u32 cb_extent[8] = {};
+    u32 db_extent = 0;
 
     // Guest textures are re-uploaded when their memory changes. Each keeps
     // hashes of its 64 KB chunks; a texture that never changed has one chunk
@@ -436,9 +524,12 @@ struct MetalRenderer::Impl {
         } else if (src_sel != 2 && !Locate(src, bytes, &sbuf, &soff)) {
             return false;
         }
+        const u32 value = static_cast<u32>(src);
+        if (src_sel == 2 && dst_sel != 1 && value != ~0u && MarkMetaCleared(dst, bytes)) {
+            EndPass(); // the next pass over the surface loads its clear value
+        }
         EndPass();
         EnsureCommandBuffer();
-        const u32 value = static_cast<u32>(src);
         if (sbuf) {
             id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
             [b copyFromBuffer:sbuf sourceOffset:soff toBuffer:dbuf destinationOffset:doff size:bytes];
@@ -847,7 +938,7 @@ struct MetalRenderer::Impl {
 
     // Decodes a T# and returns a Metal texture for it.
     id<MTLTexture> GetTexture(const u32 t[8], TextureType* type_out, bool storage = false) {
-        const u64 addr = (u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8;
+        const u64 addr = ((u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8) & kGpuAddrMask;
         const u32 dfmt = (t[1] >> 20) & 0x3F;
         const u32 nfmt = (t[1] >> 26) & 0xF;
         const u32 width = (t[2] & 0x3FFF) + 1;
@@ -873,9 +964,13 @@ struct MetalRenderer::Impl {
         }
 
         // Render-to-texture: sample the render target directly.
-        auto rt = color_targets.find(addr);
-        if (rt != color_targets.end() && tt.dim == TexDim::Tex2D) {
-            return rt->second.tex;
+        if (tt.dim == TexDim::Tex2D && !storage) {
+            if (RenderTarget* rt = Latest(color_targets, addr)) {
+                return rt->tex;
+            }
+            if (RenderTarget* rt = Latest(depth_targets, addr)) {
+                return rt->tex;
+            }
         }
         if (storage) {
             // Written by shaders: keep it GPU-side like a render target, so
@@ -887,6 +982,8 @@ struct MetalRenderer::Impl {
             const MTLPixelFormat f = fi.format == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm : fi.format;
             RenderTarget& target = GetColorTarget(addr, f, width, height);
             target.initialized = true;
+            target.clear_pending = false;
+            target.written = ++write_seq;
             return target.tex;
         }
 
@@ -1011,35 +1108,98 @@ struct MetalRenderer::Impl {
 
     // ================= render targets =================
 
-    RenderTarget& GetColorTarget(u64 addr, MTLPixelFormat fmt, u32 width, u32 height) {
-        RenderTarget& rt = color_targets[addr];
-        if (!rt.tex || rt.width != width || rt.height != height || rt.tex.pixelFormat != fmt) {
-            MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
-                                                                                         width:width
-                                                                                        height:height
-                                                                                     mipmapped:NO];
-            d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
-                      MTLTextureUsagePixelFormatView;
-            d.storageMode = MTLStorageModePrivate;
-            rt = {[device newTextureWithDescriptor:d], addr, width, height, false};
-            DC_INFO("gpu: render target %#llx %ux%u fmt %lu", addr, width, height, (unsigned long)fmt);
+    static RenderTarget* Latest(TargetMap& map, u64 addr) {
+        auto it = map.find(addr);
+        if (it == map.end()) {
+            return nullptr;
         }
-        return rt;
+        RenderTarget* best = nullptr;
+        for (auto& t : it->second) {
+            if (!best || t->written > best->written) {
+                best = t.get();
+            }
+        }
+        return best;
+    }
+
+    RenderTarget& GetTarget(TargetMap& map, u64 addr, MTLPixelFormat fmt, u32 width, u32 height, bool depth) {
+        auto& list = map[addr];
+        for (auto& t : list) {
+            if (t->width == width && t->height == height && t->tex.pixelFormat == fmt) {
+                return *t;
+            }
+        }
+        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+                                                                                     width:width
+                                                                                    height:height
+                                                                                 mipmapped:NO];
+        d.usage = depth ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead
+                        : MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+                              MTLTextureUsagePixelFormatView;
+        d.storageMode = MTLStorageModePrivate;
+        auto rt = std::make_unique<RenderTarget>();
+        rt->tex = [device newTextureWithDescriptor:d];
+        rt->addr = addr;
+        rt->width = width;
+        rt->height = height;
+        DC_INFO("gpu: %s target %#llx %ux%u fmt %lu", depth ? "depth" : "render", addr, width, height, (unsigned long)fmt);
+        list.push_back(std::move(rt));
+        return *list.back();
+    }
+
+    RenderTarget& GetColorTarget(u64 addr, MTLPixelFormat fmt, u32 width, u32 height) {
+        return GetTarget(color_targets, addr, fmt, width, height, false);
     }
 
     RenderTarget& GetDepthTarget(u64 addr, MTLPixelFormat fmt, u32 width, u32 height) {
-        RenderTarget& rt = depth_targets[addr];
-        if (!rt.tex || rt.width != width || rt.height != height || rt.tex.pixelFormat != fmt) {
-            MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
-                                                                                         width:width
-                                                                                        height:height
-                                                                                     mipmapped:NO];
-            d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-            d.storageMode = MTLStorageModePrivate;
-            rt = {[device newTextureWithDescriptor:d], addr, width, height, false};
-            DC_INFO("gpu: depth target %#llx %ux%u", addr, width, height);
+        return GetTarget(depth_targets, addr, fmt, width, height, true);
+    }
+
+    void NoteMeta(u64 meta, u64 target, bool depth) {
+        if (meta) {
+            metas[meta] = {target, depth};
         }
-        return rt;
+    }
+
+    // A fill or a clear shader rewrote metadata in [addr, addr + bytes):
+    // the surfaces it describes now read as their clear value.
+    bool MarkMetaCleared(u64 addr, u64 bytes) {
+        bool any = false;
+        for (const auto& [meta, m] : metas) {
+            if (meta < addr || meta >= addr + bytes) {
+                continue;
+            }
+            auto it = (m.depth ? depth_targets : color_targets).find(m.target);
+            if (it != (m.depth ? depth_targets : color_targets).end()) {
+                for (auto& t : it->second) {
+                    t->clear_pending = true;
+                }
+            }
+            any = true;
+            if (trace) {
+                DC_INFO("gpu:   fast clear of %s %#llx (meta %#llx)", m.depth ? "depth" : "color", m.target, meta);
+            }
+        }
+        return any;
+    }
+
+    void OnContextRegs(const u32* body, u32 n) {
+        if (n < 2) {
+            return;
+        }
+        const u32 reg = kContextRegBase + body[0];
+        const u32 count = n - 1;
+        const u32 base0 = Reg::CB_COLOR0_BASE, stride = Reg::kColorTargetStride;
+        if (reg >= base0 && reg < base0 + 8 * stride) {
+            const u32 cb = (reg - base0) / stride, field = (reg - base0) % stride;
+            if (field == Reg::CB_BASE) {
+                cb_extent[cb] = (count == 0x0E || count == 0x0D || count == 0x0B) && body[n] == kNopSizeHint ? body[n + 1] : 0;
+            } else if (field == Reg::CB_CMASK && count == 4 && body[n] == kNopSizeHint) {
+                cb_extent[cb] = body[n + 1];
+            }
+        } else if (reg == Reg::DB_Z_INFO) {
+            db_extent = count == 8 && body[21] == kNopSizeHint ? body[22] : 0;
+        }
     }
 
     void BeginPass(RenderTarget* colors[8], RenderTarget* depth, bool clear_depth, float depth_value) {
@@ -1050,32 +1210,42 @@ struct MetalRenderer::Impl {
         EnsureCommandBuffer();
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
         PassState ps;
+        u32 w = ~0u, h = ~0u;
+        const u64 seq = ++write_seq;
         for (u32 k = 0; k < 8; ++k) {
             if (!colors[k]) {
                 continue;
             }
             RenderTarget& rt = *colors[k];
             rp.colorAttachments[k].texture = rt.tex;
-            rp.colorAttachments[k].loadAction = rt.initialized ? MTLLoadActionLoad : MTLLoadActionClear;
-            rp.colorAttachments[k].clearColor = debug_clear ? MTLClearColorMake(0.1, 0.1, 0.3, 1) : MTLClearColorMake(0, 0, 0, 0);
+            rp.colorAttachments[k].loadAction = rt.initialized && !rt.clear_pending ? MTLLoadActionLoad : MTLLoadActionClear;
+            rp.colorAttachments[k].clearColor = rt.clear_pending ? rt.clear_color
+                                              : debug_clear ? MTLClearColorMake(0.1, 0.1, 0.3, 1) : MTLClearColorMake(0, 0, 0, 0);
             rp.colorAttachments[k].storeAction = MTLStoreActionStore;
             rt.initialized = true;
-            ps.color[k] = rt.addr;
-            pass_width = rt.width;
-            pass_height = rt.height;
+            rt.clear_pending = false;
+            rt.written = seq;
+            ps.color[k] = reinterpret_cast<u64>(&rt);
+            w = std::min(w, rt.width);
+            h = std::min(h, rt.height);
         }
         if (depth) {
+            const bool clear = clear_depth || depth->clear_pending || !depth->initialized;
             rp.depthAttachment.texture = depth->tex;
-            rp.depthAttachment.loadAction = (clear_depth || !depth->initialized) ? MTLLoadActionClear : MTLLoadActionLoad;
-            rp.depthAttachment.clearDepth = clear_depth ? depth_value : 1.0;
+            rp.depthAttachment.loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
+            rp.depthAttachment.clearDepth = clear_depth ? depth_value : depth->clear_pending ? depth->clear_depth : 1.0;
             rp.depthAttachment.storeAction = MTLStoreActionStore;
             depth->initialized = true;
-            ps.depth = depth->addr;
-            if (!ps.color[0] && !ps.color[1]) {
-                pass_width = depth->width;
-                pass_height = depth->height;
-            }
+            depth->clear_pending = false;
+            depth->written = seq;
+            ps.depth = reinterpret_cast<u64>(depth);
+            w = std::min(w, depth->width);
+            h = std::min(h, depth->height);
         }
+        pass_width = w;
+        pass_height = h;
+        rp.renderTargetWidth = w;
+        rp.renderTargetHeight = h;
         enc = [cmd renderCommandEncoderWithDescriptor:rp];
         pass = ps;
     }
@@ -1123,6 +1293,43 @@ struct MetalRenderer::Impl {
             types.push_back(tt);
             out.push_back({tex, img.has_sampler ? GetSampler(s) : nil});
         }
+    }
+
+    // Color target `k` as the CB registers describe it; notes its CMASK and
+    // clear color for fast clears.
+    RenderTarget& ColorTargetFor(const RegFile& r, u32 k) {
+        const u32 info = r.ColorTarget(k, Reg::CB_INFO);
+        const u64 base = u64(r.ColorTarget(k, Reg::CB_BASE)) << 8;
+        u32 width = ((r.ColorTarget(k, Reg::CB_PITCH) & 0x7FF) + 1) * 8;
+        const u32 slice = ((r.ColorTarget(k, Reg::CB_SLICE) & 0x3FFFFF) + 1) * 64;
+        u32 height = slice / width;
+        if (cb_extent[k]) { // the real size; pitch and slice are padded
+            width = cb_extent[k] & 0xFFFF;
+            height = cb_extent[k] >> 16;
+        }
+        const ColorFormatInfo cf = ColorTargetFormat(ColorInfo::Format(info), ColorInfo::NumberType(info));
+        RenderTarget& rt = GetColorTarget(base, cf.format, std::max(width, 1u), std::max(height, 1u));
+        rt.clear_color = ClearColor(info, r.ColorTarget(k, Reg::CB_CLEAR_WORD0), r.ColorTarget(k, Reg::CB_CLEAR_WORD1));
+        if (ColorInfo::FastClear(info)) {
+            NoteMeta(u64(r.ColorTarget(k, Reg::CB_CMASK)) << 8, base, false);
+        }
+        return rt;
+    }
+
+    // CB_COLOR_CONTROL.MODE = eliminate: tiles still fast-cleared get the
+    // clear color. Here: a target with a pending clear is cleared now.
+    void EliminateFastClear(const RegFile& r) {
+        const u32 info = r.ColorTarget(0, Reg::CB_INFO);
+        if (!ColorInfo::Format(info) || !r.ColorTarget(0, Reg::CB_BASE)) {
+            return;
+        }
+        RenderTarget& rt = ColorTargetFor(r, 0);
+        if (!rt.clear_pending) {
+            return;
+        }
+        RenderTarget* colors[8] = {&rt};
+        BeginPass(colors, nullptr, false, 1.0f);
+        EndPass();
     }
 
     void Draw(const RegFile& r, const DrawCall& dc);
@@ -1226,6 +1433,10 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     }
 
     // ---- attachments ----
+    if (cb_mode == 2 || cb_mode == 5) { // fast-clear eliminate / FMASK decompress
+        EliminateFastClear(r);
+        return;
+    }
     RenderTarget* colors[8] = {};
     MTLPixelFormat color_fmt[8] = {};
     OutType out_type[8] = {};
@@ -1241,11 +1452,8 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
                 col_format &= ~(0xFu << (4 * k));
                 continue;
             }
-            const u32 pitch = ((r.ColorTarget(k, Reg::CB_PITCH) & 0x7FF) + 1) * 8;
-            const u32 slice = ((r.ColorTarget(k, Reg::CB_SLICE) & 0x3FFFFF) + 1) * 64;
-            const u32 height = slice / pitch;
             const ColorFormatInfo cf = ColorTargetFormat(fmt, ColorInfo::NumberType(info));
-            colors[k] = &GetColorTarget(base, cf.format, pitch, height);
+            colors[k] = &ColorTargetFor(r, k);
             color_fmt[k] = cf.format;
             out_type[k] = cf.out;
             any_color = true;
@@ -1264,16 +1472,17 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         const u64 zbase = u64(r[Reg::DB_Z_WRITE_BASE]) << 8;
         const u32 size = r[Reg::DB_DEPTH_SIZE];
         u32 w = ((size & 0x7FF) + 1) * 8, h = (((size >> 11) & 0x7FF) + 1) * 8;
-        for (u32 k = 0; k < 8; ++k) { // Metal wants equally sized attachments
-            if (colors[k]) {
-                w = colors[k]->width;
-                h = colors[k]->height;
-                break;
-            }
+        if (db_extent) {
+            w = db_extent & 0xFFFF;
+            h = db_extent >> 16;
         }
         depth_fmt = zfmt == 1 ? MTLPixelFormatDepth16Unorm : MTLPixelFormatDepth32Float;
-        if (zbase) {
+        if (zbase && w && h) {
             depth = &GetDepthTarget(zbase, depth_fmt, w, h);
+            depth->clear_depth = r.F(Reg::DB_DEPTH_CLEAR);
+            if (ZInfo::TileSurface(z_info)) {
+                NoteMeta(u64(r[Reg::DB_HTILE_DATA_BASE]) << 8, zbase, true);
+            }
         } else {
             depth_fmt = MTLPixelFormatInvalid;
         }
@@ -1285,14 +1494,18 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
 
     PassState want;
     for (u32 k = 0; k < 8; ++k) {
-        want.color[k] = colors[k] ? colors[k]->addr : 0;
+        want.color[k] = reinterpret_cast<u64>(colors[k]);
     }
-    want.depth = depth ? depth->addr : 0;
+    want.depth = reinterpret_cast<u64>(depth);
     if (depth_clear && depth) {
         BeginPass(colors, depth, true, r.F(Reg::DB_DEPTH_CLEAR));
         return; // the draw only exists to clear depth
     }
-    if (!enc || !(want == pass)) {
+    bool pending_clear = depth && depth->clear_pending;
+    for (u32 k = 0; k < 8; ++k) {
+        pending_clear = pending_clear || (colors[k] && colors[k]->clear_pending);
+    }
+    if (!enc || !(want == pass) || pending_clear) {
         BeginPass(colors, depth, false, 1.0f);
     }
 
@@ -1641,6 +1854,14 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
         return;
     }
     ++stat_dispatches;
+    // A shader writing straight to a CMASK/HTILE surface is a fast clear.
+    for (u32 k = 0; k + 1 < 16 && !metas.empty(); ++k) {
+        const u64 base = (u64(ud[k]) | (u64(ud[k + 1] & 0xFFF) << 32)) & kGpuAddrMask;
+        if (metas.count(base) && MarkMetaCleared(base, 1)) {
+            EndPass();
+            return;
+        }
+    }
     Program* cs = GetProgram(Stage::Compute, addr, ud, Bits(rsrc2, 1, 5), Bits(rsrc2, 11, 2), rsrc2);
     if (!cs) {
         return;
@@ -1767,16 +1988,16 @@ void MetalRenderer::Impl::Flip(const FlipInfo& f) {
 
     id<MTLTexture> src = nil;
     float scale[2] = {1.0f, 1.0f};
-    auto rt = color_targets.find(f.address);
-    if (rt != color_targets.end() && rt->second.tex) {
-        id<MTLTexture> t = rt->second.tex;
+    RenderTarget* rt = Latest(color_targets, f.address);
+    if (rt && rt->tex) {
+        id<MTLTexture> t = rt->tex;
         // Scan-out shows the stored bytes: sample sRGB targets without decoding.
         if (t.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB) {
             t = [t newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
         }
         src = t;
-        scale[0] = static_cast<float>(f.width) / static_cast<float>(rt->second.width);
-        scale[1] = static_cast<float>(f.height) / static_cast<float>(rt->second.height);
+        scale[0] = static_cast<float>(f.width) / static_cast<float>(rt->width);
+        scale[1] = static_cast<float>(f.height) / static_cast<float>(rt->height);
     } else if (Readable(f.address, u64(f.pitch) * f.height * 4)) {
         // Nothing rendered there on the GPU: the CPU wrote the image.
         MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -1823,7 +2044,7 @@ void MetalRenderer::Impl::Flip(const FlipInfo& f) {
     }
     if (frame_count <= 3 || frame_count % 300 == 0) {
         DC_INFO("gpu: flip #%llu %#llx %ux%u (%s), %llu draws so far", frame_count, f.address, f.width, f.height,
-                rt != color_targets.end() ? "gpu target" : "cpu memory", draw_count);
+                rt ? "gpu target" : "cpu memory", draw_count);
     }
 }
 
@@ -1897,6 +2118,11 @@ bool MetalRenderer::DmaData(std::uint32_t dst_sel, std::uint64_t dst, std::uint3
     @autoreleasepool {
         return impl->DmaData(dst_sel, dst, src_sel, src, bytes);
     }
+}
+
+void MetalRenderer::OnContextRegs(const std::uint32_t* body, std::uint32_t body_dwords) {
+    std::scoped_lock lk(impl->lock);
+    impl->OnContextRegs(body, body_dwords);
 }
 
 void MetalRenderer::NoteConstDump(std::uint64_t addr, std::uint32_t bytes) {
