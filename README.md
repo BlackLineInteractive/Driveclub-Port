@@ -5,10 +5,7 @@
 [![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtube.com/@blacklineinteractive)
 
 ![LOGO](media/logo.png)
-![Driveclub Native Boot](media/DRIVECLUB.webp)
-![Tamil Nadu Event Loading](media/DCPS4.webp)
-![In-Game Pause Menu](media/2026-10-14_03-11-22.png)
-![Track Selection](media/2026-10-14_21-30.jpg)
+![Driveclub In-Game](media/2026-10-14_22-34-39.png)
 
 A native port of **Driveclub** (PS4, CUSA00003 v1.05) to macOS with rendering via **Metal 3**.
 

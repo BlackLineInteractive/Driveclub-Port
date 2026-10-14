@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+#include <vector>
 #include "hle/pad/pad.h"
 
 #include <atomic>
@@ -125,7 +129,34 @@ void SetStick(bool right, u8 x, u8 y) {
     }
 }
 
+// DC_AUTOPRESS=<sec>,<sec>,...: presses Cross at those times after start
+// (unattended runs that need to get past "Start Event").
+static void StartAutoPress() {
+    const char* e = std::getenv("DC_AUTOPRESS");
+    if (!e) {
+        return;
+    }
+    std::vector<double> times;
+    for (const char* p = e; *p;) {
+        char* q = nullptr;
+        times.push_back(std::strtod(p, &q));
+        p = *q == ',' ? q + 1 : q;
+        if (q == p && *p) break;
+    }
+    std::thread([times] {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (double t : times) {
+            std::this_thread::sleep_until(t0 + std::chrono::milliseconds(static_cast<s64>(t * 1000)));
+            DC_INFO("pad: auto-press Cross at %.1f s", t);
+            SetButton(0x4000, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            SetButton(0x4000, false);
+        }
+    }).detach();
+}
+
 void RegisterPad() {
+    StartAutoPress();
     constexpr const char* lib = "libScePad";
     DC_HLE(lib, scePadInit);
     DC_HLE(lib, scePadOpen);
