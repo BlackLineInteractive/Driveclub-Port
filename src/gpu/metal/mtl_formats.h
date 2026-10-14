@@ -81,6 +81,7 @@ struct TextureFormatInfo {
     u32 bytes_per_block = 0; // per texel, or per 4x4 block when compressed
     bool compressed = false;
     Shader::TexSample sample = Shader::TexSample::Float;
+    bool gpu_only = false; // bit layout differs from guest memory: only for surfaces kept on the GPU
 };
 
 // T# DATA_FORMAT + NUM_FORMAT. Invalid when we cannot upload it directly.
@@ -120,6 +121,11 @@ inline TextureFormatInfo TextureFormat(u32 dfmt, u32 nfmt) {
     case 6:
         t.format = MTLPixelFormatRG11B10Float;
         t.bytes_per_block = 4;
+        break;
+    case 7: // 11_11_10 (R10 G11 B11): stored as R11G11B10, like the render targets
+        t.format = MTLPixelFormatRG11B10Float;
+        t.bytes_per_block = 4;
+        t.gpu_only = true;
         break;
     case 9:
         t.format = uint ? MTLPixelFormatRGB10A2Uint : MTLPixelFormatRGB10A2Unorm;

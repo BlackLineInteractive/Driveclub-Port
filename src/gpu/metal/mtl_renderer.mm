@@ -1062,7 +1062,7 @@ struct MetalRenderer::Impl {
             return target.tex;
         }
 
-        if (fi.format == MTLPixelFormatInvalid) {
+        if (fi.format == MTLPixelFormatInvalid || fi.gpu_only) {
             ReportOnce("texture format dfmt=" + std::to_string(dfmt) + " nfmt=" + std::to_string(nfmt) +
                        " not supported");
             return Dummy(tt);
