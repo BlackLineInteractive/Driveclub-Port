@@ -4,6 +4,7 @@
 [![Patreon](https://img.shields.io/badge/Patreon-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/BlacklineInteractive)
 [![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtube.com/@blacklineinteractive)
 
+![LOGO](media/logo.png)
 ![Driveclub Native Boot](media/DRIVECLUB.webp)
 ![Tamil Nadu Event Loading](media/DCPS4.webp)
 ![In-Game Pause Menu](media/2026-10-14_03-11-22.png)
