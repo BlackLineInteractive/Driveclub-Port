@@ -1952,6 +1952,33 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
             return;
         }
     }
+    // The Gnm driver copies surfaces with a buffer-copy shader (V# source in
+    // user data 0-3, destination in 4-7). Surfaces we render live only in
+    // Metal textures, so copy the texture and give the destination one too.
+    if (tx == 64 && ty == 1 && tz == 1) {
+        const u64 src = (u64(ud[0]) | (u64(ud[1] & 0xFFF) << 32)) & kGpuAddrMask;
+        const u64 dst = (u64(ud[4]) | (u64(ud[5] & 0xFFF) << 32)) & kGpuAddrMask;
+        const bool from_depth = Latest(depth_targets, src) != nullptr;
+        RenderTarget* from = from_depth ? Latest(depth_targets, src) : Latest(color_targets, src);
+        if (from && dst && dst != src) {
+            RenderTarget& to = GetTarget(from_depth ? depth_targets : color_targets, dst, from->tex.pixelFormat,
+                                         from->width, from->height, from_depth);
+            EndPass();
+            EnsureCommandBuffer();
+            id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+            [b copyFromTexture:from->tex toTexture:to.tex];
+            [b endEncoding];
+            to.initialized = true;
+            to.clear_pending = from->clear_pending;
+            to.clear_color = from->clear_color;
+            to.clear_depth = from->clear_depth;
+            to.written = ++write_seq;
+            if (trace) {
+                DC_INFO("gpu:   surface copy %#llx -> %#llx (%ux%u)", src, dst, from->width, from->height);
+            }
+            return;
+        }
+    }
     Program* cs = GetProgram(Stage::Compute, addr, ud, Bits(rsrc2, 1, 5), Bits(rsrc2, 11, 2), rsrc2);
     if (!cs) {
         return;
