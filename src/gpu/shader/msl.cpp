@@ -181,6 +181,22 @@ private:
     void EmitBuffer(const Inst& i);
     void EmitImage(const Inst& i);
     void EmitExp(const Inst& i);
+    // The CB stores R11G11B10 with negatives and NaN as 0 and overflow as the largest
+    // finite value; Metal leaves those undefined (they read back as NaN/Inf).
+    void ClampUfloat(u32 target, const std::string& dst) {
+        if (o.mrt_ufloat & (1u << target)) {
+            Line(dst + " = dc_ufloat(" + dst + ");");
+        }
+    }
+
+    // Register probe at color exports that are not finite.
+    void ProbeNanExport(const std::string& dst) {
+        if (o.probe_pc == kProbeExportNan) {
+            Line("if (any(!isfinite(" + dst + "))) {");
+            body += "    /*DC_PROBE*/\n";
+            Line("}");
+        }
+    }
     void Jump(u32 target) {
         if (!structured) {
             Line("{ pc_ = " + Hex(target) + "; continue; }");
@@ -209,6 +225,7 @@ private:
     std::string body;
     u32 max_sgpr = 0;
     u32 max_vgpr = 0;
+    bool uses_movrel = false;
     std::set<u32> ps_params; // VS params the PS reads
 
     // Structured control flow (see Structure()).
@@ -704,6 +721,25 @@ void Emitter::EmitVop(const Inst& i) {
     case Vop::V_NOP:
     case Vop::V_CLREXCP:
         break;
+    // Relative VGPR addressing (vN + M0): a switch over every register the shader has,
+    // filled in once the register count is known (see Run()).
+    case Vop::V_MOVRELS_B32:
+    case Vop::V_MOVRELSD_B32: {
+        const u32 sbase = i.src[0] >= Operand::Vgpr0 ? i.src[0] - Operand::Vgpr0 : 0;
+        Line("{ uint t_ = 0u; switch (" + N(sbase) + "u + m0r) { /*DC_REL_READ*/ default: break; }");
+        if (static_cast<Vop>(i.op) == Vop::V_MOVRELS_B32) {
+            SetV(i.dst, "t_");
+        } else {
+            Line("if (exec_lo != 0u) switch (" + N(i.dst) + "u + m0r) { /*DC_REL_WRITE*/ default: break; }");
+        }
+        Line("}");
+        uses_movrel = true;
+        break;
+    }
+    case Vop::V_MOVRELD_B32:
+        Line("{ uint t_ = " + U(i, 0) + "; if (exec_lo != 0u) switch (" + N(i.dst) + "u + m0r) { /*DC_REL_WRITE*/ default: break; } }");
+        uses_movrel = true;
+        break;
     case Vop::V_MOV_B32:
     case Vop::V_MOV_FED_B32:
         SetV(i.dst, u(0));
@@ -1120,6 +1156,7 @@ void Emitter::EmitImage(const Inst& i) {
             value = "float4(as_type<float>(" + comps[0] + "), as_type<float>(" + comps[1] + "), as_type<float>(" +
                     comps[2] + "), as_type<float>(" + comps[3] + "))";
             if (NanProbe()) value = "dc_probe(" + value + ")";
+            if (tt.ufloat) value = "dc_ufloat(" + value + ")";
         } else {
             value = std::string(vec) + "(uint4(" + comps[0] + ", " + comps[1] + ", " + comps[2] + ", " + comps[3] + "))";
         }
@@ -1253,6 +1290,8 @@ void Emitter::EmitExp(const Inst& i) {
         }
         if (i.target == ExpTarget::Pos0) {
             Line("out.pos = " + value + ";");
+        } else if (i.target == ExpTarget::Pos0 + 1 && o.points && o.vtx_point_size) {
+            Line("out.psize = " + value + ".x;");
         } else if (i.target >= ExpTarget::Param0) {
             Line("out.p" + N(i.target - ExpTarget::Param0) + " = " + value + ";");
         }
@@ -1305,7 +1344,11 @@ void Emitter::EmitExp(const Inst& i) {
             value = "float4(float2(as_type<half2>(" + a + ")), float2(as_type<half2>(" + b + ")))";
             break;
         }
-        if (type == OutType::Float) Line(dst + (NanProbe() ? " = dc_probe(float4(" + value + "));" : " = float4(" + value + ");"));
+        if (type == OutType::Float) {
+            Line(dst + (NanProbe() ? " = dc_probe(float4(" + value + "));" : " = float4(" + value + ");"));
+            ClampUfloat(i.target, dst);
+            ProbeNanExport(dst);
+        }
         else if (type == OutType::Uint) Line(dst + " = uint4(" + value + ");");
         else Line(dst + " = int4(" + value + ");");
         return;
@@ -1314,6 +1357,8 @@ void Emitter::EmitExp(const Inst& i) {
         const std::string v4 = "float4(" + comp(0, "0.0f") + ", " + comp(1, "0.0f") + ", " + comp(2, "0.0f") + ", " +
                                comp(3, "1.0f") + ")";
         Line(dst + " = " + (NanProbe() ? "dc_probe(" + v4 + ")" : v4) + ";");
+        ClampUfloat(i.target, dst);
+        ProbeNanExport(dst);
     } else {
         const char* t = type == OutType::Uint ? "uint4" : "int4";
         auto raw = [&](u32 k) { return (i.en & (1u << k)) ? VName(i.vsrc[k]) : std::string("0u"); };
@@ -1327,8 +1372,10 @@ std::string Emitter::TexParams(bool entry) const {
         const TextureType tt = k < o.textures.size() ? o.textures[k] : TextureType{};
         const char* comp = tt.sample == TexSample::Float ? "float" : tt.sample == TexSample::Uint ? "uint" : "int";
         const char* kind = tt.dim == TexDim::Tex2D ? "texture2d" : tt.dim == TexDim::Tex2DArray ? "texture2d_array" : "texture3d";
-        // Images the shader writes are bound read_write (no sampling then).
-        const std::string access = p.images[k].storage ? ", access::read_write" : "";
+        // Images the shader writes are bound write-only, or read_write when it also
+        // loads them (Metal allows read_write only for a few formats).
+        const std::string access = !p.images[k].storage ? ""
+                                 : p.images[k].reads ? ", access::read_write" : ", access::write";
         s += std::string(", ") + kind + "<" + comp + access + "> t" + N(k);
         if (entry) s += " [[texture(" + N(k) + ")]]";
     }
@@ -1469,6 +1516,20 @@ std::string Emitter::Run() {
         EmitSwitch();
     }
 
+    if (uses_movrel) {
+        std::string rd, wr;
+        for (u32 k = 0; k < max_vgpr; ++k) {
+            rd += "case " + N(k) + "u: t_ = v" + N(k) + "; break; ";
+            wr += "case " + N(k) + "u: v" + N(k) + " = t_; break; ";
+        }
+        for (size_t at; (at = body.find("/*DC_REL_READ*/")) != std::string::npos;) {
+            body.replace(at, std::strlen("/*DC_REL_READ*/"), rd);
+        }
+        for (size_t at; (at = body.find("/*DC_REL_WRITE*/")) != std::string::npos;) {
+            body.replace(at, std::strlen("/*DC_REL_WRITE*/"), wr);
+        }
+    }
+
     std::string decl;
     auto dl = [&](const std::string& s) { decl += "    " + s + "\n"; };
     const u32 nud = std::min<u32>(p.num_user_sgprs, 16);
@@ -1532,14 +1593,18 @@ std::string Emitter::Run() {
     const bool probe = o.probe_pc != ~0u && p.stage != Stage::Vertex && body.find("/*DC_PROBE*/") != std::string::npos;
     if (probe) {
         // x == ~0: the first invocation to get there (any pixel / lane).
-        const bool any = o.probe_x == ~0u;
-        std::string dump = any ? "    if (atomic_exchange_explicit((device atomic_uint*)&dbg[7], 1u, memory_order_relaxed) == 0u) {"
+        // x == ~0: the first invocation to get there (any pixel / lane); x == ~1: the
+        // first one whose v[probe_y] is NaN or infinite.
+        const bool any = o.probe_x == ~0u || o.probe_x == ~1u;
+        const std::string first = "atomic_exchange_explicit((device atomic_uint*)&dbg[7], 1u, memory_order_relaxed) == 0u";
+        std::string dump = o.probe_x == ~1u ? "    if (!isfinite(as_type<float>(v" + N(o.probe_y) + ")) && " + first + ") {"
+                         : any ? "    if (" + first + ") {"
                          : p.stage == Stage::Fragment
                              ? "    if (uint(pin.pos.x) == " + N(o.probe_x) + "u && uint(pin.pos.y) == " + N(o.probe_y) + "u) {"
-                             : "    if (dc_gid.x == " + N(o.probe_x) + "u && dc_lidx == " + N(o.probe_y) + "u) {";
+                             : "    if (dc_gtid.x == " + N(o.probe_x) + "u && dc_gtid.y == " + N(o.probe_y) + "u) {";
         dump += " dbg[0] = 1u; dbg[1] = exec_lo; dbg[2] = vcc_lo; dbg[3] = m0r;";
         dump += p.stage == Stage::Fragment ? " dbg[4] = uint(pin.pos.x); dbg[5] = uint(pin.pos.y);"
-                                           : " dbg[4] = dc_gid.x; dbg[5] = dc_lidx;";
+                                           : " dbg[4] = dc_gtid.x; dbg[5] = dc_gtid.y;";
         for (u32 k = 0; k < std::min<u32>(max_vgpr, 96); ++k) {
             dump += " dbg[" + N(8 + k) + "] = v" + N(k) + ";";
         }
@@ -1571,6 +1636,9 @@ std::string Emitter::Run() {
         "device const DcMap& gmap [[buffer(3)]]";
     if (p.stage == Stage::Vertex) {
         src += "struct VsOut {\n    float4 pos [[position]];\n";
+        if (o.points) {
+            src += "    float psize [[point_size]];\n";
+        }
         for (u32 k = 0; k < 32; ++k) {
             if (p.param_mask & (1u << k)) {
                 src += "    float4 p" + N(k) + " [[user(p" + N(k) + ")]];\n";
@@ -1578,7 +1646,7 @@ std::string Emitter::Run() {
         }
         src += "};\n\n";
         src += "static VsOut dc_run(uint vid, uint iid, constant uint* ud, thread const DcMem& mem" + TexParams(false) +
-               ") {\n    VsOut out = {};\n" + decl + wrapped + "}\n\n";
+               ") {\n    VsOut out = {};\n" + (o.points ? "    out.psize = 1.0f;\n" : "") + decl + wrapped + "}\n\n";
         const std::string args = "ud, mem" + TexArgs();
         src += "vertex VsOut main0(uint vid [[vertex_id]], uint iid [[instance_id]], " + mem_params +
                ", constant DcDraw& draw [[buffer(4)]]" + (o.debug_capture ? ", device float4* dbg [[buffer(6)]]" : "") +
@@ -1633,14 +1701,23 @@ std::string Emitter::Run() {
             src += "    float depth [[depth(any)]];\n";
         }
         src += "};\n\n";
-        src += "fragment PsOut main0(PsIn pin [[stage_in]], " + mem_params + probe_param + TexParams(true) + ") {\n";
+        const std::string bounds_param =
+            o.depth_bounds ? ", texture2d<float> dc_zb [[texture(" + N(kDepthBoundsTexture) + ")]], constant float2& dc_zbr [[buffer(" +
+                                 N(kDepthBoundsBuffer) + ")]]"
+                           : "";
+        src += "fragment PsOut main0(PsIn pin [[stage_in]], " + mem_params + probe_param + bounds_param + TexParams(true) +
+               ") {\n";
+        if (o.depth_bounds) {
+            src += "    { float z_ = dc_zb.read(uint2(pin.pos.xy)).x; if (z_ < dc_zbr.x || z_ > dc_zbr.y) discard_fragment(); }\n";
+        }
         src += "    DcMem mem = {gm0, gm1, &gmap};\n    PsOut out = {};\n    bool dc_exported = false;\n";
         src += "    uint dc_qlane = (uint(pin.pos.x) & 1u) | ((uint(pin.pos.y) & 1u) << 1);\n";
         src += "    (void)mem; (void)dc_qlane;\n";
         src += decl + wrapped + "}\n";
     } else {
         src += "kernel void main0(uint3 dc_tid [[thread_position_in_threadgroup]], "
-               "uint3 dc_gid [[threadgroup_position_in_grid]], uint dc_lidx [[thread_index_in_threadgroup]], " +
+               "uint3 dc_gid [[threadgroup_position_in_grid]], uint dc_lidx [[thread_index_in_threadgroup]], "
+               "uint3 dc_gtid [[thread_position_in_grid]], " +
                mem_params + ", device uint* gds [[buffer(5)]], threadgroup uint* lds [[threadgroup(0)]]" + probe_param + TexParams(true) +
                ") {\n";
         src += "    DcMem mem = {gm0, gm1, &gmap};\n    uint dc_lane = dc_lidx & 63u;\n";

@@ -41,6 +41,7 @@ struct ImageResource {
     std::array<SgprSource, 4> ssharp{};
     bool has_sampler = false;
     bool storage = false; // image_store / atomics
+    bool reads = false;   // image_load / atomics: a storage image then needs read_write access
     bool compare = false; // depth-compare sampling
     u32 sampler_index = 0;
 };

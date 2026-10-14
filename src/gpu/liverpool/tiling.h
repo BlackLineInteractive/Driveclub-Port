@@ -30,6 +30,21 @@ u32 Thickness(u32 tile_index);
 // size of one thickness-group (Thickness() slices together).
 u64 SliceSize(u32 tile_index, u32 pitch_el, u32 height_el, u32 bytes_per_el);
 
+// One mip level of a texture in guest memory (shadPS4 ComputeImageSize).
+struct MipLevel {
+    u64 offset = 0;     // from the texture base
+    u64 slice_size = 0; // bytes per slice (per thickness group for thick modes)
+    u32 pitch_el = 0;   // padded pitch and height, in elements
+    u32 height_el = 0;
+    u32 tile_index = 0; // macro-tiled levels too small for macro tiles are 1D tiled
+};
+
+// Layout of `levels` mips of a `width` x `height` (texels) surface with `layers`
+// slices (depth for 3D); `pitch` is the T# pitch of level 0. Block-compressed
+// formats have 4x4-texel elements. Returns the total size.
+u64 MipLayout(u32 tile_index, u32 pitch, u32 height, u32 layers, u32 levels, u32 bytes_per_el, bool block,
+              bool pow2, MipLevel* out);
+
 // Detiles one slice: `src` is guest memory, `dst` gets `width_el` x
 // `height_el` elements with rows `width_el * bytes_per_el` apart. An element
 // is a texel, or a 4x4 block for block-compressed formats.

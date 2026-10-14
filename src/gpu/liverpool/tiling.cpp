@@ -1,5 +1,7 @@
 #include "gpu/liverpool/tiling.h"
 
+#include <algorithm>
+#include <bit>
 #include <cstring>
 
 namespace Gpu::Liverpool::Tiling {
@@ -171,6 +173,66 @@ u64 SliceSize(u32 tile_index, u32 pitch_el, u32 height_el, u32 bytes_per_el) {
     const u32 thick = Thickness(tile_index);
     // Thick tiles: each micro tile holds 8x8xthick elements.
     return u64(AlignUp(pitch_el, 8)) * AlignUp(height_el, 8) * bytes_per_el * thick;
+}
+
+u64 MipLayout(u32 tile_index, u32 pitch, u32 height, u32 layers, u32 levels, u32 bytes_per_el, bool block,
+              bool pow2, MipLevel* out) {
+    const u32 thick = Thickness(tile_index);
+    const Micro type2d = MicroType2D(tile_index);
+    u64 total = 0;
+    for (u32 mip = 0; mip < levels; ++mip) {
+        u32 w = pitch >> mip, h = height >> mip;
+        if (block) {
+            w = (w + 3) / 4;
+            h = (h + 3) / 4;
+        }
+        w = std::max(w, 1u);
+        h = std::max(h, 1u);
+        if (pow2) {
+            w = std::bit_ceil(w);
+            h = std::bit_ceil(h);
+        }
+        MipLevel& m = out[mip];
+        m.tile_index = tile_index;
+        u32 level_thick = 1;
+        if (IsLinear(tile_index)) {
+            // ImageSizeLinearAligned
+            const u32 pitch_align = std::max(8u, 64u / bytes_per_el);
+            u32 p = AlignUp(w, pitch_align);
+            const u32 slice_align = std::max(64u, 256u / bytes_per_el);
+            while ((u64(p) * h) % slice_align) {
+                p += pitch_align;
+            }
+            m.pitch_el = mip == 0 && !block ? std::max(p, pitch) : p;
+            m.height_el = h;
+        } else if (type2d != Micro::None) {
+            const MacroParams mp = Macro(bytes_per_el);
+            if (mip == 0 || (w >= mp.pitch && h >= mp.height)) { // IsMacroTiledMip
+                m.pitch_el = AlignUp(w, mp.pitch);
+                m.height_el = AlignUp(h, mp.height);
+            } else { // micro tiled: the 1D mode with the same micro tile type
+                m.tile_index = type2d == Micro::Display ? 0x09 : 0x0D;
+                m.pitch_el = AlignUp(w, 8);
+                m.height_el = AlignUp(h, 8);
+                while ((u64(m.pitch_el) * m.height_el * bytes_per_el) % 256) {
+                    m.pitch_el += 8;
+                }
+            }
+        } else {
+            // ImageSizeMicroTiled
+            level_thick = thick;
+            m.pitch_el = AlignUp(w, 8);
+            m.height_el = AlignUp(h, 8);
+            while ((u64(m.pitch_el) * m.height_el * bytes_per_el * level_thick) % 256) {
+                m.pitch_el += 8;
+            }
+        }
+        m.slice_size = u64(m.pitch_el) * m.height_el * bytes_per_el * level_thick;
+        u32 slices = (layers + level_thick - 1) / level_thick;
+        m.offset = total;
+        total += m.slice_size * slices;
+    }
+    return total;
 }
 
 void DetileSlice(u32 tile_index, const u8* src, u8* dst, u32 width_el, u32 height_el, u32 pitch_el,

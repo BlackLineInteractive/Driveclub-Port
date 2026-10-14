@@ -77,7 +77,8 @@ int Run(int argc, char** argv) {
 
     SDL_Window* window =
         SDL_CreateWindow("Driveclub Native", kWindowWidth, kWindowHeight,
-                         SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                         SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                             (std::getenv("DC_HIDDEN") ? SDL_WINDOW_HIDDEN : 0)); // DC_HIDDEN: no window (frame dumps)
     if (!window) {
         DC_ERROR("SDL_CreateWindow: %s", SDL_GetError());
         return 1;

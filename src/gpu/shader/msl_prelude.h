@@ -236,6 +236,11 @@ static inline float4 dc_probe(float4 v) {
 }
 // The VALU clamp modifier: NaN becomes 0 (Metal's saturate keeps NaN).
 static inline float dc_sat(float f) { return f > 0.0f ? min(f, 1.0f) : 0.0f; }
+// What the CB stores for R11G11B10: negatives and NaN become 0, overflow the largest
+// finite value (65024).
+static inline float4 dc_ufloat(float4 v) {
+    return float4(select(float3(0.0f), min(v.xyz, float3(65024.0f)), v.xyz > 0.0f), v.w);
+}
 static inline float dc_f32(uint v) { return float(as_type<half>(ushort(v & 0xffffu))); }
 static inline float dc_med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
 static inline int dc_med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }

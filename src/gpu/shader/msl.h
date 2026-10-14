@@ -59,28 +59,38 @@ struct TextureType {
     TexSample sample = TexSample::Float;
     u8 compare = 3; // depth-compare sampling: S# DEPTH_COMPARE_FUNC (ref <op> texel), default LEQUAL
     bool cube = false; // a cube (Tex2DArray of faces) sampled with V_CUBE* coordinates
+    bool ufloat = false; // unsigned small-float storage (R11G11B10): writes clamp like the CB does
     bool operator==(const TextureType&) const = default;
 };
 
 enum class OutType : u8 { Float, Uint, Sint };
 
 constexpr u32 kProbeWords = 256;
+constexpr u32 kProbeExportNan = 0xFFFFFFFEu; // probe_pc: at color exports that are NaN/Inf
 constexpr u32 kProbeBinding = 7;
+constexpr u32 kDepthBoundsBuffer = 6;
+constexpr u32 kDepthBoundsTexture = 30;
 
 struct MslOptions {
     // Vertex.
     bool rect_list = false; // expand RECTLIST: 3 vertices -> 2 triangles
     bool debug_capture = false; // write positions to buffer(6) (debugging)
+    bool points = false;          // point list: VsOut carries [[point_size]]
+    bool vtx_point_size = false;  // PA_CL_VS_OUT_CNTL.USE_VTX_POINT_SIZE: POS1.x is the size
     // Fragment.
     std::array<u32, 32> ps_input_cntl{}; // SPI_PS_INPUT_CNTL_n
     u32 vs_param_mask = 0;               // params the paired VS exports
     u32 ps_input_addr = 0;               // SPI_PS_INPUT_ADDR
     u32 col_format = 0;                  // SPI_SHADER_COL_FORMAT
     std::array<OutType, 8> mrt_type{};
+    u32 mrt_ufloat = 0; // MRTs stored as unsigned small floats (R11G11B10)
     bool depth_target = true; // false drops depth exports (no depth attachment)
+    // DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE: discard where the stored depth (a copy at
+    // texture(kDepthBoundsTexture)) is outside [min, max] (buffer(kDepthBoundsBuffer)).
+    bool depth_bounds = false;
     // Register probe (debugging): before the instruction at `probe_pc`, the
-    // fragment at pixel (probe_x, probe_y) -- for compute, the lane with
-    // threadgroup x == probe_x and thread index == probe_y -- writes its
+    // fragment at pixel (probe_x, probe_y) -- for compute, the thread at that
+    // global grid position -- writes its
     // registers to buffer(7): [0] hit, [1] exec, [2] vcc, [3] m0, [8 + n] vN
     // (n < 96), [104 + n] sN (n < 104). kProbeWords per slot.
     u32 probe_pc = ~0u;

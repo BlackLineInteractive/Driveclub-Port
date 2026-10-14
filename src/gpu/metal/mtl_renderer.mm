@@ -57,6 +57,12 @@ u64 Fnv(const void* data, size_t size, u64 h = 0xcbf29ce484222325ull) {
     return h;
 }
 
+std::string Hex(u64 v) {
+    char b[24];
+    std::snprintf(b, sizeof(b), "%#llx", static_cast<unsigned long long>(v));
+    return b;
+}
+
 template <typename T>
 u64 Hash(const T& v, u64 seed = 0xcbf29ce484222325ull) {
     return Fnv(&v, sizeof(T), seed);
@@ -149,6 +155,7 @@ struct PipelineKey {
     u32 blend[8] = {};
     u32 write_mask = 0;
     u32 depth_fmt = 0;
+    u32 shader_mask = 0;
 };
 
 constexpr const char* kCopyShader = R"(
@@ -236,7 +243,7 @@ struct MetalRenderer::Impl {
     std::condition_variable done_cv;
     std::vector<std::pair<u64, id<MTLRenderPipelineState>>> done_render;
     std::vector<std::pair<u64, id<MTLComputePipelineState>>> done_compute;
-    std::unordered_map<u32, id<MTLDepthStencilState>> depth_states;
+    std::unordered_map<u64, id<MTLDepthStencilState>> depth_states;
     std::unordered_map<u64, id<MTLSamplerState>> samplers;
 
     // Guest surfaces rendered on the host GPU stay there. The same address can
@@ -249,9 +256,12 @@ struct MetalRenderer::Impl {
         u32 depth_or_layers = 1;
         TexDim dim = TexDim::Tex2D;
         bool initialized = false;
+        id<MTLTexture> bounds_copy = nil; // depth as of bounds_seq, for the depth bounds test
+        u64 bounds_seq = 0;
         bool clear_pending = false; // fast-cleared (CMASK/HTILE): next pass clears
         MTLClearColor clear_color{};
         double clear_depth = 1.0;
+        u32 clear_stencil = 0;
         u64 written = 0; // write_seq of the last pass/dispatch writing it
         u32 bind_slice = 0; // array slice the CB registers point at (CB_COLOR_VIEW)
         u32 levels = 1;  // mip levels (compute shaders build mip chains in place)
@@ -351,7 +361,7 @@ struct MetalRenderer::Impl {
     } probe;
     id<MTLBuffer> probe_buf = nil;
     std::vector<std::string> probe_slots; // what each slot of probe_buf belongs to
-    static constexpr u32 kProbeSlots = 64;
+    static constexpr u32 kProbeSlots = 4096;
     id<MTLTexture> pass_tex[9] = {};
     u64 pass_addr[9] = {};
     bool stats = false;                // DC_GPU_STATS: per-second GPU time and submit counts
@@ -400,9 +410,27 @@ struct MetalRenderer::Impl {
         if (const char* e = std::getenv("DC_PROBE")) {
             char* q = nullptr;
             probe.shader = std::strtoull(e, &q, 16);
-            probe.pc = *q == ':' ? std::strtoul(q + 1, &q, 16) : 0;
-            probe.x = *q == ':' ? (q[1] == '*' ? ~0u : std::strtoul(q + 1, &q, 10)) : 0; // '*': any pixel
-            probe.y = *q == ',' ? std::strtoul(q + 1, &q, 10) : 0;
+            if (!std::strcmp(e, "*:nan")) { // every pixel shader's first non-finite color export
+                probe.shader = ~0ull;
+                probe.pc = Shader::kProbeExportNan;
+                probe.x = ~0u;
+                q = const_cast<char*>(e + std::strlen(e));
+            }
+            if (*q == ':') {
+                probe.pc = std::strtoul(q + 1, &q, 16);
+            }
+            // '*': any pixel; 'nan<k>': the first whose vk is NaN/Inf
+            if (*q == ':' && q[1] == '*') {
+                probe.x = ~0u;
+            } else if (*q == ':' && !std::strncmp(q + 1, "nan", 3)) {
+                probe.x = ~1u;
+                probe.y = std::strtoul(q + 4, &q, 10);
+            } else {
+                probe.x = *q == ':' ? std::strtoul(q + 1, &q, 10) : 0;
+            }
+            if (*q == ',') {
+                probe.y = std::strtoul(q + 1, &q, 10);
+            }
             probe_buf = [device newBufferWithLength:kProbeSlots * Shader::kProbeWords * 4 options:MTLResourceStorageModeShared];
             std::memset(probe_buf.contents, 0, probe_buf.length);
         }
@@ -1034,6 +1062,22 @@ struct MetalRenderer::Impl {
         return t;
     }
 
+    // How a shader samples `f`: float, uint or sint.
+    static TexSample SampleKind(MTLPixelFormat f) {
+        switch (f) {
+        case MTLPixelFormatR8Uint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatR16Uint:
+        case MTLPixelFormatRG16Uint: case MTLPixelFormatRGBA16Uint: case MTLPixelFormatR32Uint: case MTLPixelFormatRG32Uint:
+        case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGB10A2Uint:
+            return TexSample::Uint;
+        case MTLPixelFormatR8Sint: case MTLPixelFormatRG8Sint: case MTLPixelFormatRGBA8Sint: case MTLPixelFormatR16Sint:
+        case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatR32Sint: case MTLPixelFormatRG32Sint:
+        case MTLPixelFormatRGBA32Sint:
+            return TexSample::Sint;
+        default:
+            return TexSample::Float;
+        }
+    }
+
     // Cheap change detection: a few dwords spread over the texture.
     u64 Hash64(const u8* p, u64 size) {
         stat_hashed += size;
@@ -1111,13 +1155,23 @@ struct MetalRenderer::Impl {
 
         // Render-to-texture: sample the render target directly.
         if (!storage) {
+            // As shadPS4's image views: the T# format (same texel size) and swizzle.
             if (RenderTarget* rt = Latest(color_targets, addr, tt.dim)) {
-                return TargetView(*rt, base_level, last_level - base_level + 1, MTLPixelFormatInvalid, base_array,
-                                  slice_count);
+                MTLPixelFormat view_fmt = MTLPixelFormatInvalid;
+                if (fi.format != MTLPixelFormatInvalid && !fi.compressed && fi.format != rt->tex.pixelFormat &&
+                    PixelBytes(fi.format) && PixelBytes(fi.format) == PixelBytes(rt->tex.pixelFormat) &&
+                    !(fi.sample == TexSample::Float) == !(SampleKind(rt->tex.pixelFormat) == TexSample::Float)) {
+                    view_fmt = fi.format;
+                }
+                if (view_fmt == MTLPixelFormatInvalid) {
+                    tt.sample = SampleKind(rt->tex.pixelFormat); // the shader reads what the view holds
+                    *type_out = tt;
+                }
+                return TargetView(*rt, base_level, last_level - base_level + 1, view_fmt, base_array, slice_count, swz);
             }
             if (tt.dim == TexDim::Tex2D) {
                 if (RenderTarget* rt = Latest(depth_targets, addr, tt.dim)) {
-                    return rt->tex;
+                    return swz == kIdentitySwizzle ? rt->tex : TargetView(*rt, 0, rt->levels, MTLPixelFormatInvalid, 0, 1, swz);
                 }
             }
         }
@@ -1137,6 +1191,7 @@ struct MetalRenderer::Impl {
                 return Dummy(tt);
             }
             const MTLPixelFormat f = fi.format == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm : fi.format;
+            type_out->ufloat = f == MTLPixelFormatRG11B10Float;
             RenderTarget& target = GetColorTarget(addr, f, width, height, last_level + 1, tt.dim, layers);
             target.initialized = true;
             target.clear_pending = false;
@@ -1155,10 +1210,15 @@ struct MetalRenderer::Impl {
         }
         const u32 width_el = fi.compressed ? (width + 3) / 4 : width;
         const u32 height_el = fi.compressed ? (height + 3) / 4 : height;
-        const u32 pitch_el = fi.compressed ? (pitch + 3) / 4 : pitch;
         const u32 thick = Tiling::Thickness(tiling);
-        const u64 slice = Tiling::SliceSize(tiling, pitch_el, height_el, fi.bytes_per_block);
-        const u64 size = (thick > 1) ? slice * ((layers + thick - 1) / thick) : slice * layers;
+        // The whole mip chain (3D textures: level 0 only), laid out like shadPS4's
+        // ComputeImageSize: levels one after another, each with all its slices.
+        const u32 max_levels = 1 + static_cast<u32>(std::log2(std::max(width, height)));
+        const u32 levels = tt.dim == TexDim::Tex3D ? 1 : std::min(last_level + 1, max_levels);
+        const bool pow2 = (t[3] >> 25) & 1;
+        Tiling::MipLevel mips[16];
+        const u64 size = Tiling::MipLayout(tiling, pitch, height, layers, levels, fi.bytes_per_block, fi.compressed,
+                                           pow2, mips);
         if (!Readable(addr, size)) {
             ReportOnce("texture memory not mapped");
             return Dummy(tt);
@@ -1187,6 +1247,7 @@ struct MetalRenderer::Impl {
             d.pixelFormat = fi.format;
             d.width = width;
             d.height = height;
+            d.mipmapLevelCount = levels;
             if (tt.dim == TexDim::Tex3D) {
                 d.depth = layers;
             } else if (tt.dim == TexDim::Tex2DArray) {
@@ -1202,29 +1263,35 @@ struct MetalRenderer::Impl {
             }
         }
         const auto* src = reinterpret_cast<const u8*>(addr);
-        const u64 row = u64(width_el) * fi.bytes_per_block;
-        const u64 image = row * height_el;
-        std::vector<u8> linear(image);
-        for (u32 l = 0; l < layers; ++l) {
-            const u64 group_offset = slice * (l / thick);
-            const u32 z_in_group = l % thick;
-            Tiling::DetileSlice(tiling, src + group_offset, linear.data(), width_el, height_el, pitch_el,
-                                fi.bytes_per_block, z_in_group);
-            if (dump_texture == addr && dump_frames && l == 0) { // DC_DUMP_TEXTURE=<addr>: raw linear bytes
-                char path[512];
-                std::snprintf(path, sizeof(path), "%s/tex_%llx_%ux%u_bpe%u_f%llu.raw", dump_frames, addr, width_el,
-                              height_el, fi.bytes_per_block, frame_count);
-                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(linear.data()), image);
+        std::vector<u8> linear;
+        for (u32 lv = 0; lv < levels; ++lv) {
+            const Tiling::MipLevel& m = mips[lv];
+            const u32 w = std::max(width >> lv, 1u), h = std::max(height >> lv, 1u);
+            const u32 w_el = fi.compressed ? (w + 3) / 4 : w, h_el = fi.compressed ? (h + 3) / 4 : h;
+            const u64 row = u64(w_el) * fi.bytes_per_block;
+            const u64 image = row * h_el;
+            linear.resize(image);
+            const u32 level_thick = Tiling::Thickness(m.tile_index);
+            for (u32 l = 0; l < layers; ++l) {
+                const u64 group_offset = m.offset + m.slice_size * (l / level_thick);
+                Tiling::DetileSlice(m.tile_index, src + group_offset, linear.data(), w_el, h_el, m.pitch_el,
+                                    fi.bytes_per_block, l % level_thick);
+                if (dump_texture == addr && dump_frames && l == 0 && lv == 0) { // DC_DUMP_TEXTURE=<addr>: raw linear bytes
+                    char path[512];
+                    std::snprintf(path, sizeof(path), "%s/tex_%llx_%ux%u_bpe%u_f%llu.raw", dump_frames, addr, width_el,
+                                  height_el, fi.bytes_per_block, frame_count);
+                    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(linear.data()), image);
+                }
+                const MTLRegion region = tt.dim == TexDim::Tex3D ? MTLRegionMake3D(0, 0, l, w, h, 1) : MTLRegionMake2D(0, 0, w, h);
+                [e.tex replaceRegion:region
+                         mipmapLevel:lv
+                               slice:tt.dim == TexDim::Tex2DArray ? l : 0
+                           withBytes:linear.data()
+                         bytesPerRow:row
+                       bytesPerImage:image];
             }
-            const MTLRegion region = tt.dim == TexDim::Tex3D ? MTLRegionMake3D(0, 0, l, width, height, 1)
-                                                             : MTLRegionMake2D(0, 0, width, height);
-            [e.tex replaceRegion:region
-                     mipmapLevel:0
-                           slice:tt.dim == TexDim::Tex2DArray ? l : 0
-                       withBytes:linear.data()
-                     bytesPerRow:row
-                   bytesPerImage:image];
         }
+        (void)thick;
         e.chunks.resize((size + kChunk - 1) / kChunk);
         for (u32 c = 0; c < e.chunks.size(); ++c) {
             e.chunks[c] = ChunkHash(addr, size, c);
@@ -1303,7 +1370,7 @@ struct MetalRenderer::Impl {
                                   MTLTextureUsagePixelFormatView;
         } else {
             d.textureType = MTLTextureType2D;
-            d.usage = depth ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead
+            d.usage = depth ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView
                             : MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
                                   MTLTextureUsagePixelFormatView;
         }
@@ -1358,8 +1425,10 @@ struct MetalRenderer::Impl {
 
     // Levels [base, base + count) and, for arrays, slices [sbase, sbase + scount)
     // of `rt` (the texture itself when that is all of it).
+    static constexpr u32 kIdentitySwizzle = 0xFAC; // T# DST_SEL x=R y=G z=B w=A
+
     id<MTLTexture> TargetView(RenderTarget& rt, u32 base, u32 count, MTLPixelFormat fmt = MTLPixelFormatInvalid,
-                              u32 sbase = 0, u32 scount = ~0u) {
+                              u32 sbase = 0, u32 scount = ~0u, u32 swz = kIdentitySwizzle) {
         if (fmt == MTLPixelFormatInvalid) {
             fmt = rt.tex.pixelFormat;
         }
@@ -1368,10 +1437,13 @@ struct MetalRenderer::Impl {
         const u32 total = rt.tex.textureType == MTLTextureType2DArray ? static_cast<u32>(rt.tex.arrayLength) : 1;
         sbase = std::min(sbase, total - 1);
         scount = std::clamp<u32>(scount, 1, total - sbase);
-        if (base == 0 && count == rt.levels && sbase == 0 && scount == total && fmt == rt.tex.pixelFormat) {
+        swz &= 0xFFF;
+        if (base == 0 && count == rt.levels && sbase == 0 && scount == total && fmt == rt.tex.pixelFormat &&
+            swz == kIdentitySwizzle) {
             return rt.tex;
         }
-        const u64 key = base | (u64(count) << 8) | (u64(fmt) << 16) | (u64(sbase) << 32) | (u64(scount) << 46);
+        u64 key = Hash(base | (u64(count) << 8) | (u64(fmt) << 16) | (u64(sbase) << 32) | (u64(scount) << 46));
+        key = Hash(swz, key);
         auto it = rt.views.find(key);
         if (it != rt.views.end()) {
             return it->second;
@@ -1379,7 +1451,9 @@ struct MetalRenderer::Impl {
         id<MTLTexture> v = [rt.tex newTextureViewWithPixelFormat:fmt
                                                       textureType:rt.tex.textureType
                                                            levels:NSMakeRange(base, count)
-                                                           slices:NSMakeRange(sbase, scount)];
+                                                           slices:NSMakeRange(sbase, scount)
+                                                          swizzle:MTLTextureSwizzleChannelsMake(Swizzle(swz), Swizzle(swz >> 3),
+                                                                                                Swizzle(swz >> 6), Swizzle(swz >> 9))];
         rt.views[key] = v;
         return v;
     }
@@ -1442,7 +1516,12 @@ struct MetalRenderer::Impl {
         }
     }
 
-    void BeginPass(RenderTarget* colors[8], RenderTarget* depth, bool clear_depth, float depth_value) {
+    static bool HasStencil(id<MTLTexture> t) {
+        return t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8;
+    }
+
+    void BeginPass(RenderTarget* colors[8], RenderTarget* depth, bool clear_depth, float depth_value,
+                   bool clear_stencil = false, u32 stencil_value = 0) {
         EndPass();
         if (work_since_commit >= kCommitEvery) {
             Commit(false); // keep the host GPU busy while the rest is recorded
@@ -1477,6 +1556,13 @@ struct MetalRenderer::Impl {
             rp.depthAttachment.loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
             rp.depthAttachment.clearDepth = clear_depth ? depth_value : depth->clear_pending ? depth->clear_depth : 1.0;
             rp.depthAttachment.storeAction = MTLStoreActionStore;
+            if (HasStencil(depth->tex)) {
+                const bool sclear = clear_stencil || depth->clear_pending || !depth->initialized;
+                rp.stencilAttachment.texture = depth->tex;
+                rp.stencilAttachment.loadAction = sclear ? MTLLoadActionClear : MTLLoadActionLoad;
+                rp.stencilAttachment.clearStencil = clear_stencil ? stencil_value : depth->clear_pending ? depth->clear_stencil : 0;
+                rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
             depth->initialized = true;
             depth->clear_pending = false;
             depth->written = seq;
@@ -1502,18 +1588,55 @@ struct MetalRenderer::Impl {
 
     // ================= draws =================
 
-    id<MTLDepthStencilState> GetDepthState(u32 db_control) {
-        auto it = depth_states.find(db_control);
+    // DB_DEPTH_CONTROL + DB_STENCIL_CONTROL + DB_STENCILREFMASK(_BF), the way
+    // shadPS4's UpdateDepthStencilState reads them.
+    id<MTLDepthStencilState> GetDepthState(u32 db_control, bool depth_clear, bool stencil, u32 st_control,
+                                           u32 ref_front, u32 ref_back, bool stencil_clear) {
+        const bool backface = (db_control >> 7) & 1;
+        if (!backface) {
+            ref_back = ref_front;
+        }
+        u64 key = Hash(db_control & 0xFFF00FFFu);
+        key = Hash(depth_clear, key);
+        if (stencil) {
+            key = Hash(st_control, key);
+            key = Hash(ref_front & 0x00FFFF00u, key); // masks; the reference is set per draw
+            key = Hash(ref_back & 0x00FFFF00u, key);
+            key = Hash(stencil_clear, key);
+        }
+        auto it = depth_states.find(key);
         if (it != depth_states.end()) {
             return it->second;
         }
         MTLDepthStencilDescriptor* d = [MTLDepthStencilDescriptor new];
         const bool z_enable = (db_control >> 1) & 1;
         d.depthCompareFunction = z_enable ? CompareFunc(db_control >> 4) : MTLCompareFunctionAlways;
-        d.depthWriteEnabled = z_enable && ((db_control >> 2) & 1);
+        d.depthWriteEnabled = z_enable && ((db_control >> 2) & 1) && !depth_clear;
+        if (stencil && (db_control & 1)) {
+            auto face = [&](u32 fail, u32 zpass, u32 zfail, u32 func, u32 ref) {
+                MTLStencilDescriptor* f = [MTLStencilDescriptor new];
+                f.stencilFailureOperation = StencilOp(fail);
+                f.depthStencilPassOperation = StencilOp(zpass);
+                f.depthFailureOperation = StencilOp(zfail);
+                f.stencilCompareFunction = CompareFunc(func);
+                f.readMask = (ref >> 8) & 0xFF;
+                f.writeMask = stencil_clear ? 0 : (ref >> 16) & 0xFF;
+                return f;
+            };
+            d.frontFaceStencil = face(st_control, st_control >> 4, st_control >> 8, db_control >> 8, ref_front);
+            d.backFaceStencil = backface ? face(st_control >> 12, st_control >> 16, st_control >> 20, db_control >> 20, ref_back)
+                                         : face(st_control, st_control >> 4, st_control >> 8, db_control >> 8, ref_front);
+        }
         id<MTLDepthStencilState> st = [device newDepthStencilStateWithDescriptor:d];
-        depth_states[db_control] = st;
+        depth_states[key] = st;
         return st;
+    }
+
+    // GCN REPLACE_OP writes STENCILOPVAL, REPLACE_TEST the test value (shadPS4: a face
+    // with a ReplaceOp takes its reference from op_val).
+    static u32 StencilRef(u32 st_ops, u32 refmask) {
+        const bool op = (st_ops & 0xF) == 4 || ((st_ops >> 4) & 0xF) == 4 || ((st_ops >> 8) & 0xF) == 4;
+        return op ? refmask >> 24 : refmask & 0xFF;
     }
 
     struct Resources {
@@ -1639,7 +1762,8 @@ struct MetalRenderer::Impl {
 
     // Probe slot for this draw/dispatch of the probed shader, or -1.
     int ProbeSlot(u64 shader, const std::string& what) {
-        if (!probe_buf || !trace || shader != probe.shader || probe_slots.size() >= kProbeSlots) {
+        if (!probe_buf || !trace || (shader != probe.shader && probe.shader != ~0ull) ||
+            probe_slots.size() >= kProbeSlots) {
             return -1;
         }
         probe_slots.push_back(what);
@@ -1651,7 +1775,9 @@ struct MetalRenderer::Impl {
         for (size_t k = 0; k < probe_slots.size(); ++k) {
             const u32* w = d + k * Shader::kProbeWords;
             if (!w[0]) {
-                DC_INFO("probe %zu (%s): not reached", k, probe_slots[k].c_str());
+                if (probe.shader != ~0ull) {
+                    DC_INFO("probe %zu (%s): not reached", k, probe_slots[k].c_str());
+                }
                 continue;
             }
             DC_INFO("probe %zu (%s) at %u,%u: exec=%#x vcc=%#x m0=%#x", k, probe_slots[k].c_str(), w[4], w[5], w[1], w[2], w[3]);
@@ -1785,6 +1911,9 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     if (!vs_addr) {
         return;
     }
+    if ((r[Reg::PA_CL_CLIP_CNTL] >> 22) & 1) { // DX_RASTERIZATION_KILL: nothing reaches the rasterizer
+        return;
+    }
     static const u64 skip_ps = std::getenv("DC_SKIP_PS") ? std::strtoull(std::getenv("DC_SKIP_PS"), nullptr, 16) : 0;
     if (skip_ps && ps_addr == skip_ps) { // debug: drop one pixel shader's draws
         return;
@@ -1824,7 +1953,10 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     const u32 z_info = r[Reg::DB_Z_INFO];
     const u32 zfmt = z_info & 3;
     const bool depth_clear = db_render & 1;
-    const bool z_used = ((db_control >> 1) & 1) || depth_clear;
+    const bool stencil_clear = (db_render >> 1) & 1;
+    // shadPS4 StencilValid(): a stencil format and a stencil address.
+    const bool stencil_valid = (r[Reg::DB_STENCIL_INFO] & 1) && r[Reg::DB_STENCIL_WRITE_BASE];
+    const bool z_used = ((db_control >> 1) & 1) || depth_clear || (stencil_valid && ((db_control & 1) || stencil_clear));
     MTLPixelFormat depth_fmt = MTLPixelFormatInvalid;
     if (zfmt && z_used) {
         const u64 zbase = u64(r[Reg::DB_Z_WRITE_BASE]) << 8;
@@ -1834,10 +1966,12 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
             w = db_extent & 0xFFFF;
             h = db_extent >> 16;
         }
-        depth_fmt = zfmt == 1 ? MTLPixelFormatDepth16Unorm : MTLPixelFormatDepth32Float;
+        depth_fmt = stencil_valid ? MTLPixelFormatDepth32Float_Stencil8
+                  : zfmt == 1 ? MTLPixelFormatDepth16Unorm : MTLPixelFormatDepth32Float;
         if (zbase && w && h) {
             depth = &GetDepthTarget(zbase, depth_fmt, w, h);
             depth->clear_depth = r.F(Reg::DB_DEPTH_CLEAR);
+            depth->clear_stencil = r[Reg::DB_STENCIL_CLEAR] & 0xFF;
             if (ZInfo::TileSurface(z_info)) {
                 NoteMeta(u64(r[Reg::DB_HTILE_DATA_BASE]) << 8, zbase, true);
             }
@@ -1856,9 +1990,16 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         want.slice[k] = colors[k] ? colors[k]->bind_slice : 0;
     }
     want.depth = reinterpret_cast<u64>(depth);
-    if (depth_clear && depth) {
-        BeginPass(colors, depth, true, r.F(Reg::DB_DEPTH_CLEAR));
-        return; // the draw only exists to clear depth
+    if ((depth_clear || (stencil_clear && stencil_valid)) && depth) {
+        // The draw only exists to clear depth and/or stencil.
+        depth->bounds_seq = 0;
+        if (!depth_clear) {
+            // Stencil only: keep depth, so end any pass and reload it.
+            BeginPass(colors, depth, false, 1.0f, true, r[Reg::DB_STENCIL_CLEAR] & 0xFF);
+        } else {
+            BeginPass(colors, depth, true, r.F(Reg::DB_DEPTH_CLEAR), stencil_clear, r[Reg::DB_STENCIL_CLEAR] & 0xFF);
+        }
+        return;
     }
     // ---- shaders ----
     const u32* vs_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_VS_0);
@@ -1909,20 +2050,57 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     for (u32 k = 0; k < 8; ++k) {
         pending_clear = pending_clear || (colors[k] && colors[k]->clear_pending);
     }
-    if (!enc || !(want == pass) || pending_clear) {
+    // Depth bounds test (Metal on AMD has none): the pixel shader compares a copy of
+    // the depth buffer, taken when the depth may have changed since the last copy.
+    const bool depth_bounds = depth && ps && ((db_control >> 3) & 1);
+    if (depth && ((db_control >> 2) & 1)) {
+        depth->bounds_seq = 0; // this draw writes depth: an older copy goes stale
+    }
+    if (depth_bounds && (!depth->bounds_copy || depth->bounds_seq != depth->written || depth->clear_pending)) {
+        if (depth->clear_pending || !depth->initialized) { // apply the pending clear before copying
+            BeginPass(colors, depth, false, 1.0f);
+        }
+        EndPass();
+        EnsureCommandBuffer();
+        if (!depth->bounds_copy) {
+            MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:depth->tex.pixelFormat
+                                                                                         width:depth->width
+                                                                                        height:depth->height
+                                                                                     mipmapped:NO];
+            d.usage = MTLTextureUsageShaderRead;
+            d.storageMode = MTLStorageModePrivate;
+            depth->bounds_copy = [device newTextureWithDescriptor:d];
+        }
+        id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+        [b copyFromTexture:depth->tex sourceSlice:0 sourceLevel:0 toTexture:depth->bounds_copy destinationSlice:0
+          destinationLevel:0 sliceCount:1 levelCount:1];
+        [b endEncoding];
         BeginPass(colors, depth, false, 1.0f);
+        depth->bounds_seq = depth->written;
+    } else if (!enc || !(want == pass) || pending_clear) {
+        BeginPass(colors, depth, false, 1.0f);
+        if (depth && depth->bounds_seq && depth_bounds) {
+            depth->bounds_seq = depth->written; // a new pass over unchanged depth
+        }
     }
 
     // ---- functions ----
-    const int probe_slot = ps ? ProbeSlot(ps_addr, "draw " + std::to_string(draw_count)) : -1;
+    // DC_PROBE_CB=<addr>: with DC_PROBE=*:nan, only draws into that color target.
+    static const u64 probe_cb = std::getenv("DC_PROBE_CB") ? std::strtoull(std::getenv("DC_PROBE_CB"), nullptr, 16) : 0;
+    const bool probe_target = !probe_cb || (u64(r.ColorTarget(0, Reg::CB_BASE)) << 8) == probe_cb;
+    const int probe_slot = ps && probe_target ? ProbeSlot(ps_addr, "draw " + std::to_string(draw_count) + " ps " + Hex(ps_addr) +
+                                                     " cb0 " + Hex(u64(r.ColorTarget(0, Reg::CB_BASE)) << 8)) : -1;
     const bool rect = prim == PrimType::RectList;
     Shader::MslOptions vo;
     vo.rect_list = rect;
+    vo.points = prim == PrimType::PointList;
+    vo.vtx_point_size = vo.points && (r[Reg::PA_CL_VS_OUT_CNTL] & 1);
     const bool capture = debug_vsout && vs_addr == debug_vsout && !debug_vs_buf;
     vo.debug_capture = capture;
     vo.textures = vs_types;
     u64 vs_key = Hash(vs->hash);
     vs_key = Hash(rect, vs_key);
+    vs_key = Hash(u32(vo.points) | (u32(vo.vtx_point_size) << 1), vs_key);
     vs_key = Hash(capture, vs_key);
     vs_key = Fnv(vs_types.data(), vs_types.size() * sizeof(TextureType), vs_key);
     u64 ps_key = 0;
@@ -1936,9 +2114,13 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         fo.col_format = col_format;
         for (u32 k = 0; k < 8; ++k) {
             fo.mrt_type[k] = out_type[k];
+            if (color_fmt[k] == MTLPixelFormatRG11B10Float) {
+                fo.mrt_ufloat |= 1u << k;
+            }
         }
         fo.textures = ps_types;
         fo.depth_target = depth != nullptr;
+        fo.depth_bounds = depth_bounds;
         if (probe_slot >= 0) {
             fo.probe_pc = probe.pc;
             fo.probe_x = probe.x;
@@ -1947,11 +2129,13 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         ps_key = Hash(ps->hash);
         ps_key = Hash(fo.probe_pc, ps_key);
         ps_key = Hash(fo.depth_target, ps_key);
+        ps_key = Hash(fo.depth_bounds, ps_key);
         ps_key = Fnv(fo.ps_input_cntl.data(), sizeof(fo.ps_input_cntl), ps_key);
         ps_key = Hash(fo.vs_param_mask, ps_key);
         ps_key = Hash(fo.ps_input_addr, ps_key);
         ps_key = Hash(fo.col_format, ps_key);
         ps_key = Fnv(fo.mrt_type.data(), sizeof(fo.mrt_type), ps_key);
+        ps_key = Hash(fo.mrt_ufloat, ps_key);
         ps_key = Fnv(ps_types.data(), ps_types.size() * sizeof(TextureType), ps_key);
     }
 
@@ -1964,6 +2148,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         pk.blend[k] = colors[k] ? r[Reg::CB_BLEND0_CONTROL + k] : 0;
     }
     pk.write_mask = target_mask;
+    pk.shader_mask = r[Reg::CB_SHADER_MASK];
     pk.depth_fmt = static_cast<u32>(depth_fmt);
     const u64 pkey = Hash(pk);
     TakeCompiled();
@@ -1982,11 +2167,17 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
                 ca.writeMask = ((wm & 1) ? MTLColorWriteMaskRed : 0) | ((wm & 2) ? MTLColorWriteMaskGreen : 0) |
                                ((wm & 4) ? MTLColorWriteMaskBlue : 0) | ((wm & 8) ? MTLColorWriteMaskAlpha : 0);
                 const bool blendable = out_type[k] == OutType::Float && color_fmt[k] != MTLPixelFormatRGBA32Float;
+                // CB_SHADER_MASK without alpha: the hardware blends with source alpha 1
+                // (shadPS4 swaps SrcAlpha factors for One/Zero).
+                const bool alpha_masked = !((r[Reg::CB_SHADER_MASK] >> (4 * k + 3)) & 1);
                 if ((b >> 30) & 1 && blendable && !debug_fs) {
                     ca.blendingEnabled = YES;
-                    ca.sourceRGBBlendFactor = BlendFactor(b & 0x1F);
+                    auto fixa = [&](u32 f) {
+                        return !alpha_masked ? BlendFactor(f) : f == 4 ? MTLBlendFactorOne : f == 5 ? MTLBlendFactorZero : BlendFactor(f);
+                    };
+                    ca.sourceRGBBlendFactor = fixa(b & 0x1F);
                     ca.rgbBlendOperation = BlendOp((b >> 5) & 7);
-                    ca.destinationRGBBlendFactor = BlendFactor((b >> 8) & 0x1F);
+                    ca.destinationRGBBlendFactor = fixa((b >> 8) & 0x1F);
                     if ((b >> 29) & 1) {
                         ca.sourceAlphaBlendFactor = BlendFactor((b >> 16) & 0x1F);
                         ca.alphaBlendOperation = BlendOp((b >> 21) & 7);
@@ -1999,6 +2190,9 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
                 }
             }
             d.depthAttachmentPixelFormat = depth_fmt;
+            if (depth_fmt == MTLPixelFormatDepth32Float_Stencil8) {
+                d.stencilAttachmentPixelFormat = depth_fmt;
+            }
             pending.insert(pkey);
             std::string vsrc = MslSource(*vs, vo, vs_key);
             std::string fsrc = ps ? MslSource(*ps, fo, ps_key) : std::string();
@@ -2065,8 +2259,21 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     [enc setScissorRect:MTLScissorRect{static_cast<NSUInteger>(sc.x0), static_cast<NSUInteger>(sc.y0),
                                        static_cast<NSUInteger>(sc.x1 - sc.x0), static_cast<NSUInteger>(sc.y1 - sc.y0)}];
     if (depth) {
-        [enc setDepthStencilState:GetDepthState(db_control & 0x7F)];
+        const bool st = HasStencil(depth->tex);
+        const u32 st_ops = r[Reg::DB_STENCIL_CONTROL];
+        const u32 ref_f = r[Reg::DB_STENCILREFMASK], ref_b = r[Reg::DB_STENCILREFMASK_BF];
+        [enc setDepthStencilState:GetDepthState(db_control, depth_clear, st, st_ops, ref_f, ref_b, stencil_clear)];
+        if (st && (db_control & 1)) {
+            const bool backface = (db_control >> 7) & 1;
+            [enc setStencilFrontReferenceValue:StencilRef(st_ops, ref_f)
+                            backReferenceValue:backface ? StencilRef(st_ops >> 12, ref_b) : StencilRef(st_ops, ref_f)];
+        }
     }
+    // PA_CL_CLIP_CNTL.ZCLIP_NEAR/FAR_DISABLE: depth is clamped instead of clipped
+    // (shadPS4 ZclipEnable(): clipping only when both are enabled).
+    const u32 clip_cntl = r[Reg::PA_CL_CLIP_CNTL];
+    const bool zclip = !((clip_cntl >> 26) & 1) && !((clip_cntl >> 27) & 1);
+    [enc setDepthClipMode:zclip ? MTLDepthClipModeClip : MTLDepthClipModeClamp];
     const u32 su = r[Reg::PA_SU_SC_MODE_CNTL];
     static const bool no_cull = std::getenv("DC_NO_CULL") != nullptr;
     const bool cull_front = (su & 1) && !no_cull, cull_back = ((su >> 1) & 1) && !no_cull;
@@ -2138,6 +2345,11 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         for (u32 u = 0; u < ps_res.smp.size() && u < 16; ++u) {
             [enc setFragmentSamplerState:ps_res.smp[u] atIndex:u];
         }
+        if (depth_bounds) {
+            const float zb[2] = {r.F(Reg::DB_DEPTH_BOUNDS_MIN), r.F(Reg::DB_DEPTH_BOUNDS_MAX)};
+            [enc setFragmentBytes:zb length:sizeof(zb) atIndex:Shader::kDepthBoundsBuffer];
+            [enc setFragmentTexture:depth->bounds_copy atIndex:Shader::kDepthBoundsTexture];
+        }
         if (probe_slot >= 0) {
             [enc setFragmentBuffer:probe_buf offset:u64(probe_slot) * Shader::kProbeWords * 4 atIndex:Shader::kProbeBinding];
         }
@@ -2195,6 +2407,25 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         return;
     }
 
+    // Indexed lists and strips read the guest index buffer in place (Metal restarts
+    // strips at 0xFFFF / 0xFFFFFFFF like VGT_MULTI_PRIM_IB_RESET_INDX = -1).
+    if (dc.indexed && !to_list && (dc.index_size == 2 || dc.index_size == 4)) {
+        const u64 src = dc.index_base + u64(dc.index_offset) * dc.index_size;
+        id<MTLBuffer> ibuf = nil;
+        u64 ioff = 0;
+        if ((src % dc.index_size) == 0 && Locate(src, u64(dc.count) * dc.index_size, &ibuf, &ioff)) {
+            [enc drawIndexedPrimitives:mprim
+                            indexCount:dc.count
+                             indexType:dc.index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                           indexBuffer:ibuf
+                     indexBufferOffset:ioff
+                         instanceCount:instances
+                            baseVertex:base_vertex
+                          baseInstance:0];
+            return;
+        }
+    }
+
     // Gather this draw's indices (guest buffer or implicit 0..n-1).
     std::vector<u32> idx(dc.count);
     if (dc.indexed) {
@@ -2208,7 +2439,7 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         } else {
             const auto* s16 = reinterpret_cast<const u16*>(src);
             for (u32 k = 0; k < dc.count; ++k) {
-                idx[k] = s16[k];
+                idx[k] = s16[k] == 0xFFFF ? 0xFFFFFFFFu : s16[k]; // keep the restart index
             }
         }
     } else {
@@ -2346,7 +2577,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
 
     Shader::MslOptions o;
     o.textures = types;
-    const int probe_slot = ProbeSlot(addr, "dispatch " + std::to_string(stat_dispatches));
+    const int probe_slot = ProbeSlot(addr, "dispatch " + std::to_string(stat_dispatches) + " cs " + Hex(addr));
     if (probe_slot >= 0) {
         o.probe_pc = probe.pc;
         o.probe_x = probe.x;

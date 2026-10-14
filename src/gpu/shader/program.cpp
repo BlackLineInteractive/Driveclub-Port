@@ -329,6 +329,8 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
             r.storage = i.op >= static_cast<u16>(Mimg::IMAGE_STORE) &&
                         i.op < static_cast<u16>(Mimg::IMAGE_SAMPLE) &&
                         static_cast<Mimg>(i.op) != Mimg::IMAGE_GET_RESINFO;
+            r.reads = i.op < static_cast<u16>(Mimg::IMAGE_STORE) ||
+                      (i.op > static_cast<u16>(Mimg::IMAGE_GET_RESINFO) && i.op < static_cast<u16>(Mimg::IMAGE_SAMPLE));
             r.compare = IsImageCompare(i.op);
             u32 slot = 0;
             for (; slot < p->images.size(); ++slot) {
@@ -341,6 +343,7 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
                 p->images.push_back(r);
             } else {
                 p->images[slot].storage |= r.storage;
+                p->images[slot].reads |= r.reads;
                 p->images[slot].compare |= r.compare;
                 p->images[slot].has_sampler |= r.has_sampler;
                 if (r.has_sampler) {
