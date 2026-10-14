@@ -243,6 +243,8 @@ struct MetalRenderer::Impl {
         MTLClearColor clear_color{};
         double clear_depth = 1.0;
         u64 written = 0; // write_seq of the last pass/dispatch writing it
+        u32 levels = 1;  // mip levels (compute shaders build mip chains in place)
+        std::unordered_map<u64, id<MTLTexture>> views; // (base, count, format) -> view
     };
     using TargetMap = std::unordered_map<u64, std::vector<std::unique_ptr<RenderTarget>>>;
     TargetMap color_targets; // by address
@@ -1027,6 +1029,8 @@ struct MetalRenderer::Impl {
         const u32 depth = (t[4] & 0x1FFF) + 1;
         const u32 pitch = ((t[4] >> 13) & 0x3FFF) + 1;
         const u32 last_array = (t[5] >> 13) & 0x1FFF;
+        const u32 base_level = (t[3] >> 12) & 0xF;
+        const u32 last_level = std::max(base_level, (t[3] >> 16) & 0xF);
 
         const TextureFormatInfo fi = TextureFormat(dfmt, nfmt);
         TextureType tt;
@@ -1044,7 +1048,7 @@ struct MetalRenderer::Impl {
         // Render-to-texture: sample the render target directly.
         if (tt.dim == TexDim::Tex2D && !storage) {
             if (RenderTarget* rt = Latest(color_targets, addr)) {
-                return rt->tex;
+                return TargetView(*rt, base_level, last_level - base_level + 1);
             }
             if (RenderTarget* rt = Latest(depth_targets, addr)) {
                 return rt->tex;
@@ -1058,11 +1062,11 @@ struct MetalRenderer::Impl {
                 return Dummy(tt);
             }
             const MTLPixelFormat f = fi.format == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm : fi.format;
-            RenderTarget& target = GetColorTarget(addr, f, width, height);
+            RenderTarget& target = GetColorTarget(addr, f, width, height, last_level + 1);
             target.initialized = true;
             target.clear_pending = false;
             target.written = ++write_seq;
-            return target.tex;
+            return TargetView(target, base_level, 1);
         }
 
         if (fi.format == MTLPixelFormatInvalid || fi.gpu_only) {
@@ -1200,33 +1204,80 @@ struct MetalRenderer::Impl {
         return best;
     }
 
-    RenderTarget& GetTarget(TargetMap& map, u64 addr, MTLPixelFormat fmt, u32 width, u32 height, bool depth) {
-        auto& list = map[addr];
-        for (auto& t : list) {
-            if (t->width == width && t->height == height && t->tex.pixelFormat == fmt) {
-                return *t;
-            }
-        }
+    id<MTLTexture> NewTargetTexture(MTLPixelFormat fmt, u32 width, u32 height, u32 levels, bool depth) {
         MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
                                                                                      width:width
                                                                                     height:height
                                                                                  mipmapped:NO];
+        d.mipmapLevelCount = levels;
         d.usage = depth ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead
                         : MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
                               MTLTextureUsagePixelFormatView;
         d.storageMode = MTLStorageModePrivate;
+        return [device newTextureWithDescriptor:d];
+    }
+
+    RenderTarget& GetTarget(TargetMap& map, u64 addr, MTLPixelFormat fmt, u32 width, u32 height, bool depth,
+                            u32 levels = 1) {
+        auto& list = map[addr];
+        const u32 max_levels = 1 + static_cast<u32>(std::log2(std::max(width, height)));
+        levels = std::clamp<u32>(levels, 1, max_levels);
+        for (auto& t : list) {
+            if (t->width != width || t->height != height || t->tex.pixelFormat != fmt) {
+                continue;
+            }
+            if (t->levels < levels) { // now used with a mip chain: grow, keeping what is there
+                id<MTLTexture> tex = NewTargetTexture(fmt, width, height, levels, depth);
+                EndPass();
+                EnsureCommandBuffer();
+                id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+                for (u32 l = 0; l < t->levels; ++l) {
+                    [b copyFromTexture:t->tex sourceSlice:0 sourceLevel:l toTexture:tex destinationSlice:0
+                      destinationLevel:l sliceCount:1 levelCount:1];
+                }
+                [b endEncoding];
+                t->tex = tex;
+                t->levels = levels;
+                t->views.clear();
+            }
+            return *t;
+        }
         auto rt = std::make_unique<RenderTarget>();
-        rt->tex = [device newTextureWithDescriptor:d];
+        rt->tex = NewTargetTexture(fmt, width, height, levels, depth);
         rt->addr = addr;
         rt->width = width;
         rt->height = height;
+        rt->levels = levels;
         DC_INFO("gpu: %s target %#llx %ux%u fmt %lu", depth ? "depth" : "render", addr, width, height, (unsigned long)fmt);
         list.push_back(std::move(rt));
         return *list.back();
     }
 
-    RenderTarget& GetColorTarget(u64 addr, MTLPixelFormat fmt, u32 width, u32 height) {
-        return GetTarget(color_targets, addr, fmt, width, height, false);
+    // Levels [base, base + count) of `rt` (the texture itself when that is all of it).
+    id<MTLTexture> TargetView(RenderTarget& rt, u32 base, u32 count, MTLPixelFormat fmt = MTLPixelFormatInvalid) {
+        if (fmt == MTLPixelFormatInvalid) {
+            fmt = rt.tex.pixelFormat;
+        }
+        base = std::min(base, rt.levels - 1);
+        count = std::clamp<u32>(count, 1, rt.levels - base);
+        if (base == 0 && count == rt.levels && fmt == rt.tex.pixelFormat) {
+            return rt.tex;
+        }
+        const u64 key = base | (u64(count) << 8) | (u64(fmt) << 16);
+        auto it = rt.views.find(key);
+        if (it != rt.views.end()) {
+            return it->second;
+        }
+        id<MTLTexture> v = [rt.tex newTextureViewWithPixelFormat:fmt
+                                                      textureType:MTLTextureType2D
+                                                           levels:NSMakeRange(base, count)
+                                                           slices:NSMakeRange(0, 1)];
+        rt.views[key] = v;
+        return v;
+    }
+
+    RenderTarget& GetColorTarget(u64 addr, MTLPixelFormat fmt, u32 width, u32 height, u32 levels = 1) {
+        return GetTarget(color_targets, addr, fmt, width, height, false, levels);
     }
 
     RenderTarget& GetDepthTarget(u64 addr, MTLPixelFormat fmt, u32 width, u32 height) {
@@ -1588,14 +1639,6 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
         BeginPass(colors, depth, true, r.F(Reg::DB_DEPTH_CLEAR));
         return; // the draw only exists to clear depth
     }
-    bool pending_clear = depth && depth->clear_pending;
-    for (u32 k = 0; k < 8; ++k) {
-        pending_clear = pending_clear || (colors[k] && colors[k]->clear_pending);
-    }
-    if (!enc || !(want == pass) || pending_clear) {
-        BeginPass(colors, depth, false, 1.0f);
-    }
-
     // ---- shaders ----
     const u32* vs_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_VS_0);
     const u32* ps_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_PS_0);
@@ -1615,6 +1658,14 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
     Resolve(*vs, vs_ud, vs_types, vs_res);
     if (ps) {
         Resolve(*ps, ps_ud, ps_types, ps_res);
+    }
+
+    bool pending_clear = depth && depth->clear_pending;
+    for (u32 k = 0; k < 8; ++k) {
+        pending_clear = pending_clear || (colors[k] && colors[k]->clear_pending);
+    }
+    if (!enc || !(want == pass) || pending_clear) {
+        BeginPass(colors, depth, false, 1.0f);
     }
 
     // ---- functions ----
