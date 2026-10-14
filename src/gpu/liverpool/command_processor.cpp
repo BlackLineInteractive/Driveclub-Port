@@ -520,7 +520,13 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                             (unsigned long long)(u64(body[1]) | (u64(body[2]) << 32)), body_n - 3, body[0],
                             body_n > 3 ? body[3] : 0);
                 }
-                std::memcpy(Ptr<u32>(body[1], body[2]), body + 3, (body_n - 3) * 4);
+                u32* dst = Ptr<u32>(body[1], body[2]);
+                std::memcpy(dst, body + 3, (body_n - 3) * 4);
+                // Like a CE dump: draws recorded before this one must still read the
+                // old data when the host GPU runs them, later ones the new data.
+                if (renderer && body_n - 3 > 2) {
+                    renderer->NoteConstDump(reinterpret_cast<u64>(dst), (body_n - 3) * 4);
+                }
             }
             break;
         }
