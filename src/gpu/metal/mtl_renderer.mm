@@ -162,9 +162,9 @@ vertex V copy_vs(uint vid [[vertex_id]]) {
     return o;
 }
 fragment float4 debug_fs() { return float4(1.0, 0.0, 1.0, 1.0); }
-fragment float4 dump_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]], constant uint& alpha [[buffer(1)]]) {
+fragment float4 dump_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]], constant float2& opt [[buffer(1)]]) {
     constexpr sampler s(filter::nearest, address::clamp_to_edge);
-    float3 c = alpha ? float3(src.sample(s, in.uv).a) * 0.5 : src.sample(s, in.uv).rgb;
+    float3 c = (opt.x != 0.0 ? float3(src.sample(s, in.uv).a) * 0.5 : src.sample(s, in.uv).rgb) * opt.y;
     if (any(isnan(c)) || any(isinf(c))) return float4(1.0, 0.0, 1.0, 1.0);
     return float4(max(c, 0.0) / (1.0 + max(c, 0.0)) * 2.0, 1.0);
 }
@@ -645,8 +645,10 @@ struct MetalRenderer::Impl {
         id<MTLRenderCommandEncoder> e = [cmd renderCommandEncoderWithDescriptor:rp];
         const float scale[2] = {1, 1};
         [e setRenderPipelineState:dump_pipeline];
-        static const u32 dump_alpha = std::getenv("DC_DUMP_ALPHA") != nullptr; // pass dumps show alpha
-        [e setFragmentBytes:&dump_alpha length:4 atIndex:1];
+        // DC_DUMP_ALPHA: show alpha; DC_DUMP_GAIN=<x>: scale before the x/(1+x) display curve
+        static const float dump_opt[2] = {std::getenv("DC_DUMP_ALPHA") ? 1.0f : 0.0f,
+                                          std::getenv("DC_DUMP_GAIN") ? std::strtof(std::getenv("DC_DUMP_GAIN"), nullptr) : 1.0f};
+        [e setFragmentBytes:dump_opt length:sizeof(dump_opt) atIndex:1];
         [e setFragmentTexture:t atIndex:0];
         [e setFragmentBytes:scale length:sizeof(scale) atIndex:0];
         [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];

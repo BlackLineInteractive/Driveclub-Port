@@ -1271,6 +1271,17 @@ void Emitter::EmitExp(const Inst& i) {
     }
     const OutType type = o.mrt_type[i.target];
     const std::string dst = "out.c" + N(i.target);
+    // DC_PS_REG=<ps address hex>:<vgpr>: that shader exports vN..vN+2 instead (debugging)
+    if (static const char* reg = std::getenv("DC_PS_REG"); reg && type == OutType::Float && i.target == 0) {
+        char* e = nullptr;
+        const u64 at = std::strtoull(reg, &e, 16);
+        if (at == p.address && *e == ':') {
+            const u32 n = std::strtoul(e + 1, nullptr, 10);
+            Line(dst + " = float4(as_type<float>(" + VName(n) + "), as_type<float>(" + VName(n + 1) +
+                 "), as_type<float>(" + VName(n + 2) + "), 1.0f);");
+            return;
+        }
+    }
     if (i.compr) {
         const std::string a = VName(i.vsrc[0]), b = VName(i.vsrc[1]);
         std::string value;
