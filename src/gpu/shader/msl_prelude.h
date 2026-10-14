@@ -218,6 +218,19 @@ static inline uint dc_cvt_i32(float f) {
     return uint(int(f));
 }
 static inline uint dc_f16(float f) { return uint(as_type<ushort>(half(f))); }
+// V_CVT_PKRTZ: round toward zero, so finite values never become infinity.
+static inline uint dc_f16_rtz(float f) {
+    if (isnan(f)) return 0x7e00u;
+    if (isinf(f)) return f > 0.0f ? 0x7c00u : 0xfc00u;
+    half h = half(clamp(f, -65504.0f, 65504.0f));
+    if (abs(float(h)) > abs(f)) {
+        ushort b = as_type<ushort>(h);
+        h = as_type<half>(ushort(b - 1u)); // one ulp toward zero
+    }
+    return uint(as_type<ushort>(h));
+}
+// The VALU clamp modifier: NaN becomes 0 (Metal's saturate keeps NaN).
+static inline float dc_sat(float f) { return f > 0.0f ? min(f, 1.0f) : 0.0f; }
 static inline float dc_f32(uint v) { return float(as_type<half>(ushort(v & 0xffffu))); }
 static inline float dc_med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
 static inline int dc_med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }

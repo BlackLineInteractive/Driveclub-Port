@@ -149,7 +149,7 @@ private:
         if (i.omod == 1) e = "(" + e + ") * 2.0f";
         else if (i.omod == 2) e = "(" + e + ") * 4.0f";
         else if (i.omod == 3) e = "(" + e + ") * 0.5f";
-        if (i.clamp) e = "saturate(" + e + ")";
+        if (i.clamp) e = "dc_sat(" + e + ")";
         return "as_type<uint>(" + e + ")";
     }
     void SetVF(const Inst& i, const std::string& fe) { SetV(i.dst, FOut(i, fe)); }
@@ -621,7 +621,7 @@ void Emitter::EmitVop(const Inst& i) {
     case Vop::V_LDEXP_F32: SetVF(i, "ldexp(" + f(0) + ", " + s(1) + ")"); break;
     case Vop::V_CVT_PKNORM_I16_F32: SetV(i.dst, "pack_float_to_snorm2x16(float2(" + f(0) + ", " + f(1) + "))"); break;
     case Vop::V_CVT_PKNORM_U16_F32: SetV(i.dst, "pack_float_to_unorm2x16(float2(" + f(0) + ", " + f(1) + "))"); break;
-    case Vop::V_CVT_PKRTZ_F16_F32: SetV(i.dst, "dc_f16(" + f(0) + ") | (dc_f16(" + f(1) + ") << 16)"); break;
+    case Vop::V_CVT_PKRTZ_F16_F32: SetV(i.dst, "dc_f16_rtz(" + f(0) + ") | (dc_f16_rtz(" + f(1) + ") << 16)"); break;
     case Vop::V_CVT_PK_U16_U32: SetV(i.dst, "min(" + u(0) + ", 0xffffu) | (min(" + u(1) + ", 0xffffu) << 16)"); break;
     case Vop::V_CVT_PK_I16_I32:
         SetV(i.dst, "(uint(clamp(" + s(0) + ", -32768, 32767)) & 0xffffu) | (uint(clamp(" + s(1) + ", -32768, 32767)) << 16)");
