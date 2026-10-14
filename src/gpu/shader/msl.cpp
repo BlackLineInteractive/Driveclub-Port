@@ -1655,7 +1655,7 @@ std::string Emitter::Run() {
         if (o.rect_list) {
             // As shadPS4's rect list TCS: the vertex whose x matches one neighbour and y
             // the other is the right-angle corner; the 4th vertex is opposite it. Triangles:
-            // the given one, then the two others with the 4th.
+            // the given one, then the two others with the 4th, wound the same way (culling).
             src += "    uint r_ = vid / 6u, c_ = vid % 6u;\n";
             src += "    if (c_ < 3u) {\n        o = dc_run(r_ * 3u + c_, iid, " + args + ");\n    } else {\n";
             src += "        VsOut v_[3] = {dc_run(r_ * 3u, iid, " + args + "), dc_run(r_ * 3u + 1u, iid, " + args +
@@ -1667,7 +1667,7 @@ std::string Emitter::Run() {
             src += "            bool edge = (e_[i].x && e_[(i + 2u) % 3u].y) || (e_[i].y && e_[(i + 2u) % 3u].x);\n";
             src += "            b_[i] = edge ? -1.0f : 1.0f; if (edge) ci_ = i;\n        }\n";
             src += "        if (min(b_[0], min(b_[1], b_[2])) > 0.0f) b_[0] = -1.0f; // no right angle: v0\n";
-            src += "        if (c_ < 5u) {\n            o = v_[(ci_ + c_ - 2u) % 3u];\n        } else {\n";
+            src += "        if (c_ < 5u) {\n            o = v_[(ci_ + 5u - c_) % 3u];\n        } else {\n";
             src += "            o.pos = v_[0].pos * b_[0] + v_[1].pos * b_[1] + v_[2].pos * b_[2];\n";
             for (u32 k = 0; k < 32; ++k) {
                 if (p.param_mask & (1u << k)) {

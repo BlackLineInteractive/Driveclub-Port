@@ -2839,8 +2839,15 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   [enc setDepthClipMode:zclip ? MTLDepthClipModeClip : MTLDepthClipModeClamp];
   const u32 su = r[Reg::PA_SU_SC_MODE_CNTL];
   static const bool no_cull = std::getenv("DC_NO_CULL") != nullptr;
-  const bool cull_front = (su & 1) && !no_cull,
-             cull_back = ((su >> 1) & 1) && !no_cull;
+  // shadPS4 IsPrimitiveCulled: only triangle-type primitives are culled (not
+  // rect lists, points or lines).
+  const bool cullable = prim == PrimType::TriList ||
+                        prim == PrimType::TriStrip ||
+                        prim == PrimType::TriFan ||
+                        prim == PrimType::QuadList ||
+                        prim == PrimType::Polygon;
+  const bool cull_front = (su & 1) && !no_cull && cullable,
+             cull_back = ((su >> 1) & 1) && !no_cull && cullable;
   [enc setCullMode:(cull_front && cull_back) ? MTLCullModeNone
                    : cull_front              ? MTLCullModeFront
                    : cull_back               ? MTLCullModeBack
