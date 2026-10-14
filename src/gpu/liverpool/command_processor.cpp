@@ -514,6 +514,12 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
         case Op::WriteData: {
             const u32 dst_sel = (body[0] >> 8) & 0xF;
             if (dst_sel == 1 || dst_sel == 2 || dst_sel == 5) {
+                static const bool log = std::getenv("DC_LOG_WRITEDATA") != nullptr;
+                if (log) {
+                    DC_INFO("gpu: WRITE_DATA %#llx %u dwords ctl %#x val %#x",
+                            (unsigned long long)(u64(body[1]) | (u64(body[2]) << 32)), body_n - 3, body[0],
+                            body_n > 3 ? body[3] : 0);
+                }
                 std::memcpy(Ptr<u32>(body[1], body[2]), body + 3, (body_n - 3) * 4);
             }
             break;
