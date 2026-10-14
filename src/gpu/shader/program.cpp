@@ -107,12 +107,17 @@ public:
                 Set(i.dst + 1u, b);
                 return;
             }
-            Clobber(i.dst, 2);
+            Clobber(i.dst, Width(i));
             return;
         }
         case Enc::SOP2:
+            Clobber(i.dst, Width(i));
+            return;
         case Enc::SOPK:
-            Clobber(i.dst, 2);
+            if (i.op >= static_cast<u16>(Sopk::S_CMPK_EQ_I32) && i.op <= static_cast<u16>(Sopk::S_CMPK_LE_U32)) {
+                return; // compares write SCC only
+            }
+            Clobber(i.dst, 1);
             return;
         case Enc::VOPC:
         case Enc::VOP2:
@@ -134,6 +139,12 @@ public:
     }
 
 private:
+    // Scalar registers an SALU instruction writes: two for the 64-bit forms.
+    static u32 Width(const Inst& i) {
+        const char* n = OpName(i.enc, i.op);
+        return n && std::strstr(n, "64") ? 2 : 1;
+    }
+
     void Set(u32 reg, const SgprSource& s) {
         if (reg < state.size()) {
             state[reg] = s;

@@ -57,6 +57,7 @@ enum class TexSample : u8 { Float, Uint, Sint };
 struct TextureType {
     TexDim dim = TexDim::Tex2D;
     TexSample sample = TexSample::Float;
+    u8 compare = 3; // depth-compare sampling: S# DEPTH_COMPARE_FUNC (ref <op> texel), default LEQUAL
     bool operator==(const TextureType&) const = default;
 };
 

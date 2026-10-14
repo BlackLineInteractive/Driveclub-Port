@@ -1053,6 +1053,14 @@ void Emitter::EmitBuffer(const Inst& i) {
     Line("}");
 }
 
+// Depth-compare result (1 or 0) for S# DEPTH_COMPARE_FUNC `func`: ref <op> texel.
+static std::string Compare(u8 func, const std::string& ref, const std::string& texel) {
+    static const char* ops[8] = {nullptr, "<", "==", "<=", ">", "!=", ">=", nullptr};
+    if (func == 0) return "0.0f";
+    if (func == 7) return "1.0f";
+    return "(" + ref + " " + ops[func & 7] + " " + texel + " ? 1.0f : 0.0f)";
+}
+
 void Emitter::EmitImage(const Inst& i) {
     const u32 slot = p.ImageSlot(i.pc);
     const TextureType tt = slot < o.textures.size() ? o.textures[slot] : TextureType{};
@@ -1191,8 +1199,9 @@ void Emitter::EmitImage(const Inst& i) {
         const std::string offs = tt.dim == TexDim::Tex3D ? "" : ", int2(0)";
         Line(std::string("  ") + vec + " r_ = " + t + ".gather(" + args + offs + ", " + comps[comp] + ");");
         if (c) {
-            Line("  r_ = " + std::string(vec) + "(" + ref + " <= r_.x ? 1.0f : 0.0f, " + ref + " <= r_.y ? 1.0f : 0.0f, " +
-                 ref + " <= r_.z ? 1.0f : 0.0f, " + ref + " <= r_.w ? 1.0f : 0.0f);");
+            Line("  r_ = " + std::string(vec) + "(" + Compare(tt.compare, ref, "r_.x") + ", " +
+                 Compare(tt.compare, ref, "r_.y") + ", " + Compare(tt.compare, ref, "r_.z") + ", " +
+                 Compare(tt.compare, ref, "r_.w") + ");");
         }
         for (u32 n = 0; n < 4; ++n) {
             SetV(i.vdata + n, "as_type<uint>(r_[" + N(n) + "])");
@@ -1206,7 +1215,7 @@ void Emitter::EmitImage(const Inst& i) {
     else if (d) args += ", " + grad;
     Line(std::string("  ") + vec + " r_ = " + t + ".sample(" + args + ");");
     if (c) {
-        Line("  r_ = " + std::string(vec) + "(" + ref + " <= r_.x ? 1.0f : 0.0f);");
+        Line("  r_ = " + std::string(vec) + "(" + Compare(tt.compare, ref, "r_.x") + ");");
     }
     write_dmask("r_");
     Line("}");

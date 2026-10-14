@@ -86,6 +86,8 @@ constexpr u32 PA_SU_SC_MODE_CNTL = 0xA205;
 constexpr u32 PA_CL_VTE_CNTL = 0xA206;
 constexpr u32 PA_CL_VS_OUT_CNTL = 0xA207;
 constexpr u32 VGT_PRIMITIVE_RESTART = 0xA2A5; // VGT_MULTI_PRIM_IB_RESET_EN
+constexpr u32 PA_SU_POLY_OFFSET_CLAMP = 0xA2DF;
+constexpr u32 PA_SU_POLY_OFFSET_FRONT_SCALE = 0xA2E0; // FRONT_SCALE, FRONT_OFFSET, BACK_SCALE, BACK_OFFSET
 constexpr u32 CB_COLOR0_BASE = 0xA318;
 constexpr u32 kColorTargetStride = 15; // CB_COLORn_* blocks are 15 dwords apart
 // Offsets inside one CB_COLORn block.

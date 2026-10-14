@@ -162,9 +162,9 @@ vertex V copy_vs(uint vid [[vertex_id]]) {
     return o;
 }
 fragment float4 debug_fs() { return float4(1.0, 0.0, 1.0, 1.0); }
-fragment float4 dump_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]]) {
+fragment float4 dump_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]], constant uint& alpha [[buffer(1)]]) {
     constexpr sampler s(filter::nearest, address::clamp_to_edge);
-    float3 c = src.sample(s, in.uv).rgb;
+    float3 c = alpha ? float3(src.sample(s, in.uv).a) * 0.5 : src.sample(s, in.uv).rgb;
     if (any(isnan(c)) || any(isinf(c))) return float4(1.0, 0.0, 1.0, 1.0);
     return float4(max(c, 0.0) / (1.0 + max(c, 0.0)) * 2.0, 1.0);
 }
@@ -630,6 +630,8 @@ struct MetalRenderer::Impl {
             id<MTLRenderCommandEncoder> e = [cmd renderCommandEncoderWithDescriptor:rp];
             const float scale[2] = {1, 1};
             [e setRenderPipelineState:dump_pipeline];
+            static const u32 dump_alpha = std::getenv("DC_DUMP_ALPHA") != nullptr; // pass dumps show alpha
+            [e setFragmentBytes:&dump_alpha length:4 atIndex:1];
             [e setFragmentTexture:t atIndex:0];
             [e setFragmentBytes:scale length:sizeof(scale) atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -1484,6 +1486,14 @@ struct MetalRenderer::Impl {
     };
     // Evaluates each image instruction's descriptors against the user data.
     void Resolve(const Program& p, const u32* ud, std::vector<TextureType>& types, Resources& out) {
+        std::vector<std::array<u32, 4>> ssharps;
+        for (const auto& ss : p.samplers) {
+            std::array<u32, 4> s{};
+            for (u32 k = 0; k < 4; ++k) {
+                s[k] = Shader::ResolveSgpr(ss[k], ud);
+            }
+            ssharps.push_back(s);
+        }
         for (const auto& img : p.images) {
             u32 t[8];
             for (u32 k = 0; k < 8; ++k) {
@@ -1501,15 +1511,27 @@ struct MetalRenderer::Impl {
                         (t[2] & 0x3FFF) + 1, ((t[2] >> 14) & 0x3FFF) + 1, (t[3] >> 20) & 0x1F, t[3] >> 28,
                         t[3] & 0xFFF, img.storage ? " storage" : "");
             }
+            if (img.compare && img.has_sampler && img.sampler_index < ssharps.size()) {
+                tt.compare = static_cast<u8>((ssharps[img.sampler_index][0] >> 12) & 7);
+                static const bool always = std::getenv("DC_CMP_ALWAYS") != nullptr; // debug experiment
+                if (always) {
+                    tt.compare = 7;
+                }
+                static const bool flip = std::getenv("DC_CMP_FLIP") != nullptr; // debug experiment
+                if (flip && tt.compare >= 1 && tt.compare <= 6 && tt.compare != 2 && tt.compare != 5) {
+                    tt.compare = tt.compare == 1 ? 6 : tt.compare == 3 ? 4 : tt.compare == 4 ? 3 : 1;
+                }
+                if (trace) {
+                    const auto& ss = ssharps[img.sampler_index];
+                    DC_INFO("gpu:   compare sampler S# %08x %08x %08x %08x func %u", ss[0], ss[1], ss[2], ss[3],
+                            tt.compare);
+                }
+            }
             types.push_back(tt);
             out.tex.push_back(tex);
         }
-        for (const auto& ss : p.samplers) {
-            u32 s[4] = {};
-            for (u32 k = 0; k < 4; ++k) {
-                s[k] = Shader::ResolveSgpr(ss[k], ud);
-            }
-            out.smp.push_back(GetSampler(s));
+        for (const auto& s : ssharps) {
+            out.smp.push_back(GetSampler(s.data()));
         }
     }
 
@@ -1941,6 +1963,16 @@ void MetalRenderer::Impl::Draw(const RegFile& r, const DrawCall& dc) {
                      : cull_front ? MTLCullModeFront
                      : cull_back ? MTLCullModeBack : MTLCullModeNone];
     [enc setFrontFacingWinding:((su >> 2) & 1) ? MTLWindingClockwise : MTLWindingCounterClockwise];
+    if (depth) {
+        // Polygon offset (shadow maps rely on it): POLY_OFFSET_FRONT/BACK_ENABLE.
+        const bool front = (su >> 11) & 1, back = (su >> 12) & 1;
+        if (front || back) {
+            const u32 base = Reg::PA_SU_POLY_OFFSET_FRONT_SCALE + (front ? 0 : 2);
+            [enc setDepthBias:r.F(base + 1) slopeScale:r.F(base) / 16.0f clamp:r.F(Reg::PA_SU_POLY_OFFSET_CLAMP)];
+        } else {
+            [enc setDepthBias:0 slopeScale:0 clamp:0];
+        }
+    }
     [enc setBlendColorRed:r.F(Reg::CB_BLEND_RED)
                     green:r.F(Reg::CB_BLEND_RED + 1)
                      blue:r.F(Reg::CB_BLEND_RED + 2)
@@ -2120,6 +2152,18 @@ void MetalRenderer::Impl::Dispatch(const RegFile& r, u32 gx, u32 gy, u32 gz) {
         if (addr == peek_cs) {
             for (u32 k = 0; k + 1 < 12; k += 4) {
                 peek_addrs.push_back((u64(ud[k]) | (u64(ud[k + 1] & 0xFFF) << 32)) & kGpuAddrMask);
+            }
+            // DC_PEEK_TABLE=<ud>,<dword>: also the V# found at pointer ud[n..n+1] + dword*4
+            if (const char* pt = std::getenv("DC_PEEK_TABLE")) {
+                char* e = nullptr;
+                const u32 n = std::strtoul(pt, &e, 10);
+                const u32 off = *e ? std::strtoul(e + 1, nullptr, 10) : 0;
+                const u64 table = u64(ud[n]) | (u64(ud[n + 1] & 0xFFFF) << 32);
+                if (n + 1 < 16 && Readable(table + off * 4, 16)) {
+                    const u32* v = reinterpret_cast<const u32*>(table + off * 4);
+                    DC_INFO("gpu: peek table %#llx+%u: V# %08x %08x %08x %08x", table, off, v[0], v[1], v[2], v[3]);
+                    peek_addrs.push_back((u64(v[0]) | (u64(v[1] & 0xFFF) << 32)) & kGpuAddrMask);
+                }
             }
         }
     }
