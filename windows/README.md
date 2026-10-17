@@ -41,7 +41,7 @@ Requirements: Windows 10/11 64-bit, a CPU with AVX, a Vulkan 1.3 GPU.
 
 ## Windows port credits
 
-DCport (the Windows backend) is a modified version of other people's work; almost all of it is theirs.
+DCport is built on other people's work: the native PS4 runtime by deadinside28 and Supermedo, and shadPS4's renderer. The Driveclub support, the launcher and the tools are new.
 
 - **Native PS4 runtime:** deadinside28 ([bloodborne_pc](https://github.com/deadinside28/bloodborne_pc)) and the Windows port by Supermedo ([bloodborne_pc](https://github.com/Supermedo/bloodborne_pc)).
 - **[shadPS4](https://github.com/shadps4-emu/shadPS4):** renderer, shader recompiler and libraries the runtime is built on.
