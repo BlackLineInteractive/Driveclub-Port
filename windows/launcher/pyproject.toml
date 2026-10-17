@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+# Tcl caches and later closes the OS standard handles; pytest's default fd capture swaps
+# those handles between tests, so a new Tk() sometimes fails to read init.tcl.
+addopts = "--capture=sys"

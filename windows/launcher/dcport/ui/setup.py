@@ -1,0 +1,390 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""SETUP page: game folder, frame rate, window, FPS counter, upscaling, prepare again."""
+
+import tkinter as tk
+from pathlib import Path
+
+from dcport.game import ready_checks
+from dcport.prepare_state import is_prepared
+from dcport.runtime import FPS_PRESETS, fps_note, parse_fps
+from dcport.ui import theme
+
+FPS_ERROR = "Enter a whole number from 30 to 240"
+FSR4_MISSING = "FSR 4 needs the fsr4_shaders folder next to DriveClub.exe"
+HINT = "Changes save at once. Game not starting after an update? Prepare its files again."
+UPSCALERS = (("off", "Off"), ("fsr3", "FSR 3.1"), ("fsr4", "FSR 4"))
+GLYPHS = {"ok": "✓", "warn": "⚠", "bad": "✕"}
+DEFAULT_SHARPNESS = 0.30  # the runtime's value when dcport.ini has none
+
+
+class SetupPage(tk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        app.paint(self, bg="bg")
+        self._build_bottom()
+        self.board = theme.CardBoard(self, app, columns=2)
+        self.board.pack(fill="x")
+        self._build_game(self.board.add(0, 0, title="Game folder"))
+        self._build_fps(self.board.add(0, 1, title="Frame rate"))
+        self._build_display(self.board.add(1, 0, title="Display"))
+        self.upscaler_choice = None
+        if app.fsr:
+            self._build_upscaling(self.board.add(1, 1, title="Upscaling"))
+        self._error = ""
+        self._phase = app.phase
+        self._checks: list[tuple[tk.Label, str]] = []
+        # runs now and after every theme switch, which repaints the state colours
+        app.on_theme(lambda pal: self._repaint())
+
+    # ------------------------------------------------------------ building
+
+    def _row(self, master) -> tk.Frame:
+        row = tk.Frame(master)
+        self.app.paint(row, bg="panel")
+        return row
+
+    def _settings_grid(self, card) -> tk.Frame:
+        """Label | control rows, with the same label width in every card."""
+        grid = self._row(card)
+        grid.pack(fill="x")
+        grid.columnconfigure(0, minsize=self.app.px(112))
+        grid.columnconfigure(1, weight=1)
+        return grid
+
+    def _wrapping(self, label: tk.Label, master: tk.Misc) -> tk.Label:
+        """Wrap the label's text at the card's width."""
+        master.bind("<Configure>", lambda e: label.configure(wraplength=max(1, e.width)),
+                    add="+")
+        return label
+
+    def _build_bottom(self) -> None:
+        app = self.app
+        bar = tk.Frame(self)
+        app.paint(bar, bg="bg")
+        bar.pack(side="bottom", fill="x", padx=app.px(24), pady=(app.px(16), app.px(20)))
+        self.prepare_button = theme.PillButton(bar, app, "Prepare game files again",
+                                               self.prepare_again, kind="secondary",
+                                               font=app.fonts["button"], height=app.px(40),
+                                               padx=app.px(22))
+        self.prepare_button.pack(side="right")
+        self.status = theme.text_label(bar, app, HINT, fg="muted", bg="bg")
+        self.status.pack(side="left", fill="x", expand=True)
+
+    def _build_game(self, card) -> None:
+        app = self.app
+        row = self._row(card)
+        row.pack(fill="x")
+        change = theme.PillButton(row, app, "Change…", self._change_folder, kind="secondary",
+                                  font=app.fonts["button"], height=app.px(32),
+                                  padx=app.px(18), bg_role="panel")
+        change.pack(side="right", padx=(app.px(10), 0))
+        self.folder = theme.Field(row, app, width=app.px(160), editable=False)
+        self.folder.pack(side="left", fill="x", expand=True)
+        self.game_check = theme.text_label(card, app)
+        self.game_check.pack(fill="x", pady=(app.px(12), 0))
+        self.files_check = theme.text_label(card, app)
+        self.files_check.pack(fill="x", pady=(app.px(4), 0))
+
+    def _build_fps(self, card) -> None:
+        app = self.app
+        options = [(fps, str(fps)) for fps in FPS_PRESETS] + [("custom", "Custom")]
+        self.fps_choice = theme.Segmented(card, app, options, self._pick_fps, min_label="000",
+                                          pad=app.px(12))
+        self.fps_choice.pack(anchor="w")
+        row = self._row(card)
+        row.pack(fill="x", pady=(app.px(14), 0))
+        theme.text_label(row, app, "Custom").pack(side="left")
+        self.custom = theme.Field(row, app, width=app.px(64), justify="center")
+        self.custom.pack(side="left", padx=(app.px(12), app.px(8)))
+        theme.text_label(row, app, "FPS").pack(side="left")
+        theme.text_label(row, app, "30 to 240, then Enter", font="small", fg="muted").pack(
+            side="left", padx=(app.px(14), 0))
+        entry = self.custom.entry
+        for key in ("<Return>", "<KP_Enter>"):
+            entry.bind(key, lambda e: self.apply_custom_fps(entry.get()))
+        entry.bind("<FocusOut>", self._custom_left, add="+")
+        entry.bind("<Escape>", lambda e: self._custom_cancel())
+        self.fps_error = theme.text_label(card, app, font="small_bold", fg="bad")
+        self.fps_note = theme.text_label(card, app, font="small", fg="warn")
+        self._wrapping(self.fps_note, card)
+
+    def _build_display(self, card) -> None:
+        app = self.app
+        grid = self._settings_grid(card)
+        theme.text_label(grid, app, "Window").grid(row=0, column=0, sticky="w")
+        self.window_choice = theme.Segmented(
+            grid, app, (("windowed", "Windowed"), ("fullscreen", "Fullscreen")),
+            lambda v: self.set_fullscreen(v == "fullscreen"), min_label="Fullscreen")
+        self.window_choice.grid(row=0, column=1, sticky="w")
+        theme.text_label(grid, app, "FPS counter").grid(row=1, column=0, sticky="w",
+                                                        pady=(app.px(10), 0))
+        self.counter_choice = theme.Segmented(grid, app, ((True, "On"), (False, "Off")),
+                                              self.set_fps_counter, min_label="Fullscreen")
+        self.counter_choice.grid(row=1, column=1, sticky="w", pady=(app.px(10), 0))
+        hint = theme.text_label(card, app, "More settings in game: press Insert, or L3 + R3 "
+                                "on a controller.", font="small", fg="muted")
+        self._wrapping(hint, card).pack(fill="x", pady=(app.px(14), 0))
+
+    def _build_upscaling(self, card) -> None:
+        app = self.app
+        grid = self._settings_grid(card)
+        theme.text_label(grid, app, "Upscaler").grid(row=0, column=0, sticky="w")
+        self.upscaler_choice = theme.Segmented(grid, app, UPSCALERS, self.set_upscaler,
+                                               min_label="FSR 3.1")
+        self.upscaler_choice.grid(row=0, column=1, sticky="w")
+        theme.text_label(grid, app, "Sharpness").grid(row=1, column=0, sticky="w",
+                                                      pady=(app.px(10), 0))
+        row = self._row(grid)
+        row.grid(row=1, column=1, sticky="we", pady=(app.px(10), 0))
+        self.sharpness_value = theme.text_label(row, app, "0.30", font="body_bold", width=4,
+                                                anchor="e")
+        self.sharpness_value.pack(side="right")
+        self.sharpness = theme.Slider(row, app, length=app.px(140),
+                                      on_change=self._sharpness_moved,
+                                      on_commit=self.set_sharpness)
+        self.sharpness.pack(side="left", fill="x", expand=True, padx=(0, app.px(10)))
+        self.upscaler_note = theme.text_label(card, app, font="small", fg="muted")
+        self._wrapping(self.upscaler_note, card)
+
+    # ------------------------------------------------------------ showing
+
+    def on_show(self) -> None:
+        self._show_checks()
+        self.refresh_session()
+
+    def on_hide(self) -> None:
+        if self._typing():  # leaving the page leaves the Custom field: apply what it holds
+            self._custom_left(None)
+            self.focus_set()
+
+    def _repaint(self) -> None:
+        self._paint_checks()
+        self.refresh_session()
+
+    def _typing(self) -> bool:
+        """True while the Custom FPS field has the focus (its text may be half-typed)."""
+        try:
+            return self.focus_lastfor() is self.custom.entry
+        except (KeyError, tk.TclError):
+            return False
+
+    def refresh_session(self) -> None:
+        """Show the saved values (App's settings and dcport.ini); RACE's card shows the same.
+
+        Runs after every settings save, so it only reads files that are cheap to read; the
+        folder checks (is_prepared) wait for show(), a folder change or a process ending.
+        """
+        app, s = self.app, self.app.settings
+        self.folder.set(s.game_dir or "No folder chosen")
+        if not self._typing():
+            if s.fps in FPS_PRESETS:
+                self.fps_choice.set(s.fps)
+                self.custom.set("")
+            else:
+                self.fps_choice.set("custom")
+                self.custom.set(str(s.fps))
+            self._show_fps_error("")
+        note = fps_note(s.fps) or ("The game's original timing (no frame-rate patches)."
+                                   if s.fps == 30 else "")
+        self.fps_note.configure(text=note, fg=app.palette["warn" if s.fps > 120 else "muted"])
+        self._pack_if(self.fps_note, bool(note), pady=(app.px(10), 0))
+        self.window_choice.set("fullscreen" if s.fullscreen else "windowed")
+        self.counter_choice.set(app.fps_counter_on())
+        if self.upscaler_choice is not None:
+            self._refresh_upscaling()
+        self._show_status()
+        self.set_phase(app.phase)
+
+    def _show_checks(self) -> None:
+        app = self.app
+        folder = Path(app.settings.game_dir) if app.settings.game_dir else \
+            app.paths.root / "(no game folder)"
+        gd = app.game_dir()
+        prepared = False
+        if gd is not None:
+            try:
+                prepared = is_prepared(app.paths, gd)
+            except (OSError, ValueError):
+                prepared = False
+        game, _, _, files = ready_checks(folder, app.paths, app.gpu, prepared)
+        for label, check in ((self.game_check, game), (self.files_check, files)):
+            label.configure(text=f"{GLYPHS.get(check.state, '')} {check.label}")
+        self._checks = [(self.game_check, game.state), (self.files_check, files.state)]
+        self._paint_checks()
+        self._pack_if(self.files_check, gd is not None, pady=(app.px(4), 0))
+
+    def _paint_checks(self) -> None:
+        for label, state in self._checks:
+            label.configure(fg=self.app.palette[state])
+
+    def _pack_if(self, widget: tk.Misc, show: bool, **pack) -> None:
+        if show:
+            widget.pack(fill="x", **pack)
+        else:
+            widget.pack_forget()
+
+    def _show_status(self, error: "str | None" = None) -> None:
+        """The bottom line: the last save error, else the hint."""
+        if error is not None:
+            self._error = error
+        role = "bad" if self._error else "muted"
+        self.status.configure(text=self._error or HINT, fg=self.app.palette[role])
+
+    def status_text(self) -> str:
+        return self._error
+
+    def set_phase(self, phase: str) -> None:
+        ended = phase == "idle" and self._phase != "idle"
+        self._phase = phase
+        self.prepare_button.set("Prepare game files again", enabled=phase == "idle")
+        if ended:
+            self._show_checks()  # a prepare may have changed the game files
+
+    # ------------------------------------------------------------ game folder
+
+    def _change_folder(self) -> None:
+        if self.app.ask_game_folder():
+            self._show_checks()
+            self.refresh_session()
+
+    def prepare_enabled(self) -> bool:
+        return self.prepare_button.enabled
+
+    def prepare_again(self) -> bool:
+        """Delete data/source.txt and run the prepare tool; never starts the game."""
+        if self.app.phase != "idle":
+            return False
+        return self.app.prepare(start_game=False)
+
+    # ------------------------------------------------------------ frame rate
+
+    def _saved(self, ok: bool) -> None:
+        self._show_status("" if ok else "Could not save the settings file (dcport-launcher.json)")
+
+    def set_fps(self, fps: int) -> None:
+        self.app.settings.fps = int(fps)
+        self._saved(self.app.save_settings())  # also refreshes this page and RACE's card
+
+    def _pick_fps(self, value) -> None:
+        if value == "custom":
+            self.focus_custom()
+            return
+        if self._typing():  # a preset replaces whatever was being typed
+            self.custom.set("")
+            self.focus_set()
+        self.set_fps(value)
+
+    def focus_custom(self) -> None:
+        """Ready for typing a custom frame rate (also from RACE's Custom… menu item)."""
+        self.fps_choice.set("custom")
+        self.custom.entry.focus_set()
+        self.custom.entry.select_range(0, "end")
+
+    def apply_custom_fps(self, text: str) -> bool:
+        fps = parse_fps(text)
+        if fps is None:
+            self._show_fps_error(FPS_ERROR)
+            self.fps_choice.set("custom")
+            return False
+        self._show_fps_error("")
+        self.set_fps(fps)
+        return True
+
+    def _custom_left(self, event) -> None:
+        text = self.custom.get().strip()
+        if not text:
+            if not self.fps_error.cget("text"):
+                self.refresh_session()
+        elif text != str(self.app.settings.fps):
+            self.apply_custom_fps(text)
+
+    def _custom_cancel(self) -> None:
+        self.refresh_session()
+        self.focus_set()
+
+    def _show_fps_error(self, text: str) -> None:
+        self.fps_error.configure(text=text)
+        place = {"before": self.fps_note} if self.fps_note.winfo_manager() else {}
+        self._pack_if(self.fps_error, bool(text), pady=(self.app.px(10), 0), **place)
+
+    def fps_note_text(self) -> str:
+        return self.fps_note.cget("text") if self.fps_note.winfo_manager() else ""
+
+    def fps_error_text(self) -> str:
+        return self.fps_error.cget("text")
+
+    def selected_fps(self) -> "int | None":
+        value = self.fps_choice.value
+        return value if isinstance(value, int) else parse_fps(self.custom.get())
+
+    # ------------------------------------------------------------ display
+
+    def set_fullscreen(self, on: bool) -> None:
+        self.app.settings.fullscreen = bool(on)
+        self._saved(self.app.save_settings())
+
+    def selected_window(self) -> str:
+        return self.window_choice.value
+
+    def set_fps_counter(self, on: bool) -> None:
+        self._show_status(self.app.update_game_ini({"show_fps": "1" if on else "0"}) or "")
+        self.refresh_session()
+
+    def selected_fps_counter(self) -> bool:
+        return bool(self.counter_choice.value)
+
+    # ------------------------------------------------------------ upscaling (FSR edition)
+
+    def has_upscaler_controls(self) -> bool:
+        return self.upscaler_choice is not None
+
+    def fsr4_available(self) -> bool:
+        try:
+            return any(self.app.paths.fsr4_dir.glob("fsr4_model_*.spv"))
+        except OSError:
+            return False
+
+    def _refresh_upscaling(self) -> None:
+        ini = self.app.game_ini()
+        current = ini.get("upscaler", "fsr3").strip()  # the runtime's default is FSR 3
+        self.upscaler_choice.set(current)
+        fsr4 = self.fsr4_available()
+        self.upscaler_choice.set_enabled("fsr4", fsr4)
+        known = {value for value, _ in UPSCALERS}
+        if not fsr4:
+            note, role = FSR4_MISSING, "warn" if current == "fsr4" else "muted"
+        elif current not in known:
+            note, role = f"Chosen in the game's menu: {current}", "muted"
+        else:
+            note, role = "", "muted"
+        self.upscaler_note.configure(text=note, fg=self.app.palette[role])
+        self._pack_if(self.upscaler_note, bool(note), pady=(self.app.px(12), 0))
+        try:
+            sharpness = float(ini.get("sharpness", DEFAULT_SHARPNESS))
+        except ValueError:
+            sharpness = DEFAULT_SHARPNESS
+        self.sharpness.set(sharpness)
+        self.sharpness.set_enabled(current != "off")  # as in the game's menu
+        self._sharpness_moved(self.sharpness.value)
+
+    def upscaler_note_text(self) -> str:
+        if self.upscaler_choice is None or not self.upscaler_note.winfo_manager():
+            return ""
+        return self.upscaler_note.cget("text")
+
+    def set_upscaler(self, value: str) -> None:
+        # DCport runs DRIVECLUB's upscalers without subpixel jitter: it goes with every change
+        self._show_status(self.app.update_game_ini({"upscaler": value, "jitter": "0"}) or "")
+        self._refresh_upscaling()
+
+    def _sharpness_moved(self, value: float) -> None:
+        self.sharpness_value.configure(text=f"{value:.2f}")
+
+    def sharpness_text(self) -> str:
+        return self.sharpness_value.cget("text")
+
+    def set_sharpness(self, value: float) -> None:
+        value = min(1.0, max(0.0, float(value)))
+        self._show_status(self.app.update_game_ini({"sharpness": f"{value:.2f}"}) or "")
+        self._refresh_upscaling()
