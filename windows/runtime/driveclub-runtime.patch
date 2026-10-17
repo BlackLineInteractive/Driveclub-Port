@@ -1189,10 +1189,18 @@ index 506cc51..6fd582b 100644
      /// cannot run (Problem() says why; missing assets or device features are permanent).
      bool Record(const Frame& frame);
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
-index fad0a85..38a6e6f 100644
+index fad0a85..982fbea 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
-@@ -293,9 +293,14 @@ public:
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <cstdlib>
+ #include <span>
+ #include <unordered_map>
+ 
+@@ -293,9 +294,25 @@ public:
                 features.shaderStorageImageExtendedFormats;
      }
  
@@ -1206,11 +1214,22 @@ index fad0a85..38a6e6f 100644
 +    }
 +    bool HasMixedFloatDotProduct() const {
 +        return mixed_float_dot_product;
++    }
++
++    /// bbport: draws prepared and Vulkan commands recorded on worker threads (faster).
++    /// BB_THREADED_RECORDING=0/1 (dcport.ini threaded_recording); unset or "auto": off on AMD
++    /// RX 6000 and older (device ids below 0x7440), whose driver loses the device mid-race with it.
++    bool ThreadedRecording() const {
++        const char* env = std::getenv("BB_THREADED_RECORDING");
++        if (env && (env[0] == '0' || env[0] == '1')) {
++            return env[0] == '1';
++        }
++        return !(properties.vendorID == 0x1002 && properties.deviceID < 0x7440);
      }
  
      /// VK_KHR_shader_clock is supported.
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp
-index 77df0d0..b69b534 100644
+index 77df0d0..989695b 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp
 @@ -14,6 +14,7 @@
@@ -1229,6 +1248,15 @@ index 77df0d0..b69b534 100644
  #include <vector>
  #include <vk_mem_alloc.h>
  #ifdef MemoryBarrier
+@@ -130,7 +132,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
+     : window{window_}, liverpool{liverpool_},
+       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
+                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
+-      draw_scheduler{instance, true}, present_scheduler{instance}, flip_scheduler{instance},
++      draw_scheduler{instance, instance.ThreadedRecording()}, present_scheduler{instance}, flip_scheduler{instance},
+       swapchain{instance, window}, runtime{instance, draw_scheduler},
+       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
+       texture_cache{rasterizer->GetTextureCache()} {
 @@ -156,7 +158,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
      fsr_pass.Create(device, instance.GetAllocator(), num_images);
      pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
@@ -1472,7 +1500,7 @@ index 7eaf065..1866655 100644
      vk::UniqueCommandPool command_pool;
      std::vector<Frame> present_frames;
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
-index c941f6b..c4a52ca 100644
+index c941f6b..a0a6292 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
 @@ -3,8 +3,11 @@
@@ -1495,7 +1523,24 @@ index c941f6b..c4a52ca 100644
  #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
  #include "bbport_threads.h"
  #include "video_core/renderer_vulkan/vk_runtime.h"
-@@ -273,6 +277,26 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+@@ -65,7 +69,15 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
+     memory->SetRasterizer(this);
+ 
+     GpuProfiler::Init(instance, scheduler);
+-    if (DrawPipeWanted()) {
++    {
++        const char* env = std::getenv("BB_THREADED_RECORDING");
++        const bool forced = env && (env[0] == '0' || env[0] == '1');
++        std::printf("Threaded recording: %s%s\n", instance.ThreadedRecording() ? "on" : "off",
++                    forced ? " (setting)"
++                    : instance.ThreadedRecording() ? " (auto)"
++                                                   : " (auto: AMD RX 6000 and older)");
++    }
++    if (instance.ThreadedRecording() && DrawPipeWanted()) {
+         constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
+         draw_pipe = std::make_unique<DrawPipe>(&RunDrawPacket, this);
+     }
+@@ -273,6 +285,26 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
      if (upscaler->Enabled() && cb_descs[0].first) {
          upscaler->OnColorTarget(cb_descs[0].first);
      }
@@ -1522,7 +1567,7 @@ index c941f6b..c4a52ca 100644
      // bbport: scene color: a full-size RGBA16F target drawn with the scene depth.
      if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth() &&
          cb_descs[0].first && std::popcount(key.mrt_mask) <= 2) {
-@@ -440,6 +464,10 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
+@@ -440,6 +472,10 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
      return tid == liverpool->GetGpuCommandProcessorThreadId();
  }
  
@@ -1533,7 +1578,7 @@ index c941f6b..c4a52ca 100644
  void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
      if (!draw_pipe || !size) {
          return;
-@@ -960,6 +988,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
+@@ -960,6 +996,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
      // target is that frame.
      if (camera_motion->Enabled() && regs.color_buffers[0] &&
          FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
@@ -1543,7 +1588,7 @@ index c941f6b..c4a52ca 100644
          scene_started = false;
          camera_motion->OnDisplayPass(cb_descs[0].first);
          if (upscaler->OnFrameStart()) {
-@@ -1108,7 +1139,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
+@@ -1108,7 +1147,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
      // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
      // full-screen quad leaves an edge column unwritten).
      draw_jitter = {};
@@ -1554,7 +1599,7 @@ index c941f6b..c4a52ca 100644
          (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
          draw_jitter = upscaler->Jitter();
      }
-@@ -1240,7 +1273,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
+@@ -1240,7 +1281,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
      push_data.yoffset *= target_scale[1];
      pipeline->BindResources(set_writes, push_data);
      draw_jitter = {};
@@ -1565,7 +1610,7 @@ index c941f6b..c4a52ca 100644
          draw_jitter = upscaler->Jitter();
      }
      UpdateDynamicState(pipeline, is_indexed);
-@@ -1315,6 +1350,114 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
+@@ -1315,6 +1358,114 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
      if (upscaler->Enabled()) {
          upscaler->OnDispatch(cs.pgm_hash);
      }
@@ -1741,6 +1786,71 @@ index df4887d..34e428d 100644
 +        }
      }
  }
+ 
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 089c503..05df9ea 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -107,6 +107,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
+ }
+ 
+ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool deferred) {
++    std::scoped_lock lk{large_mutex};
+     auto& cache = large_caches[u32(type)];
+     const u64 max_size = std::max(size + size / 4, RoundAllocationSize(size));
+ 
+@@ -150,6 +151,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
+ }
+ 
+ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
++    std::scoped_lock lk{large_mutex};
+     auto& cache = large_caches[u32(ref.type)];
+     const auto it = std::ranges::find_if(
+         cache, [&](const LargeBuffer& entry) { return entry.buffer.get() == ref.buffer; });
+@@ -164,8 +166,11 @@ void StagingBufferPool::TickFrame() {
+     for (Ring& ring : rings) {
+         TrimRing(ring);
+     }
+-    for (auto& cache : large_caches) {
+-        TrimLarge(cache);
++    {
++        std::scoped_lock lk{large_mutex};
++        for (auto& cache : large_caches) {
++            TrimLarge(cache);
++        }
+     }
+     PublishStats();
+ }
+@@ -210,6 +215,7 @@ void StagingBufferPool::PublishStats() const {
+         for (const Block& block : rings[i].blocks) {
+             bytes += block.buffer->SizeBytes();
+         }
++        std::scoped_lock lk{large_mutex};
+         for (const LargeBuffer& entry : large_caches[i]) {
+             bytes += entry.buffer->SizeBytes();
+         }
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index 1ca0873..01761ae 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -5,6 +5,7 @@
+ 
+ #include <array>
+ #include <memory>
++#include <mutex>
+ #include <vector>
+ 
+ #include "common/types.h"
+@@ -78,6 +79,10 @@ private:
+ 
+     void PublishStats() const;
+ 
++    // bbport: FreeDeferred runs on the scheduler's priority pending-ops thread (downloads written
++    // back once the GPU is done) while the GPU thread requests and trims; guards large_caches.
++    mutable std::mutex large_mutex;
++
+     const Instance& instance;
+     Scheduler& scheduler;
  
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp
 index 3cf4558..61ba5bb 100644

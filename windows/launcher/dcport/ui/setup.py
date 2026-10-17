@@ -22,10 +22,22 @@ DEFAULT_SHARPNESS = 0.30  # the runtime's value when dcport.ini has none
 WINDOW_CHOICES = tuple((f"{w}x{h}", "4K" if h == 2160 else f"{h}p")
                        for w, h in patches.WINDOW_SIZES)
 RENDER_CHOICES = tuple((r.key, r.label) for r in patches.RESOLUTIONS)
+THREADING_CHOICES = (("auto", "Auto"), ("1", "On"), ("0", "Off"))
+THREADING_NOTE = ("Threading: the game's GPU work is prepared on extra threads (more FPS). "
+                  "Auto turns it off on AMD Radeon RX 6000 and older, which run fine without it "
+                  "and can crash mid-race with it, and on for other cards (NVIDIA, newer AMD). "
+                  "If the game crashes, try Off; if it runs fine, try On for more FPS. "
+                  "Applies on the next PLAY.")
 BLUR_NOTE = ("FSR and frame generation do not run with the PATCHES page's 'No motion blur or "
              "depth of field': the game's anti-aliasing is in that shader.")
 FRAMEGEN_ON = ("A generated frame between each two: the game runs at half the frame rate "
                "and shows the full one (120 FPS = 60 + 60).")
+
+
+def threading_value(ini: dict) -> str:
+    """dcport.ini threaded_recording: "1", "0", or anything else (or missing) for Auto."""
+    value = ini.get("threaded_recording", "auto").strip()
+    return value if value in ("0", "1") else "auto"
 
 
 def framegen_note(s, upscaler: str, on: bool) -> str:
@@ -163,6 +175,14 @@ class SetupPage(tk.Frame):
         self.counter_choice = theme.Segmented(grid, app, ((True, "On"), (False, "Off")),
                                               self.set_fps_counter, min_label="Fullscreen")
         self.counter_choice.grid(row=3, column=1, sticky="w", pady=(app.px(10), 0))
+        theme.text_label(grid, app, "Threading").grid(row=4, column=0, sticky="w",
+                                                      pady=(app.px(10), 0))
+        self.threading_choice = theme.Segmented(grid, app, THREADING_CHOICES, self.set_threading,
+                                                min_label="Fullscreen")
+        self.threading_choice.grid(row=4, column=1, sticky="w", pady=(app.px(10), 0))
+        self.threading_note = theme.text_label(card, app, THREADING_NOTE, font="small",
+                                               fg="muted")
+        self._wrapping(self.threading_note, card).pack(fill="x", pady=(app.px(12), 0))
         self.render_note = theme.text_label(card, app, font="small", fg="muted")
         self._wrapping(self.render_note, card)
         self.display_hint = theme.text_label(card, app, "More settings in game: press Insert, "
@@ -262,6 +282,7 @@ class SetupPage(tk.Frame):
         self._pack_if(self.render_note, render.key != patches.DEFAULT_RESOLUTION,
                       pady=(app.px(12), 0), before=self.display_hint)
         self.counter_choice.set(app.fps_counter_on())
+        self.threading_choice.set(threading_value(app.game_ini()))
         if self.upscaler_choice is not None:
             self._refresh_upscaling()
         self._show_status()
@@ -508,6 +529,9 @@ class SetupPage(tk.Frame):
 
     def fsr411_status_text(self) -> str:
         return self.fsr411_status.cget("text")
+
+    def set_threading(self, value: str) -> None:
+        self._show_status(self.app.update_game_ini({"threaded_recording": value}) or "")
 
     def set_frame_gen(self, on: bool) -> None:
         self._show_status(self.app.update_game_ini({"frame_gen": "1" if on else "0"}) or "")

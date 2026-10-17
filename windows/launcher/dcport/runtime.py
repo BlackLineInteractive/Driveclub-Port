@@ -61,14 +61,18 @@ def game_env(paths: AppPaths, s: LauncherSettings, fsr: bool,
         "BB_CONFIG": str(paths.ini),
         "BB_LENIENT_IMPORTS": "1",
         "BB_READBACKS": "0",
-        # dcport.ini threaded_recording=0: draws recorded on the GPU thread itself (slower;
-        # for testing the intermittent AMD device-lost crash).
-        "BB_DRAW_PIPE": "0" if _ini_value(paths, "threaded_recording", "1") == "0" else "1",
+        "BB_DRAW_PIPE": "1",
         "BB_PREP_WORKERS": "0",
         "BB_FULLSCREEN": "1" if s.fullscreen else "0",
         "BB_WINDOW_SIZE": "{}x{}".format(*window_size(s.window_size)),
         "BB_DMEM_MB": str(dmem_mb(s)),
     })
+    # dcport.ini threaded_recording=0/1 (SETUP > Threading); Auto (anything else) lets the
+    # runtime decide: off on AMD RX 6000 and older, on elsewhere.
+    env.pop("BB_THREADED_RECORDING", None)
+    threading = _ini_value(paths, "threaded_recording", "auto")
+    if threading in ("0", "1"):
+        env["BB_THREADED_RECORDING"] = threading
     if s.fps == 30:
         env["BB_VBLANK_HZ"] = "60"
         env["BB_FPS_LIMIT"] = "0"

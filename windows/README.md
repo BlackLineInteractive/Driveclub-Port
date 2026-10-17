@@ -28,6 +28,11 @@ Nothing of AMD's is in the download or in this repository: every player builds i
 
 Also new: **FSR in every race** (0.2.0's FSR ran in menus only), **FSR 3 frame generation** with a HUD-less copy of each frame, a **PATCHES** tab, window size and render resolution settings.
 
+## 0.3.2 hotfix
+
+- **Crash at 4K / under memory pressure fixed** (seen on an RTX 3080 10 GB within a minute: "FreeDeferred on an allocation that is not held"): two threads used the same staging-buffer list without a lock.
+- **AMD RX 6000 mid-race crashes** ("Device lost", amdvlk64.dll): new **SETUP > Threading** (Auto / On / Off). Threaded command recording is off by default on AMD Radeon RX 6000 and older, which run fine without it, and on for other cards (NVIDIA, newer AMD). If the game crashes, try Off; if it runs fine, try On for more FPS.
+
 ## 0.3.1 hotfix
 
 - US copies (CUSA00093) are accepted: the launcher said "patches need 1.28" for them although the game is 01.28. Versions now show as on the PS4 (01.28).

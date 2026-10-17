@@ -370,7 +370,7 @@ def test_run_task_reports_on_the_ui_thread(tmp_path):
 
 
 def test_version_and_bundled_resources(monkeypatch, tmp_path):
-    assert dcport.__version__ == "0.3.1"
+    assert dcport.__version__ == "0.3.2"
     assert theme.default_controls() == DEFAULT_INPUT.resolve()
     assert theme.assets_dir() == DEFAULT_INPUT.resolve().parent / "assets"
     monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
