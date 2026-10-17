@@ -36,6 +36,10 @@ Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the 
 - On discrete AMD GPUs, memory is not unified: dirty page tracking and uploading modified ranges only.
 - Explicit discrete GPU selection on dual-GPU MacBooks (`DC_GPU=<partial_name>` override).
 
+## Windows (DCport)
+
+A separate Windows backend lives in [`windows/`](windows/README.md), maintained by [qnfn](https://github.com/qnfn). It targets **Driveclub v1.28** (CUSA00003) and runs on a different native PS4 runtime (based on [Supermedo/bloodborne_pc](https://github.com/Supermedo/bloodborne_pc) with shadPS4's Vulkan renderer), with its own launcher, FSR 3.1/FSR 4 and DLC support. Ready-to-play builds: [Windows releases](https://github.com/qnfn/Driveclub-Port/releases). The architecture described above is the macOS backend.
+
 ## Requirements
 
 - Intel Mac (x86_64), Metal 3-capable GPU (tested: AMD Radeon Pro 5500M)
