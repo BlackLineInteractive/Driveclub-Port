@@ -3,9 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 project(DriveclubNative LANGUAGES C CXX OBJC OBJCXX)
 
 # Backends
-#   macOS:          this tree, Metal renderer (src/gpu/metal), always built.
-#                   Optional second renderer: Vulkan (src/gpu/vulkan, shadPS4's
-#                   video_core on our command processor), DC_RENDERER=vulkan.
+#   macOS:          this tree, Metal renderer (src/gpu/metal).
 #   Windows/Linux:  the DCport backend in windows/ (its own native runtime and
 #                   launcher, Vulkan); see windows/README.md. This tree's core
 #                   (src/core: loader, memory, signals, TLS) is macOS-only, so
@@ -30,8 +28,7 @@ set(CMAKE_OSX_ARCHITECTURES x86_64)
 
 find_package(SDL3 REQUIRED CONFIG)
 
-# Platform core, HLE and the GPU front end (PM4, tiling, GCN decode) shared by
-# every renderer.
+# Platform core, HLE and the GPU front end (PM4, tiling, GCN decode).
 set(DC_CORE_SOURCES
     src/main.mm
     src/common/log.h
@@ -145,22 +142,6 @@ target_link_options(driveclub PRIVATE
     -Wl,-segaddr,GUEST_SYSRSV,0x7FFFFC000
     -Wl,-segaddr,GUEST_USER,0x1000000000
 )
-
-# Vulkan renderer (shadPS4's, third_party/shadps4) on our command processor,
-# selectable with DC_RENDERER=vulkan. Needs sparse buffers, which MoltenVK on
-# Intel Macs lacks; it is here for when src/core is ported off macOS.
-find_package(Vulkan QUIET)
-option(DC_ENABLE_VULKAN "Build the Vulkan renderer (shadPS4)" ${Vulkan_FOUND})
-if (DC_ENABLE_VULKAN)
-    include(cmake/ShadPS4Vulkan.cmake)
-    target_sources(driveclub PRIVATE
-        src/gpu/vulkan/vk_renderer.h
-        src/gpu/vulkan/vk_renderer.cpp
-        src/gpu/vulkan/dc_host.cpp)
-    target_include_directories(driveclub PRIVATE src/gpu/vulkan/bridge)
-    target_compile_definitions(driveclub PRIVATE DC_HAS_VULKAN=1)
-    target_link_libraries(driveclub PRIVATE dc_shadps4_vulkan Vulkan::Vulkan)
-endif()
 
 target_link_libraries(driveclub PRIVATE
     SDL3::SDL3

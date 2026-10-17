@@ -19,7 +19,7 @@ jobs:
       - name: Dependencies
         run: brew install cmake ninja sdl3
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DDC_ENABLE_VULKAN=OFF
+        run: cmake -S . -B build -G Ninja
       - name: Build
         run: cmake --build build && cmake --build build --target gcn_dis
 

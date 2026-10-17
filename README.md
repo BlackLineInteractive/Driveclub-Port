@@ -27,7 +27,6 @@ This is not a general-purpose emulator. PS4 code is x86-64, so on Intel Macs it 
 | Path | Backend | Platform | What it is |
 | --- | --- | --- | --- |
 | `src/` | Metal (`src/gpu/metal`) | macOS | Our native runtime: ELF loader, HLE libraries, PM4 command processor, GCN → MSL |
-| `src/gpu/vulkan`, `third_party/shadps4` | Vulkan (experimental) | macOS today, Windows/Linux once `src/core` is ported | shadPS4's renderer on our command processor, `DC_RENDERER=vulkan` |
 | `windows/` | Vulkan (DCport) | Windows | Separate native runtime (bloodborne_pc + `runtime/driveclub-runtime.patch`), launcher, community patches |
 
 `src/` and `windows/` are independent: each has its own runtime and build, and changes to one do not affect the other. Fixes found on one side are worth checking on the other (both translate the same GCN/PM4 stream).
@@ -42,9 +41,8 @@ Sony HLE libraries ── libkernel, libc, Pad, AudioOut, VideoOut, Network/PSN 
    │  sceGnmSubmitCommandBuffers / sceGnmDingDong
    ▼
 GPU frontend ── PM4 packet parsing, register state, GCN shaders -> IR
-   │  src/gpu/renderer.h  (shared interface)
-   ├──► Metal 3 (macOS)  - src/gpu/metal, IR -> MSL directly
-   └──► Vulkan (experimental) - src/gpu/vulkan: shadPS4's renderer (third_party/shadps4)
+   │  src/gpu/renderer.h
+   └──► Metal 3 (macOS) - src/gpu/metal, IR -> MSL directly
 ```
 
 Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the command buffer itself and passes only the finished buffer to the driver (`sceGnmDraw*` are not imported). Therefore, the GPU layer operates at the PM4 + GCN shader level.
@@ -82,26 +80,6 @@ cmake --build build
 
 **Windows**: download a release build, or build the launcher and runtime from [`windows/`](windows/README.md).
 
-### Vulkan renderer
-
-`src/gpu/vulkan` puts shadPS4's Vulkan renderer (`video_core` + `shader_recompiler`,
-vendored in `third_party/shadps4`) behind the same `Gpu::Renderer` interface; our PM4
-command processor stays the front end. It is built when a Vulkan loader is found
-(`-DDC_ENABLE_VULKAN=ON/OFF`) and selected at run time with `DC_RENDERER=vulkan`.
-
-- Extra build dependencies: Vulkan loader + headers and `glslang` (`brew install vulkan-loader
-  vulkan-headers glslang molten-vk`). The other libraries (sirit, VMA, Boost headers, fmt,
-  magic_enum, robin-map, xbyak, Zydis, half, xxHash, miniz, Tracy headers) are taken from
-  system packages, from a shadPS4 checkout's `externals` (`DC_SHADPS4_EXTERNALS`, default
-  `./shadps4/externals`) or fetched by CMake.
-- The GPU needs sparse buffers (`sparseResidencyBuffer`) and `robustness2`: desktop AMD,
-  NVIDIA and Intel drivers on Windows/Linux have them; MoltenVK on Intel Macs does not, so
-  there the renderer stops with an error after creating the device.
-- This repository's core (`src/core`: loader, memory, signals, TLS) is macOS-only for now;
-  the playable Windows version is the separate DCport backend in [`windows/`](windows/README.md).
-- Options: `DC_VK_GPU=<index>`, `DC_VK_VALIDATION=1`, `DC_VK_MARKERS=1`, `DC_VK_DUMP_SHADERS=1`,
-  `DC_VK_READBACKS=0|1|2`, `DC_VK_LOG=debug`.
-
 ## Game Files
 
 Game files **are not included** in the repository and must never be committed (see `.gitignore`).
@@ -130,6 +108,6 @@ This project is licensed under the **GNU General Public License v2.0 or later (G
 
 ## Acknowledgments
 
-- [shadPS4](https://github.com/shadps4-emu/shadPS4) - PS4 emulator, the primary source of knowledge on ELF loading, HLE libraries, PM4, and GCN shader recompilation. Its Vulkan renderer and shader recompiler are the Vulkan backend here (`third_party/shadps4`, GPL-2.0-or-later; see its README for the local changes).
+- [shadPS4](https://github.com/shadps4-emu/shadPS4) - PS4 emulator, the primary source of knowledge on ELF loading, HLE libraries, PM4, and GCN shader recompilation. Its Vulkan renderer is the reference for GCN/PM4 semantics in the Metal backend, and the renderer of the Windows backend.
 - [OpenGNM](https://ps4-opengnm.github.io/opengnm/) - documentation on PS4 Gnm and GCN shaders.
 - Windows backend: deadinside28 and Supermedo (native PS4 runtime), FireBurn (FSR-Vulkan, FSR 4 assets), akitaonrails and the patch authors; see [`windows/README.md`](windows/README.md).
