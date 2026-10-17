@@ -49,7 +49,7 @@ DCport is built on other people's work: the native PS4 runtime by deadinside28 a
 - **[akitaonrails](https://github.com/akitaonrails/shadPS4):** shadPS4 investigation of Driveclub (MSAA depth resolve).
 - **Also used:** [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan) and the AMD FidelityFX SDK (FSR), FSR 4 assets from [FireBurn/Q2RTX](https://github.com/FireBurn/Q2RTX); FreeType, SDL3, FFmpeg and the other libraries listed in `licenses/`.
 - **Community patches** ([shadps4-emu/ps4_cheats](https://github.com/shadps4-emu/ps4_cheats)): illusion, u/Charlie_Muggins, kalaposfos.
-- Windows port by **qnfn**; the Driveclub-specific changes (system functions, fonts, readbacks, upscaler integration, launcher) were written with the help of Claude (Anthropic).
+- Windows port by **qnfn** (system functions, fonts, readbacks, upscaler integration, launcher).
 
 ## Legal disclaimer
 
