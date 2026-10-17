@@ -1,0 +1,3590 @@
+diff --git a/gpu/CMakeLists.txt b/gpu/CMakeLists.txt
+index d35e804..2589ec6 100644
+--- a/gpu/CMakeLists.txt
++++ b/gpu/CMakeLists.txt
+@@ -111,6 +111,9 @@ function(add_host_shader FILENAME SHADER_NAME)
+     set(SHADER_HEADERS ${SHADER_HEADERS} ${OUT} PARENT_SCOPE)
+ endfunction()
+ add_host_shader(color_to_ms_depth.frag color_to_ms_depth_frag)
++add_host_shader(ms_depth_to_color.frag ms_depth_to_color_frag)
++add_host_shader(dc_motion.comp dc_motion_comp)
++add_host_shader(dc_merge.comp dc_merge_comp)
+ add_host_shader(ms_image_blit.frag ms_image_blit_frag)
+ add_host_shader(ms_image_blit.frag ms_image_blit_msaa_frag SRC_MSAA=1)
+ add_host_shader(fault_buffer_process.comp fault_buffer_process_comp)
+@@ -270,7 +273,9 @@ if (WIN32)
+             $<$<COMPILE_LANGUAGE:C>:-Wno-error=unused-but-set-global>)
+     endif()
+     target_include_directories(bb-probe PRIVATE .. ../src)
+-    target_link_libraries(bb-probe PRIVATE bbgpu atrac9 onecore bcrypt ws2_32 -pthread)
++    # FreeType: libSceFont for Driveclub (runtime_font.c rasterizes the game's own fonts).
++    find_package(Freetype REQUIRED)
++    target_link_libraries(bb-probe PRIVATE bbgpu atrac9 Freetype::Freetype onecore bcrypt ws2_32 -pthread)
+     # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
+     # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
+     target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
+diff --git a/gpu/shadps4/core/libraries/videoout/driver.cpp b/gpu/shadps4/core/libraries/videoout/driver.cpp
+index 35b0f1b..b3efa63 100644
+--- a/gpu/shadps4/core/libraries/videoout/driver.cpp
++++ b/gpu/shadps4/core/libraries/videoout/driver.cpp
+@@ -454,6 +454,26 @@ void VideoOutDriver::Flip(const Request& req) {
+                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
+                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
+                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
++            std::printf("GPU waits by site (ms/s, count/frame): eos-gds %.1f %.1f, buffer-download "
++                        "%.1f %.1f, image-download %.1f %.1f, fault-buffer %.1f %.1f, "
++                        "stream-buffer %.1f %.1f\n",
++                        BbStats::site_wait_ns[0].exchange(0) / (window * 1e6),
++                        frames ? double(BbStats::site_waits[0].exchange(0)) / frames : 0.0,
++                        BbStats::site_wait_ns[1].exchange(0) / (window * 1e6),
++                        frames ? double(BbStats::site_waits[1].exchange(0)) / frames : 0.0,
++                        BbStats::site_wait_ns[2].exchange(0) / (window * 1e6),
++                        frames ? double(BbStats::site_waits[2].exchange(0)) / frames : 0.0,
++                        BbStats::site_wait_ns[3].exchange(0) / (window * 1e6),
++                        frames ? double(BbStats::site_waits[3].exchange(0)) / frames : 0.0,
++                        BbStats::site_wait_ns[4].exchange(0) / (window * 1e6),
++                        frames ? double(BbStats::site_waits[4].exchange(0)) / frames : 0.0);
++            std::printf("Async readback per frame: ranges <=256B %.1f, <=4K %.1f, <=64K %.1f, "
++                        "larger %.1f; %.1f KiB\n",
++                        frames ? double(BbStats::async_ranges[0].exchange(0)) / frames : 0.0,
++                        frames ? double(BbStats::async_ranges[1].exchange(0)) / frames : 0.0,
++                        frames ? double(BbStats::async_ranges[2].exchange(0)) / frames : 0.0,
++                        frames ? double(BbStats::async_ranges[3].exchange(0)) / frames : 0.0,
++                        frames ? double(BbStats::async_bytes.exchange(0)) / frames / 1024.0 : 0.0);
+             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
+             if (intervals.size() > 2) {
+                 std::vector<double> sorted = intervals;
+diff --git a/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_image.cpp b/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+index fc4bf4b..174cece 100644
+--- a/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_image.cpp
++++ b/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+@@ -286,7 +286,23 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id
+         image_ptr = ctx.OpAccessChain(single_image_ptr_type, image_ptr, std::array{lod});
+     }
+     const Id image = ctx.OpLoad(texture.image_type, image_ptr);
+-    const Id texel = texture.is_integer ? ctx.OpBitcast(color_type, color) : color;
++    Id texel = texture.is_integer ? ctx.OpBitcast(color_type, color) : color;
++    // 11/11/10 unsigned floats store negatives and NaN as 0 and overflow as 65024 on the
++    // PS4; Vulkan leaves those undefined (Driveclub's compute post-processing writes them).
++    const auto sharp = ctx.info.images[handle & 0xFFFF].GetSharp(ctx.info);
++    const auto dfmt = sharp.GetDataFmt();
++    if (!texture.is_integer && sharp.GetNumberFmt() == AmdGpu::NumberFormat::Float &&
++        (dfmt == AmdGpu::DataFormat::Format10_11_11 || dfmt == AmdGpu::DataFormat::Format11_11_10)) {
++        std::array<Id, 4> parts;
++        for (u32 i = 0; i < 4; ++i) {
++            const Id part = ctx.OpCompositeExtract(ctx.F32[1], texel, i);
++            parts[i] = i == 3 ? part
++                              : ctx.OpSelect(ctx.F32[1], ctx.OpFOrdGreaterThan(ctx.U1[1], part, ctx.ConstF32(0.f)),
++                                             ctx.OpFMin(ctx.F32[1], part, ctx.ConstF32(65024.f)),
++                                             ctx.ConstF32(0.f));
++        }
++        texel = ctx.OpCompositeConstruct(ctx.F32[4], parts);
++    }
+     ctx.OpImageWrite(image, coords, texel, operands.mask, operands.operands);
+ }
+ 
+diff --git a/gpu/shadps4/shader_recompiler/frontend/translate/export.cpp b/gpu/shadps4/shader_recompiler/frontend/translate/export.cpp
+index 616c7c6..6c337fb 100644
+--- a/gpu/shadps4/shader_recompiler/frontend/translate/export.cpp
++++ b/gpu/shadps4/shader_recompiler/frontend/translate/export.cpp
+@@ -103,6 +103,13 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
+                                     color_buffer.data_format == AmdGpu::DataFormat::Format8_8 ||
+                                     color_buffer.data_format == AmdGpu::DataFormat::Format8_8_8_8);
+ 
++    // The CB stores 11/11/10 unsigned floats with negatives and NaN as 0 and overflow as the
++    // largest finite value (65024); Vulkan leaves those undefined, and a NaN kept in an HDR
++    // target spreads through the game's post-processing as black blotches (Driveclub).
++    const bool ufloat_target = color_buffer.num_format == AmdGpu::NumberFormat::Float &&
++                               (color_buffer.data_format == AmdGpu::DataFormat::Format10_11_11 ||
++                                color_buffer.data_format == AmdGpu::DataFormat::Format11_11_10);
++
+     // Swizzle components and export
+     for (u32 i = 0; i < 4; ++i) {
+         const auto swizzled_comp = components[color_buffer.swizzle.Map(i)];
+@@ -114,6 +121,11 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
+             // FIXME: Fix-up for GPUs where float-to-unorm rounding is off from expected.
+             converted = ir.FPSub(converted, ir.Imm32(1.f / 127500.f));
+         }
++        if (ufloat_target && i < 3) {
++            // Ordered compare: NaN is not greater than 0.
++            converted = IR::F32{ir.Select(ir.FPGreaterThan(converted, ir.Imm32(0.f)),
++                                          ir.FPMin(converted, ir.Imm32(65024.f)), ir.Imm32(0.f))};
++        }
+         ir.SetAttribute(mrt, converted, i);
+     }
+ }
+diff --git a/gpu/shadps4/video_core/amdgpu/liverpool.cpp b/gpu/shadps4/video_core/amdgpu/liverpool.cpp
+index c137807..31d37f6 100644
+--- a/gpu/shadps4/video_core/amdgpu/liverpool.cpp
++++ b/gpu/shadps4/video_core/amdgpu/liverpool.cpp
+@@ -320,6 +320,7 @@ void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
+ 
+ void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
+     rasterizer.WaitDeferredSignals();
++    rasterizer.AsyncReadbackFrame();
+     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+ }
+ 
+@@ -351,6 +352,7 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
+     });
+     if (event_eos.command == PM4CmdEventWriteEos::Command::GdsStore) {
+         ASSERT(event_eos.size == 1);
++        BbStats::SiteTimer site_timer{0};
+         rasterizer.Finish();
+         const u32 value = rasterizer.ReadDataFromGds(event_eos.gds_index);
+         *event_eos.Address() = value;
+diff --git a/gpu/shadps4/video_core/buffer_cache/buffer.cpp b/gpu/shadps4/video_core/buffer_cache/buffer.cpp
+index 6318e26..4c6f530 100644
+--- a/gpu/shadps4/video_core/buffer_cache/buffer.cpp
++++ b/gpu/shadps4/video_core/buffer_cache/buffer.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <numeric>
+ 
++#include "bbport_toggles.h"
+ #include "common/alignment.h"
+ #include "common/assert.h"
+ #include "video_core/buffer_cache/buffer.h"
+@@ -281,7 +282,10 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
+         if (!scheduler.IsFree(watch.tick) && !allow_wait) {
+             return false;
+         }
+-        scheduler.Wait(watch.tick);
++        {
++            BbStats::SiteTimer site_timer{4};
++            scheduler.Wait(watch.tick);
++        }
+         wait_bound = watch.upper_bound;
+         ++wait_cursor;
+     }
+diff --git a/gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp b/gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp
+index 18476d4..8b03c41 100644
+--- a/gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp
++++ b/gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp
+@@ -148,6 +148,15 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
+ }
+ 
+ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
++    static const bool trace = std::getenv("BB_READBACK_TRACE") != nullptr;
++    if (trace) {
++        static std::atomic<int> logged{0};
++        if (logged.fetch_add(1) < 200) {
++            std::printf("Readback: %s %#llx +%#llx\n", is_write ? "write" : "read",
++                        static_cast<unsigned long long>(device_addr),
++                        static_cast<unsigned long long>(size));
++        }
++    }
+     const auto flush_request = [this, device_addr, size, is_write] {
+         const u32 first_block = device_addr >> block_shift;
+         const u32 last_block = (device_addr + size - 1) >> block_shift;
+@@ -173,6 +182,100 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
+     }
+ }
+ 
++void BufferCache::AsyncReadbackFrame() {
++    static const bool enabled = [] {
++        const char* env = std::getenv("BB_ASYNC_READBACK");
++        return EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Disabled &&
++               !(env && env[0] == '0');
++    }();
++    std::vector<std::pair<VAddr, u64>> ranges;
++    {
++        std::scoped_lock lk{frame_written_mutex};
++        ranges.swap(frame_written);
++    }
++    if (!enabled || ranges.empty()) {
++        return;
++    }
++    // Merge overlapping and touching ranges.
++    std::sort(ranges.begin(), ranges.end());
++    std::vector<std::pair<VAddr, u64>> merged;
++    for (const auto& [addr, size] : ranges) {
++        if (!merged.empty() && addr <= merged.back().first + merged.back().second) {
++            const VAddr end = std::max(merged.back().first + merged.back().second, addr + size);
++            merged.back().second = end - merged.back().first;
++        } else {
++            merged.emplace_back(addr, size);
++        }
++    }
++    struct Readback {
++        VAddr addr;
++        u64 size;
++        u64 staging_offset;
++    };
++    std::vector<Readback> readbacks;
++    u64 total = 0;
++    for (const auto& [addr, size] : merged) {
++        if (total + size > AsyncReadbackMaxFrameBytes) {
++            break;
++        }
++        readbacks.push_back({addr, size, total});
++        total += Common::AlignUp(size, 64);
++        BbStats::async_ranges[size <= 256 ? 0 : size <= 4_KB ? 1 : size <= 64_KB ? 2 : 3]
++            .fetch_add(1, std::memory_order_relaxed);
++        BbStats::async_bytes.fetch_add(size, std::memory_order_relaxed);
++    }
++    if (readbacks.empty()) {
++        return;
++    }
++    const auto download = staging_pool.Request(total, VideoCore::MemoryType::HostCached, 64, true);
++    // One copy command per arena (each carries its own barriers).
++    std::vector<std::pair<const Buffer*, boost::container::small_vector<vk::BufferCopy, 16>>> batches;
++    for (const auto& r : readbacks) {
++        const u32 first_block = r.addr >> block_shift;
++        const u32 last_block = (r.addr + r.size - 1) >> block_shift;
++        const Buffer* arena = GetArena(first_block, last_block);
++        if (!arena || r.addr < arena->cpu_addr ||
++            r.addr + r.size > arena->cpu_addr + arena->size_bytes) {
++            continue;
++        }
++        auto it = std::find_if(batches.begin(), batches.end(),
++                               [arena](const auto& b) { return b.first == arena; });
++        if (it == batches.end()) {
++            it = batches.emplace(batches.end(), arena,
++                                 boost::container::small_vector<vk::BufferCopy, 16>{});
++        }
++        it->second.push_back(vk::BufferCopy{
++            .srcOffset = r.addr - arena->cpu_addr,
++            .dstOffset = download.offset + r.staging_offset,
++            .size = r.size,
++        });
++    }
++    for (const auto& [arena, copies] : batches) {
++        runtime.CopyBuffer(arena, download.buffer, copies);
++    }
++    // Written once the GPU has finished the frame. A range the CPU wrote since keeps the CPU's
++    // data (it is uploaded to the GPU at its next use).
++    scheduler.DeferPriorityOperation([this, download, readbacks = std::move(readbacks)] {
++        download.Invalidate();
++        auto* memory = Core::Memory::Instance();
++        static const bool copy_only = [] {
++            const char* env = std::getenv("BB_ASYNC_READBACK");
++            return env && env[0] == '2'; // measurements: GPU copies without the guest writes
++        }();
++        for (const auto& r : readbacks) {
++            if (copy_only) {
++                break;
++            }
++            if (memory_tracker->IsRegionCpuModified(r.addr, r.size)) {
++                continue;
++            }
++            memory->TryWriteBacking(std::bit_cast<u8*>(r.addr), download.mapped + r.staging_offset,
++                                    r.size);
++        }
++        staging_pool.FreeDeferred(download);
++    });
++}
++
+ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+     boost::container::small_vector<vk::BufferCopy, 1> copies;
+     u64 total_size_bytes = 0;
+@@ -202,7 +305,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
+         copy.dstOffset += download.offset;
+     }
+     runtime.CopyBuffer(arena, download.buffer, copies);
+-    scheduler.Finish();
++    {
++        BbStats::SiteTimer site_timer{1};
++        scheduler.Finish();
++    }
+ 
+     download.buffer->Invalidate(download.offset, download.size);
+     for (const auto& copy : copies) {
+@@ -345,6 +451,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
+     }
+     if (is_written) {
+         gpu_modified_ranges.Add(device_addr, size);
++        if (size <= AsyncReadbackMaxRange) {
++            std::scoped_lock lk{frame_written_mutex};
++            frame_written.emplace_back(device_addr, size);
++        }
+     }
+     return {arena, arena->Offset(device_addr)};
+ }
+diff --git a/gpu/shadps4/video_core/buffer_cache/buffer_cache.h b/gpu/shadps4/video_core/buffer_cache/buffer_cache.h
+index 0ab18c2..8f8c4b0 100644
+--- a/gpu/shadps4/video_core/buffer_cache/buffer_cache.h
++++ b/gpu/shadps4/video_core/buffer_cache/buffer_cache.h
+@@ -6,6 +6,9 @@
+ #include "bbport_copy.h"
+ 
+ #include <deque>
++#include <mutex>
++#include <utility>
++#include <vector>
+ #include <boost/container/small_vector.hpp>
+ 
+ #include "common/interval_set.h"
+@@ -106,6 +109,11 @@ public:
+     /// Processes the fault buffer.
+     void ProcessFaultBuffer();
+ 
++    /// bbport (Driveclub): with readbacks off, copies the small ranges the GPU wrote this frame
++    /// back to guest memory without waiting for the GPU; the guest sees them a frame or two
++    /// later, as a PS4 game reading last frame's results expects (auto-exposure histogram).
++    void AsyncReadbackFrame();
++
+     /// Synchronizes all buffers needed for DMA.
+     void SynchronizeDmaBuffers();
+ 
+@@ -163,6 +171,10 @@ private:
+     StreamBuffer stream_buffer;
+     Buffer gds_buffer;
+     RangeSet gpu_modified_ranges;
++    static constexpr u64 AsyncReadbackMaxRange = 64_KB;
++    static constexpr u64 AsyncReadbackMaxFrameBytes = 8_MB;
++    std::mutex frame_written_mutex;
++    std::vector<std::pair<VAddr, u64>> frame_written; ///< small GPU writes since the last flip
+ 
+     std::unique_ptr<FaultManager> fault_manager;
+     std::unique_ptr<Buffer> bda_pagetable_buffer;
+diff --git a/gpu/shadps4/video_core/buffer_cache/fault_manager.cpp b/gpu/shadps4/video_core/buffer_cache/fault_manager.cpp
+index f82967c..90c485a 100644
+--- a/gpu/shadps4/video_core/buffer_cache/fault_manager.cpp
++++ b/gpu/shadps4/video_core/buffer_cache/fault_manager.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "bbport_toggles.h"
+ #include "common/div_ceil.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+ #include "video_core/buffer_cache/fault_manager.h"
+@@ -86,6 +87,7 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler&
+ 
+ void FaultManager::ProcessFaultBuffer() {
+     if (u64 wait_tick = fault_areas[current_area]) {
++        BbStats::SiteTimer site_timer{3};
+         scheduler.Wait(wait_tick);
+         scheduler.PopPendingOperations();
+     }
+diff --git a/gpu/shadps4/video_core/host_shaders/CMakeLists.txt b/gpu/shadps4/video_core/host_shaders/CMakeLists.txt
+index 8c9d802..b087210 100644
+--- a/gpu/shadps4/video_core/host_shaders/CMakeLists.txt
++++ b/gpu/shadps4/video_core/host_shaders/CMakeLists.txt
+@@ -39,6 +39,7 @@ function(add_host_shader FILENAME SHADER_NAME)
+ endfunction()
+ 
+ add_host_shader(color_to_ms_depth.frag color_to_ms_depth_frag)
++add_host_shader(ms_depth_to_color.frag ms_depth_to_color_frag)
+ add_host_shader(ms_image_blit.frag ms_image_blit_frag)
+ add_host_shader(ms_image_blit.frag ms_image_blit_msaa_frag SRC_MSAA=1)
+ add_host_shader(fault_buffer_process.comp fault_buffer_process_comp)
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
+index 2c70bba..e19da7e 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
+@@ -190,6 +190,9 @@ struct Fsr4Upscaler::Impl {
+         ffxCreateContextDescUpscale desc{};
+         desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+         desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
++        if (reversed_infinite_depth) {
++            desc.flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED | FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
++        }
+         // Any preset's render size fits: the context is not recreated for a size change.
+         desc.maxRenderSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
+         desc.maxUpscaleSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.h b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.h
+index 506cc51..dfc61bf 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.h
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.h
+@@ -41,6 +41,10 @@ public:
+         bool sharpen, reset, auto_exposure;
+     };
+ 
++    /// Driveclub: depth is reversed (1 = near) with an infinite far plane; read when a context
++    /// is created.
++    static inline bool reversed_infinite_depth = false;
++
+     /// Records FSR 4 into `frame.cmdbuf`; the output stays in General. False when FSR 4
+     /// cannot run (Problem() says why; missing assets or device features are permanent).
+     bool Record(const Frame& frame);
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
+index c941f6b..06470f0 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -20,6 +20,7 @@
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
++#include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+ #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+ #include "bbport_threads.h"
+ #include "video_core/renderer_vulkan/vk_runtime.h"
+@@ -273,6 +274,25 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+     if (upscaler->Enabled() && cb_descs[0].first) {
+         upscaler->OnColorTarget(cb_descs[0].first);
+     }
++    // Driveclub: the main view's G-buffer (3+ targets, D32S8 at 1920x1080; target 2 holds the
++    // object IDs) and its scene color, the last R11G11B10 target drawn with that depth before
++    // the TAA resolve.
++    if (upscaler->Enabled() && upscaler->DcMode() && db_desc.first) {
++        const auto& depth = texture_cache.GetImage(db_desc.first);
++        if (std::popcount(key.mrt_mask) >= 3 && cb_descs[2].first &&
++            depth.info.pixel_format == vk::Format::eD32SfloatS8Uint &&
++            depth.info.size.width == 1920 && depth.info.size.height == 1080) {
++            upscaler->OnDcGBuffer(db_desc.first, cb_descs[2].first);
++        } else if (db_desc.first == upscaler->DcDepth() && cb_descs[0].first &&
++                   std::popcount(key.mrt_mask) <= 2) {
++            const auto& color = texture_cache.GetImage(cb_descs[0].first);
++            if (color.info.pixel_format == vk::Format::eB10G11R11UfloatPack32 &&
++                color.info.size.width == depth.info.size.width &&
++                color.info.size.height == depth.info.size.height) {
++                upscaler->OnDcSceneColor(cb_descs[0].first);
++            }
++        }
++    }
+     // bbport: scene color: a full-size RGBA16F target drawn with the scene depth.
+     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth() &&
+         cb_descs[0].first && std::popcount(key.mrt_mask) <= 2) {
+@@ -440,6 +460,10 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
+     return tid == liverpool->GetGpuCommandProcessorThreadId();
+ }
+ 
++void Rasterizer::AsyncReadbackFrame() {
++    buffer_cache.AsyncReadbackFrame();
++}
++
+ void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
+     if (!draw_pipe || !size) {
+         return;
+@@ -1108,7 +1132,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
+     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
+     // full-screen quad leaves an edge column unwritten).
+     draw_jitter = {};
+-    if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth() &&
++    if (upscaler->Enabled() && db_desc.first &&
++        (db_desc.first == camera_motion->Depth() ||
++         (upscaler->DcMode() && db_desc.first == upscaler->DcDepth())) &&
+         (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
+         draw_jitter = upscaler->Jitter();
+     }
+@@ -1240,7 +1266,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
+     push_data.yoffset *= target_scale[1];
+     pipeline->BindResources(set_writes, push_data);
+     draw_jitter = {};
+-    if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
++    if (upscaler->Enabled() && db_desc.first &&
++        (db_desc.first == camera_motion->Depth() ||
++         (upscaler->DcMode() && db_desc.first == upscaler->DcDepth()))) {
+         draw_jitter = upscaler->Jitter();
+     }
+     UpdateDynamicState(pipeline, is_indexed);
+@@ -1315,6 +1343,50 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
+     if (upscaler->Enabled()) {
+         upscaler->OnDispatch(cs.pgm_hash);
+     }
++    // Driveclub research: the TAA resolve's constants, to find the camera jitter.
++    static const bool taa_dump = std::getenv("BB_DC_TAA_DUMP") != nullptr;
++    if (taa_dump && cs.pgm_hash == 0x403f86d4ULL && cs.buffers.size() >= 2) {
++        static int dumped = 0;
++        if (dumped++ < 16) {
++            const auto b0 = cs.buffers[0].GetSharp(cs);
++            const auto b1 = cs.buffers[1].GetSharp(cs);
++            const auto* f0 = reinterpret_cast<const float*>(b0.base_address);
++            const auto* f1 = reinterpret_cast<const float*>(b1.base_address);
++            std::string line = fmt::format("DC TAA #{} b0@{:#x}[{}] 64..99:", dumped, b0.base_address,
++                                           b0.GetSize());
++            for (int i = 64; i < 100; ++i) line += fmt::format(" {}={:.6g}", i, f0[i]);
++            line += fmt::format(" | b1@{:#x}[{}] 96..119:", b1.base_address, b1.GetSize());
++            for (int i = 96; i < 120; ++i) line += fmt::format(" {}={:.6g}", i, f1[i]);
++            std::printf("%s\n", line.c_str());
++        }
++    }
++    // Driveclub: Native AA before the TAA resolve, which then passes the scene through.
++    if (upscaler->Enabled() && upscaler->DcMode() && cs.pgm_hash == TemporalUpscaler::DcTaaHash &&
++        cs.buffers.size() >= 3) {
++        TemporalUpscaler::DcInputs inputs{};
++        bool ok = true;
++        const u64 align = instance.StorageMinAlignment();
++        for (u32 i = 0; i < 3 && ok; ++i) {
++            const auto sharp = cs.buffers[i].GetSharp(cs);
++            if (!sharp.base_address || !sharp.GetSize() ||
++                !memory->IsValidGpuMapping(sharp.base_address, 0)) {
++                ok = false;
++                break;
++            }
++            const auto [buffer, offset] =
++                buffer_cache.ObtainBuffer(sharp.base_address, u32(sharp.GetSize()), false);
++            const u64 aligned = offset & ~(align - 1);
++            inputs.buffers[i] = {buffer->Handle(), aligned, sharp.GetSize() + (offset - aligned)};
++            inputs.dword_offsets[i] = u32((offset - aligned) / 4);
++        }
++        if (ok) {
++            auto* frame = reinterpret_cast<float*>(cs.buffers[0].GetSharp(cs).base_address);
++            inputs.tan_half_fov_y = frame[93];
++            if (upscaler->RunDriveclub(inputs)) {
++                frame[98] = 0.0f; // the resolve's history weight: the upscaled scene passes through
++            }
++        }
++    }
+     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
+         return;
+     }
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.h b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.h
+index b1ff8b9..ac1f992 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -121,6 +121,8 @@ public:
+     /// Stage A: guest memory the recording thread will write for work handed to it (storage
+     /// buffers, DMA, WriteData, fences); constants overlapping it are bound there, not copied here.
+     void NotePendingGpuWrite(VAddr address, u64 size);
++    /// At a flip: the frame's small GPU writes are copied back to guest memory asynchronously.
++    void AsyncReadbackFrame();
+     /// Before a guest-visible write: fences deferred earlier are written first.
+     void WaitDeferredSignals() {
+         scheduler.WaitDeferredSignals();
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_runtime.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_runtime.cpp
+index df4887d..34e428d 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_runtime.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_runtime.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
+ #include <boost/container/small_vector.hpp>
+ #include "bbport_toggles.h"
+ #include "video_core/buffer_cache/buffer.h"
+@@ -533,8 +534,35 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
+         blit_helper->ReinterpretColorAsMsDepth(
+             dst->info.size.width, dst->info.size.height, dst->info.num_samples,
+             src->info.pixel_format, dst->info.pixel_format, src->GetImage(), dst->GetImage());
++    } else if (src->info.props.is_depth && src->info.num_samples > 1 &&
++               !dst->info.props.is_depth && dst->info.num_samples == 1) {
++        // Reverse of the branch above: resolve sample 0 of an MSAA depth buffer into a 1x
++        // color image the game samples as a texture (Driveclub's screen-space lighting,
++        // SSAO and soft particles). Without it the color image keeps stale contents.
++        bool needs_flush =
++            Transit(src, vk::ImageLayout::eShaderReadOnlyOptimal,
++                    vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
++        needs_flush |= Transit(dst, vk::ImageLayout::eColorAttachmentOptimal,
++                               vk::PipelineStageFlagBits2::eColorAttachmentOutput,
++                               vk::AccessFlagBits2::eColorAttachmentWrite);
++        if (needs_flush) {
++            FlushBarriers();
++        }
++
++        blit_helper->ReinterpretMsDepthAsColor(
++            dst->info.size.width, dst->info.size.height, src->info.num_samples,
++            src->info.pixel_format, dst->info.pixel_format, src->GetImage(), dst->GetImage());
++        dst->flags |= VideoCore::ImageFlagBits::GpuModified;
++        dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+     } else {
+-        LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
++        static std::atomic<int> reported{0};
++        if (reported.fetch_add(1) < 8) {
++            LOG_WARNING(Render_Vulkan,
++                        "Unimplemented depth overlap copy: {} depth={} samples={} -> {} depth={} samples={}",
++                        vk::to_string(src->info.pixel_format), bool(src->info.props.is_depth),
++                        src->info.num_samples, vk::to_string(dst->info.pixel_format),
++                        bool(dst->info.props.is_depth), dst->info.num_samples);
++        }
+     }
+ }
+ 
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp
+index 3cf4558..3abac16 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp
+@@ -6,6 +6,7 @@
+ #include "video_core/renderer_vulkan/ui_composition.h"
+ 
+ #include <algorithm>
++#include <span>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -17,6 +18,8 @@
+ #include "bbport_settings.h"
+ #include "bbport_toggles.h"
+ #include "ffx_vk_portable.h"
++#include "video_core/host_shaders/dc_merge_comp.h"
++#include "video_core/host_shaders/dc_motion_comp.h"
+ #include "video_core/host_shaders/upscale_merge_comp.h"
+ #include "video_core/host_shaders/upscale_reactive_comp.h"
+ #include "video_core/host_shaders/taa_comp.h"
+@@ -175,6 +178,13 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
+     // Available unless BB_UPSCALER=none; on/off and the parameters are the menu's settings.
+     const char* env = std::getenv("BB_UPSCALER");
+     enabled = !(env && std::strcmp(env, "none") == 0);
++    // Driveclub: Native AA in place of the game's TAA resolve (RunDriveclub). Its depth is
++    // reversed with an infinite far plane.
++    if (const char* dc = std::getenv("BB_DC_UPSCALE"); dc && dc[0] == '1') {
++        dc_mode = true;
++        trigger_hash = DcTaaHash;
++        Fsr4Upscaler::reversed_infinite_depth = true;
++    }
+     if (const char* hash = std::getenv("BB_UPSCALE_BEFORE_CS")) {
+         trigger_hash = std::strtoull(hash, nullptr, 16);
+     }
+@@ -291,7 +301,8 @@ bool TemporalUpscaler::OnFrameStart() {
+     const auto& settings = BbSettings::Get();
+     // The guest's startup resolution patch remains in effect until restart. Keep the FSR
+     // model at the applied preset while the menu saves the requested one for run.sh.
+-    const int preset = BbSettings::RenderPreset();
++    // Driveclub: Native AA only (the scaled presets redirect Bloodborne's targets).
++    const int preset = dc_mode ? 0 : BbSettings::RenderPreset();
+     if (applied_preset != preset || settings.upscaler == BbSettings::UpscalerOff) failed = false;
+     const bool active = Active();
+     const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(1u << 25);
+@@ -360,6 +371,9 @@ bool TemporalUpscaler::OnFrameStart() {
+ }
+ 
+ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
++    if (dc_mode) {
++        return; // RunDriveclub, called by the rasterizer with the resolve's buffers
++    }
+     if (cs_hash != trigger_hash || done_this_frame || failed || Scaled()) {
+         return;
+     }
+@@ -413,9 +427,12 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
+     FfxVkPortableUpscaleCreateInfo create_info{};
+     create_info.structSize = sizeof(create_info);
+     // Native AA runs on the HDR scene color; scaled presets on the game's tonemapped frame.
+-    create_info.flags = hdr ? FFX_VK_PORTABLE_CONTEXT_HDR_COLOR_INPUT |
+-                                  FFX_VK_PORTABLE_CONTEXT_AUTO_EXPOSURE
+-                            : 0;
++    create_info.flags = (dc_mode ? FFX_VK_PORTABLE_CONTEXT_DEPTH_INVERTED |
++                                       FFX_VK_PORTABLE_CONTEXT_DEPTH_INFINITE
++                                 : 0u) |
++                        (hdr ? FFX_VK_PORTABLE_CONTEXT_HDR_COLOR_INPUT |
++                                   FFX_VK_PORTABLE_CONTEXT_AUTO_EXPOSURE
++                             : 0u);
+     create_info.maxRenderSize = {w, h};
+     create_info.maxOutputSize = {ow, oh};
+     // FSR 4 has its own model context (vk_fsr4); the images below are shared.
+@@ -1987,9 +2004,9 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image
+         .preset = applied_preset,
+         .jitter = {sign * jitter[0], sign * jitter[1]},
+         .frame_ms = frame_ms,
+-        .near_plane = camera_motion.Near(),
+-        .far_plane = 3000.0f,
+-        .vertical_fov = camera_motion.VerticalFov(),
++        .near_plane = dc_mode ? dc_near : camera_motion.Near(),
++        .far_plane = dc_mode ? 1.0e6f : 3000.0f,
++        .vertical_fov = dc_mode ? dc_vertical_fov : camera_motion.VerticalFov(),
+         .sharpness = std::min(settings.sharpness.load(), 1.0f),
+         .sharpen = settings.sharpen,
+         .reset = reset,
+@@ -2063,4 +2080,326 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
+     return ok;
+ }
+ 
++// ---- Driveclub -----------------------------------------------------------------------------
++
++void TemporalUpscaler::OnDcGBuffer(VideoCore::ImageId depth, VideoCore::ImageId object_ids) {
++    dc_depth = depth;
++    dc_object_ids = object_ids;
++}
++
++void TemporalUpscaler::OnDcSceneColor(VideoCore::ImageId color) {
++    dc_color = color;
++}
++
++void TemporalUpscaler::CreateDcPipelines() {
++    if (dc_motion_pipeline) {
++        return;
++    }
++    const auto device = instance.GetDevice();
++    const auto make = [&](std::span<const vk::DescriptorType> types,
++                          vk::UniqueDescriptorSetLayout& set_layout,
++                          vk::UniquePipelineLayout& pipeline_layout, u32 push_size,
++                          const auto& code, vk::UniquePipeline& pipeline) {
++        std::array<vk::DescriptorSetLayoutBinding, 8> bindings{};
++        for (u32 i = 0; i < types.size(); ++i) {
++            bindings[i] = {.binding = i,
++                           .descriptorType = types[i],
++                           .descriptorCount = 1,
++                           .stageFlags = vk::ShaderStageFlagBits::eCompute};
++        }
++        set_layout = Check(device.createDescriptorSetLayoutUnique({
++            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
++            .bindingCount = u32(types.size()),
++            .pBindings = bindings.data(),
++        }));
++        const vk::PushConstantRange push{.stageFlags = vk::ShaderStageFlagBits::eCompute,
++                                         .offset = 0,
++                                         .size = push_size};
++        pipeline_layout = Check(device.createPipelineLayoutUnique({
++            .setLayoutCount = 1,
++            .pSetLayouts = &*set_layout,
++            .pushConstantRangeCount = 1,
++            .pPushConstantRanges = &push,
++        }));
++        const auto module = CompileSPV(code, device);
++        pipeline = Check(device.createComputePipelineUnique(
++            {}, vk::ComputePipelineCreateInfo{
++                    .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
++                              .module = module,
++                              .pName = "main"},
++                    .layout = *pipeline_layout,
++                }));
++        device.destroyShaderModule(module);
++    };
++    static constexpr std::array motion_types = {
++        vk::DescriptorType::eStorageBuffer, vk::DescriptorType::eStorageBuffer,
++        vk::DescriptorType::eStorageBuffer, vk::DescriptorType::eSampledImage,
++        vk::DescriptorType::eSampledImage,  vk::DescriptorType::eStorageImage,
++    };
++    make(motion_types, dc_motion_desc_layout, dc_motion_pipeline_layout, 8 * sizeof(u32),
++         DC_MOTION_COMP, dc_motion_pipeline);
++    static constexpr std::array merge_types = {
++        vk::DescriptorType::eSampledImage,
++        vk::DescriptorType::eStorageImage,
++        vk::DescriptorType::eSampledImage,
++    };
++    make(merge_types, dc_merge_desc_layout, dc_merge_pipeline_layout, 4 * sizeof(u32),
++         DC_MERGE_COMP, dc_merge_pipeline);
++}
++
++bool TemporalUpscaler::RunDriveclub(const DcInputs& inputs) {
++    if (!dc_mode || done_this_frame) {
++        return false;
++    }
++    done_this_frame = true;
++    const int provider = BbSettings::Get().upscaler.load();
++    if (failed || !Active() || provider == BbSettings::UpscalerTaa ||
++        provider == BbSettings::UpscalerDlss || !dc_depth || !dc_object_ids || !dc_color) {
++        reset = true;
++        return false;
++    }
++    auto& color = texture_cache.GetImage(dc_color);
++    auto& depth = texture_cache.GetImage(dc_depth);
++    auto& ids = texture_cache.GetImage(dc_object_ids);
++    const u32 w = color.info.size.width, h = color.info.size.height;
++    if (depth.info.size.width != w || depth.info.size.height != h ||
++        ids.info.size.width != w || ids.info.size.height != h ||
++        !(color.usage_flags & vk::ImageUsageFlagBits::eStorage)) {
++        static bool printed = false;
++        if (!printed) {
++            printed = true;
++            std::printf("Upscaler (Driveclub): scene targets do not match (%ux%u)\n", w, h);
++        }
++        return false;
++    }
++    if (!EnsureResources(w, h, w, h, true)) {
++        failed = true;
++        return false;
++    }
++    CreateDcPipelines();
++    dc_vertical_fov = 2.0f * std::atan(std::abs(inputs.tan_half_fov_y));
++    if (!(dc_vertical_fov > 0.1f && dc_vertical_fov < 3.0f)) {
++        dc_vertical_fov = 1.0472f;
++    }
++    if (auto* profiler = GpuProfiler::Get()) {
++        profiler->Mark(0xDC00'0000ull, [] { return std::string{"upscaler Run (Driveclub)"}; });
++    }
++
++    const auto depth_view =
++        CachedView(depth, depth.info.pixel_format, vk::ImageAspectFlagBits::eDepth);
++    const auto color_view =
++        CachedView(color, color.info.pixel_format, vk::ImageAspectFlagBits::eColor);
++    const auto ids_view = CachedView(ids, ids.info.pixel_format, vk::ImageAspectFlagBits::eColor);
++
++    scheduler.EndRendering();
++    runtime.Transit(&depth, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
++                    vk::AccessFlagBits2::eShaderRead);
++    runtime.Transit(&ids, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
++                    vk::AccessFlagBits2::eShaderRead);
++    runtime.Transit(&color, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
++                    vk::AccessFlagBits2::eShaderRead);
++    runtime.FlushBarriers();
++    const auto cmdbuf = scheduler.CommandBuffer();
++
++    const auto own_barrier = [&](vk::Image image, vk::ImageLayout old_layout,
++                                 vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
++                                 vk::ImageLayout new_layout, vk::PipelineStageFlags2 dst_stage,
++                                 vk::AccessFlags2 dst_access) {
++        const vk::ImageMemoryBarrier2 barrier{
++            .srcStageMask = src_stage,
++            .srcAccessMask = src_access,
++            .dstStageMask = dst_stage,
++            .dstAccessMask = dst_access,
++            .oldLayout = old_layout,
++            .newLayout = new_layout,
++            .image = image,
++            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
++        };
++        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
++    };
++    const auto all = vk::PipelineStageFlagBits2::eAllCommands;
++    const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
++    own_barrier(vk::Image(motion_image), vk::ImageLayout::eUndefined, all,
++                vk::AccessFlagBits2::eNone, vk::ImageLayout::eGeneral,
++                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
++    own_barrier(vk::Image(output_image), vk::ImageLayout::eUndefined, all,
++                vk::AccessFlagBits2::eNone, vk::ImageLayout::eGeneral, all, rw);
++
++    // Motion vectors from the resolve's reprojection (dc_motion.comp).
++    {
++        std::array<vk::DescriptorBufferInfo, 3> buffers{};
++        for (u32 i = 0; i < 3; ++i) {
++            buffers[i] = {.buffer = inputs.buffers[i].buffer,
++                          .offset = inputs.buffers[i].offset,
++                          .range = inputs.buffers[i].size};
++        }
++        const vk::DescriptorImageInfo ids_info{.imageView = ids_view,
++                                               .imageLayout = vk::ImageLayout::eGeneral};
++        const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
++                                                 .imageLayout = vk::ImageLayout::eGeneral};
++        const vk::DescriptorImageInfo motion_info{.imageView = *motion_view,
++                                                  .imageLayout = vk::ImageLayout::eGeneral};
++        std::array<vk::WriteDescriptorSet, 6> writes{};
++        for (u32 i = 0; i < 3; ++i) {
++            writes[i] = {.dstBinding = i,
++                         .descriptorCount = 1,
++                         .descriptorType = vk::DescriptorType::eStorageBuffer,
++                         .pBufferInfo = &buffers[i]};
++        }
++        writes[3] = {.dstBinding = 3,
++                     .descriptorCount = 1,
++                     .descriptorType = vk::DescriptorType::eSampledImage,
++                     .pImageInfo = &ids_info};
++        writes[4] = {.dstBinding = 4,
++                     .descriptorCount = 1,
++                     .descriptorType = vk::DescriptorType::eSampledImage,
++                     .pImageInfo = &depth_info};
++        writes[5] = {.dstBinding = 5,
++                     .descriptorCount = 1,
++                     .descriptorType = vk::DescriptorType::eStorageImage,
++                     .pImageInfo = &motion_info};
++        struct {
++            float size[2], jitter[2];
++            u32 offsets[4];
++        } push = {{float(w), float(h)},
++                  {jitter[0], jitter[1]},
++                  {inputs.dword_offsets[0], inputs.dword_offsets[1], inputs.dword_offsets[2], 0}};
++        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *dc_motion_pipeline);
++        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *dc_motion_pipeline_layout, 0,
++                                    writes);
++        cmdbuf.pushConstants(*dc_motion_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
++                             sizeof(push), &push);
++        cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
++    }
++    own_barrier(vk::Image(motion_image), vk::ImageLayout::eGeneral,
++                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
++                vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
++
++    const auto now = std::chrono::steady_clock::now();
++    float frame_ms = std::chrono::duration<float, std::milli>(now - last_frame).count();
++    if (frame_ms <= 0.0f || frame_ms > 200.0f) {
++        frame_ms = 16.6f;
++    }
++    last_frame = now;
++
++    bool dispatched = false;
++    if (UseFsr4()) {
++        dispatched = RecordFsr4(cmdbuf, {color.GetImage(), color_view, w, h},
++                                {depth.GetImage(), depth_view, w, h}, w, h, w, h, frame_ms);
++    } else {
++        FfxVkPortableUpscaleDispatchInfo info{};
++        info.structSize = sizeof(info);
++        info.commandBuffer = cmdbuf;
++        info.color = Describe(color.GetImage(), color.info.pixel_format, w, h, color.usage_flags,
++                              vk::ImageAspectFlagBits::eColor,
++                              FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
++        info.depth = Describe(depth.GetImage(), depth.info.pixel_format, w, h, depth.usage_flags,
++                              vk::ImageAspectFlagBits::eDepth,
++                              FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
++        info.motionVectors = Describe(vk::Image(motion_image), vk::Format::eR16G16Sfloat, w, h,
++                                      vk::ImageUsageFlagBits::eStorage |
++                                          vk::ImageUsageFlagBits::eSampled,
++                                      vk::ImageAspectFlagBits::eColor,
++                                      FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
++        info.output = Describe(vk::Image(output_image), vk::Format::eR16G16B16A16Sfloat, w, h,
++                               vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
++                                   vk::ImageUsageFlagBits::eTransferSrc,
++                               vk::ImageAspectFlagBits::eColor,
++                               FFX_VK_PORTABLE_RESOURCE_STATE_UNORDERED_ACCESS);
++        info.exposure.structSize = sizeof(info.exposure);
++        info.reactiveMask.structSize = sizeof(info.reactiveMask);
++        info.transparencyAndCompositionMask.structSize =
++            sizeof(info.transparencyAndCompositionMask);
++        // The menu's invert-jitter option applies to FSR 3 here too (A/B of the convention).
++        const float sign = BbToggle::Disabled(1u << 26) != BbSettings::Get().fsr4_invert_jitter.load()
++                               ? -1.0f
++                               : 1.0f;
++        info.jitterOffset = {sign * jitter[0], sign * jitter[1]};
++        info.motionVectorScale = {1.0f, 1.0f};
++        info.renderSize = {w, h};
++        info.outputSize = {w, h};
++        info.frameTimeMilliseconds = frame_ms;
++        info.preExposure = 1.0f;
++        info.cameraNear = dc_near;
++        info.cameraFar = 1.0e6f;
++        info.cameraVerticalFovRadians = dc_vertical_fov;
++        info.viewSpaceToMeters = 1.0f;
++        info.sharpness = std::min(BbSettings::Get().sharpness.load(), 1.0f);
++        info.enableSharpening = BbSettings::Get().sharpen ? VK_TRUE : VK_FALSE;
++        info.reset = reset ? VK_TRUE : VK_FALSE;
++        info.frameId = frame_id++;
++        FfxVkPortableUpscaleCreateInfo create_info{};
++        create_info.structSize = sizeof(create_info);
++        create_info.flags = FFX_VK_PORTABLE_CONTEXT_HDR_COLOR_INPUT |
++                            FFX_VK_PORTABLE_CONTEXT_AUTO_EXPOSURE |
++                            FFX_VK_PORTABLE_CONTEXT_DEPTH_INVERTED |
++                            FFX_VK_PORTABLE_CONTEXT_DEPTH_INFINITE;
++        create_info.maxRenderSize = {w, h};
++        create_info.maxOutputSize = {w, h};
++        if (const u64 issues = ffxVkPortableValidateUpscaleDispatchInfo(&create_info, &info)) {
++            static bool printed = false;
++            if (!printed) {
++                printed = true;
++                PrintIssues("dispatch (Driveclub)", issues);
++            }
++            failed = true;
++        } else if (ffxVkPortableUpscaleContextRecordDispatch(context, &info) !=
++                   FFX_VK_PORTABLE_OK) {
++            std::printf("Upscaler (Driveclub): FSR 3 dispatch failed\n");
++            failed = true;
++        } else {
++            dispatched = true;
++        }
++    }
++    if (!dispatched) {
++        return false;
++    }
++    reset = false;
++    dispatched_last_frame = true;
++    ExtraSharpen(cmdbuf, vk::Image(output_image), false, w, h);
++
++    // The result into the scene color (dc_merge.comp).
++    own_barrier(vk::Image(output_image), vk::ImageLayout::eGeneral, all, rw,
++                vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
++                vk::AccessFlagBits2::eShaderRead);
++    runtime.Transit(&color, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
++                    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
++    runtime.FlushBarriers();
++    {
++        const vk::DescriptorImageInfo out_info{.imageView = *output_view,
++                                               .imageLayout = vk::ImageLayout::eGeneral};
++        const vk::DescriptorImageInfo scene_info{.imageView = color_view,
++                                                 .imageLayout = vk::ImageLayout::eGeneral};
++        const vk::DescriptorImageInfo motion_info{.imageView = *motion_view,
++                                                  .imageLayout = vk::ImageLayout::eGeneral};
++        const std::array<vk::WriteDescriptorSet, 3> writes = {{
++            {.dstBinding = 0,
++             .descriptorCount = 1,
++             .descriptorType = vk::DescriptorType::eSampledImage,
++             .pImageInfo = &out_info},
++            {.dstBinding = 1,
++             .descriptorCount = 1,
++             .descriptorType = vk::DescriptorType::eStorageImage,
++             .pImageInfo = &scene_info},
++            {.dstBinding = 2,
++             .descriptorCount = 1,
++             .descriptorType = vk::DescriptorType::eSampledImage,
++             .pImageInfo = &motion_info},
++        }};
++        static const bool debug_motion = std::getenv("BB_DC_DEBUG_MOTION") != nullptr;
++        const std::array<u32, 4> size = {w, h, debug_motion ? 1u : 0u, 0u};
++        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *dc_merge_pipeline);
++        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *dc_merge_pipeline_layout, 0,
++                                    writes);
++        cmdbuf.pushConstants(*dc_merge_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
++                             sizeof(size), size.data());
++        cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
++    }
++    // The resolve that follows reads the scene color.
++    runtime.Transit(&color, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
++                    vk::AccessFlagBits2::eShaderRead);
++    color.flags |= VideoCore::ImageFlagBits::GpuModified;
++    return true;
++}
++
+ } // namespace Vulkan
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.h b/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.h
+index 4067dfb..7192960 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.h
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.h
+@@ -63,6 +63,34 @@ public:
+     /// Before a compute dispatch: the post-processing combine shader triggers the upscale.
+     void OnDispatch(u64 cs_hash);
+ 
++    // Driveclub (BB_DC_UPSCALE=1): Native AA in place of the game's own TAA resolve. The G-buffer
++    // pass gives the scene depth and the object IDs, the last R11G11B10 target drawn with that
++    // depth is the scene color, and the TAA resolve's buffers give the motion (dc_motion.comp).
++
++    [[nodiscard]] bool DcMode() const noexcept {
++        return dc_mode;
++    }
++    /// The main view's depth target (kept across frames: its draws are jittered).
++    [[nodiscard]] VideoCore::ImageId DcDepth() const noexcept {
++        return dc_depth;
++    }
++    /// The TAA resolve shader (compute 0x403f86d4).
++    static constexpr u64 DcTaaHash = 0x403f86d4;
++    void OnDcGBuffer(VideoCore::ImageId depth, VideoCore::ImageId object_ids);
++    void OnDcSceneColor(VideoCore::ImageId color);
++    struct DcBuffer {
++        vk::Buffer buffer;
++        u64 offset, size;
++    };
++    struct DcInputs {
++        std::array<DcBuffer, 3> buffers; ///< frame, camera and object constants of the resolve
++        std::array<u32, 3> dword_offsets; ///< from each bound (aligned) range to the game's data
++        float tan_half_fov_y;
++    };
++    /// Before the TAA resolve: motion vectors, FSR into the scene color. True when it ran (the
++    /// caller then makes the resolve pass the scene through).
++    bool RunDriveclub(const DcInputs& inputs);
++
+     /// Start of a frame in the command stream (display pass).
+     bool OnFrameStart();
+     bool RasterScaling() const;
+@@ -194,6 +222,14 @@ private:
+     bool enabled = false;
+     bool failed = false;
+     u64 trigger_hash = 0x9a9cf8a9;
++    // Driveclub mode.
++    bool dc_mode = false;
++    VideoCore::ImageId dc_depth{}, dc_object_ids{}, dc_color{};
++    float dc_near = 0.02f, dc_vertical_fov = 1.0472f;
++    vk::UniqueDescriptorSetLayout dc_motion_desc_layout, dc_merge_desc_layout;
++    vk::UniquePipelineLayout dc_motion_pipeline_layout, dc_merge_pipeline_layout;
++    vk::UniquePipeline dc_motion_pipeline, dc_merge_pipeline;
++    void CreateDcPipelines();
+     VideoCore::ImageId scene_color{};
+     bool done_this_frame = false;
+     u32 preset_file_frames = 0; ///< BB_PRESET_FILE polling
+diff --git a/gpu/shadps4/video_core/texture_cache/blit_helper.cpp b/gpu/shadps4/video_core/texture_cache/blit_helper.cpp
+index 03427b7..c2be51e 100644
+--- a/gpu/shadps4/video_core/texture_cache/blit_helper.cpp
++++ b/gpu/shadps4/video_core/texture_cache/blit_helper.cpp
+@@ -8,6 +8,7 @@
+ #include "video_core/texture_cache/image.h"
+ 
+ #include "video_core/host_shaders/color_to_ms_depth_frag.h"
++#include "video_core/host_shaders/ms_depth_to_color_frag.h"
+ #include "video_core/host_shaders/fs_tri_vert.h"
+ #include "video_core/host_shaders/ms_image_blit_frag.h"
+ #include "video_core/host_shaders/ms_image_blit_msaa_frag.h"
+@@ -41,6 +42,7 @@ BlitHelper::~BlitHelper() {
+     const auto device = instance.GetDevice();
+     device.destroy(fs_tri_vertex);
+     device.destroy(color_to_ms_depth_frag);
++    device.destroy(ms_depth_to_color_frag);
+     device.destroy(src_msaa_copy_frag);
+     device.destroy(src_non_msaa_copy_frag);
+ }
+@@ -147,6 +149,113 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
+     scheduler.GetDynamicState().Invalidate();
+ }
+ 
++void BlitHelper::ReinterpretMsDepthAsColor(u32 width, u32 height, u32 num_samples,
++                                           vk::Format src_pixel_format, vk::Format dst_pixel_format,
++                                           vk::Image source, vk::Image dest) {
++    // Source view: MSAA depth, sampled-image aspect.
++    const vk::ImageViewUsageCreateInfo depth_usage_ci{.usage = vk::ImageUsageFlagBits::eSampled};
++    const vk::ImageViewCreateInfo depth_view_ci = {
++        .pNext = &depth_usage_ci,
++        .image = source,
++        .viewType = vk::ImageViewType::e2D,
++        .format = src_pixel_format,
++        .subresourceRange{
++            .aspectMask = vk::ImageAspectFlagBits::eDepth,
++            .baseMipLevel = 0U,
++            .levelCount = 1U,
++            .baseArrayLayer = 0U,
++            .layerCount = 1U,
++        },
++    };
++    const auto [depth_view_result, depth_view] =
++        instance.GetDevice().createImageView(depth_view_ci);
++    ASSERT_MSG(depth_view_result == vk::Result::eSuccess, "Failed to create image view: {}",
++               vk::to_string(depth_view_result));
++
++    // Destination view: 1-sample color attachment.
++    const vk::ImageViewUsageCreateInfo color_usage_ci{
++        .usage = vk::ImageUsageFlagBits::eColorAttachment};
++    const vk::ImageViewCreateInfo color_view_ci = {
++        .pNext = &color_usage_ci,
++        .image = dest,
++        .viewType = vk::ImageViewType::e2D,
++        .format = dst_pixel_format,
++        .subresourceRange{
++            .aspectMask = vk::ImageAspectFlagBits::eColor,
++            .baseMipLevel = 0U,
++            .levelCount = 1U,
++            .baseArrayLayer = 0U,
++            .layerCount = 1U,
++        },
++    };
++    const auto [color_view_result, color_view] =
++        instance.GetDevice().createImageView(color_view_ci);
++    ASSERT_MSG(color_view_result == vk::Result::eSuccess, "Failed to create image view: {}",
++               vk::to_string(color_view_result));
++    scheduler.DeferOperation([device = instance.GetDevice(), depth_view, color_view] {
++        device.destroyImageView(depth_view);
++        device.destroyImageView(color_view);
++    });
++
++    Vulkan::RenderState state{};
++    state.width = width;
++    state.height = height;
++    state.num_layers = 1;
++    state.num_color_attachments = 1;
++    state.color_attachments[0].image_view = color_view;
++    state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
++    state.color_attachments[0].is_clear = true;
++    scheduler.BeginRendering(state);
++
++    const auto cmdbuf = scheduler.CommandBuffer();
++    const vk::DescriptorImageInfo image_info = {
++        .sampler = VK_NULL_HANDLE,
++        .imageView = depth_view,
++        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
++    };
++    const vk::WriteDescriptorSet texture_write = {
++        .dstSet = VK_NULL_HANDLE,
++        .dstBinding = 0U,
++        .dstArrayElement = 0U,
++        .descriptorCount = 1U,
++        .descriptorType = vk::DescriptorType::eSampledImage,
++        .pImageInfo = &image_info,
++    };
++    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
++                                texture_write);
++
++    // Pipeline key: destination (color) format + MSAA sample count of the source.
++    // src_msaa is always true in this direction.
++    const MsPipelineKey key{num_samples, dst_pixel_format, true};
++    auto it = std::ranges::find(ms_depth_to_color_pl, key, &MsPipeline::first);
++    if (it == ms_depth_to_color_pl.end()) {
++        CreateMsDepthToColorPipeline(key);
++        it = --ms_depth_to_color_pl.end();
++    }
++    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
++
++    const vk::Viewport viewport = {
++        .x = 0,
++        .y = 0,
++        .width = float(state.width),
++        .height = float(state.height),
++        .minDepth = 0.f,
++        .maxDepth = 1.f,
++    };
++    cmdbuf.setViewportWithCount(viewport);
++
++    const vk::Rect2D scissor = {
++        .offset = {0, 0},
++        .extent = {state.width, state.height},
++    };
++    cmdbuf.setScissorWithCount(scissor);
++
++    cmdbuf.draw(3, 1, 0, 0);
++
++    scheduler.EndRendering();
++    scheduler.GetDynamicState().Invalidate();
++}
++
+ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
+                                      vk::Format pixel_format, bool src_msaa, vk::Image source,
+                                      vk::Image dest) {
+@@ -252,6 +361,7 @@ void BlitHelper::CreateShaders() {
+     const auto device = instance.GetDevice();
+     fs_tri_vertex = Vulkan::CompileSPV(FS_TRI_VERT, device);
+     color_to_ms_depth_frag = Vulkan::CompileSPV(COLOR_TO_MS_DEPTH_FRAG, device);
++    ms_depth_to_color_frag = Vulkan::CompileSPV(MS_DEPTH_TO_COLOR_FRAG, device);
+     src_msaa_copy_frag = Vulkan::CompileSPV(MS_IMAGE_BLIT_MSAA_FRAG, device);
+     src_non_msaa_copy_frag = Vulkan::CompileSPV(MS_IMAGE_BLIT_FRAG, device);
+ }
+@@ -353,6 +463,86 @@ void BlitHelper::CreateColorToMSDepthPipeline(const MsPipelineKey& key) {
+     color_to_ms_depth_pl.emplace_back(key, std::move(pipeline));
+ }
+ 
++void BlitHelper::CreateMsDepthToColorPipeline(const MsPipelineKey& key) {
++    // Source is MSAA depth, destination is a 1-sample color attachment.
++    // Rasterization samples therefore match the COLOR attachment (1x), not
++    // the source — the shader does the sample fetch itself via texture2DMS.
++    const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
++        .topology = vk::PrimitiveTopology::eTriangleList,
++    };
++    const vk::PipelineMultisampleStateCreateInfo multisampling = {
++        .rasterizationSamples = vk::SampleCountFlagBits::e1,
++    };
++    const vk::PipelineDepthStencilStateCreateInfo depth_state = {
++        .depthTestEnable = false,
++        .depthWriteEnable = false,
++        .depthCompareOp = vk::CompareOp::eAlways,
++    };
++    const std::array dynamic_states = {vk::DynamicState::eViewportWithCount,
++                                       vk::DynamicState::eScissorWithCount};
++    const vk::PipelineDynamicStateCreateInfo dynamic_info = {
++        .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
++        .pDynamicStates = dynamic_states.data(),
++    };
++
++    std::array<vk::PipelineShaderStageCreateInfo, 2> shader_stages;
++    shader_stages[0] = {
++        .stage = vk::ShaderStageFlagBits::eVertex,
++        .module = fs_tri_vertex,
++        .pName = "main",
++    };
++    shader_stages[1] = {
++        .stage = vk::ShaderStageFlagBits::eFragment,
++        .module = ms_depth_to_color_frag,
++        .pName = "main",
++    };
++
++    const vk::PipelineRenderingCreateInfo pipeline_rendering_ci = {
++        .colorAttachmentCount = 1u,
++        .pColorAttachmentFormats = &key.attachment_format,
++        .depthAttachmentFormat = vk::Format::eUndefined,
++        .stencilAttachmentFormat = vk::Format::eUndefined,
++    };
++
++    const vk::PipelineColorBlendAttachmentState attachment = {
++        .blendEnable = false,
++        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
++                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
++    };
++    const vk::PipelineColorBlendStateCreateInfo color_blending = {
++        .logicOpEnable = false,
++        .logicOp = vk::LogicOp::eCopy,
++        .attachmentCount = 1u,
++        .pAttachments = &attachment,
++    };
++    const vk::PipelineViewportStateCreateInfo viewport_info{};
++    const vk::PipelineVertexInputStateCreateInfo vertex_input_info{};
++    const vk::PipelineRasterizationStateCreateInfo raster_state{.lineWidth = 1.f};
++
++    const vk::GraphicsPipelineCreateInfo pipeline_info = {
++        .pNext = &pipeline_rendering_ci,
++        .stageCount = static_cast<u32>(shader_stages.size()),
++        .pStages = shader_stages.data(),
++        .pVertexInputState = &vertex_input_info,
++        .pInputAssemblyState = &input_assembly,
++        .pViewportState = &viewport_info,
++        .pRasterizationState = &raster_state,
++        .pMultisampleState = &multisampling,
++        .pDepthStencilState = &depth_state,
++        .pColorBlendState = &color_blending,
++        .pDynamicState = &dynamic_info,
++        .layout = *single_texture_pl_layout,
++    };
++
++    auto [pipeline_result, pipeline] =
++        instance.GetDevice().createGraphicsPipelineUnique(VK_NULL_HANDLE, pipeline_info);
++    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
++               vk::to_string(pipeline_result));
++    Vulkan::SetObjectName(instance.GetDevice(), *pipeline, "MS Depth to Color {}", key.num_samples);
++
++    ms_depth_to_color_pl.emplace_back(key, std::move(pipeline));
++}
++
+ void BlitHelper::CreateMsCopyPipeline(const MsPipelineKey& key) {
+     const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
+         .topology = vk::PrimitiveTopology::eTriangleList,
+diff --git a/gpu/shadps4/video_core/texture_cache/blit_helper.h b/gpu/shadps4/video_core/texture_cache/blit_helper.h
+index 5855a5c..c577d0d 100644
+--- a/gpu/shadps4/video_core/texture_cache/blit_helper.h
++++ b/gpu/shadps4/video_core/texture_cache/blit_helper.h
+@@ -28,6 +28,13 @@ public:
+                                    vk::Format src_pixel_format, vk::Format dst_pixel_format,
+                                    vk::Image source, vk::Image dest);
+ 
++    // Resolves a multi-sample depth image into a single-sample color image (sample 0 into R):
++    // Driveclub samples its MSAA depth as a 1x color texture for screen-space lighting, SSAO
++    // and soft particles. From akitaonrails/shadPS4 (gamma-debug), GPL-2.0-or-later.
++    void ReinterpretMsDepthAsColor(u32 width, u32 height, u32 num_samples,
++                                   vk::Format src_pixel_format, vk::Format dst_pixel_format,
++                                   vk::Image source, vk::Image dest);
++
+     void CopyBetweenMsImages(u32 width, u32 height, u32 num_samples, vk::Format pixel_format,
+                              bool src_msaa, vk::Image source, vk::Image dest);
+ 
+@@ -43,6 +50,7 @@ private:
+         auto operator<=>(const MsPipelineKey&) const noexcept = default;
+     };
+     void CreateColorToMSDepthPipeline(const MsPipelineKey& key);
++    void CreateMsDepthToColorPipeline(const MsPipelineKey& key);
+     void CreateMsCopyPipeline(const MsPipelineKey& key);
+ 
+ private:
+@@ -52,11 +60,13 @@ private:
+     vk::UniquePipelineLayout single_texture_pl_layout;
+     vk::ShaderModule fs_tri_vertex;
+     vk::ShaderModule color_to_ms_depth_frag;
++    vk::ShaderModule ms_depth_to_color_frag;
+     vk::ShaderModule src_msaa_copy_frag;
+     vk::ShaderModule src_non_msaa_copy_frag;
+ 
+     using MsPipeline = std::pair<MsPipelineKey, vk::UniquePipeline>;
+     std::vector<MsPipeline> color_to_ms_depth_pl;
++    std::vector<MsPipeline> ms_depth_to_color_pl;
+     std::vector<MsPipeline> ms_image_copy_pl;
+ };
+ 
+diff --git a/gpu/shadps4/video_core/texture_cache/texture_cache.cpp b/gpu/shadps4/video_core/texture_cache/texture_cache.cpp
+index 9692547..4b27efa 100644
+--- a/gpu/shadps4/video_core/texture_cache/texture_cache.cpp
++++ b/gpu/shadps4/video_core/texture_cache/texture_cache.cpp
+@@ -99,6 +99,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+     };
+     runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
+     if (sync) {
++        BbStats::SiteTimer site_timer{2};
+         scheduler.Finish();
+         download.Invalidate();
+         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
+diff --git a/gpu/shim/bbgpu.cpp b/gpu/shim/bbgpu.cpp
+index 494d151..85c8231 100644
+--- a/gpu/shim/bbgpu.cpp
++++ b/gpu/shim/bbgpu.cpp
+@@ -233,7 +233,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
+     if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
+ #endif
+     Core::Emulator::FillElfInfo(*config);
+-    const std::string title = config->title ? config->title : "Bloodborne";
++    const std::string title = config->title ? config->title : "DRIVECLUB";
+     const s32 width = config->width, height = config->height;
+     g_window_thread = std::thread([title, width, height] {
+         Common::SetCurrentThreadName("bb:window");
+diff --git a/gpu/shim/bbport_overlay.cpp b/gpu/shim/bbport_overlay.cpp
+index c6f7c9a..4459551 100644
+--- a/gpu/shim/bbport_overlay.cpp
++++ b/gpu/shim/bbport_overlay.cpp
+@@ -7,6 +7,7 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <mutex>
+ 
+ #include <SDL3/SDL.h>
+@@ -168,7 +169,7 @@ void Menu() {
+         ImVec2(0.0f, 0.0f),
+         ImVec2(FLT_MAX, std::max(viewport->WorkSize.y - 60.0f * base_scale, 200.0f * base_scale)));
+     bool keep_open = true;
+-    if (!ImGui::Begin("Bloodborne - Settings (Insert / L3+R3)", &keep_open,
++    if (!ImGui::Begin("DCport - Settings (Insert / L3+R3)", &keep_open,
+                       ImGuiWindowFlags_NoCollapse)) {
+         ImGui::End();
+         return;
+@@ -176,6 +177,12 @@ void Menu() {
+     ImGui::Text("%.0f FPS  (%.1f ms)", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
+                 frame_ms_avg);
+ 
++    // DCport without FSR (BB_UPSCALER=none): no upscaler, preset or output resolution options.
++    static const bool no_upscaler = [] {
++        const char* env = std::getenv("BB_UPSCALER");
++        return env && std::strcmp(env, "none") == 0;
++    }();
++    if (!no_upscaler) {
+     ImGui::SeparatorText("Temporal upscaling");
+     static const char* upscalers[] = {"Off", "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
+                                      "TAA (native anti-aliasing)", "DLSS (NVIDIA RTX)"};
+@@ -225,6 +232,10 @@ void Menu() {
+         Checkbox("FSR 4: invert jitter", s.fsr4_invert_jitter);
+         Hint("Ghosting diagnostics: FSR 4 uses exposure to normalize color and decide when to discard history. These options apply immediately.");
+     }
++    if (s.upscaler == BbSettings::UpscalerFsr3) {
++        Checkbox("Invert jitter", s.fsr4_invert_jitter);
++        Hint("The direction FSR is told the camera was shifted. If edges or bright highlights shimmer, try the other setting.");
++    }
+     const bool upscaler_on = s.upscaler != BbSettings::UpscalerOff;
+     const bool taa = s.upscaler == BbSettings::UpscalerTaa;
+     ImGui::BeginDisabled(!upscaler_on);
+@@ -334,6 +345,9 @@ void Menu() {
+         ImGui::EndCombo();
+     }
+     Hint("On: output and presets change without restarting, while game post-processing stays at 1080p. Off: the scene is patched to the preset resolution at startup. Auto enables the live path on capable discrete GPUs. Changes apply after restarting the game.");
++    // Driveclub: the effects, cheats and model detail below are Bloodborne 1.09 patches.
++    static const bool bloodborne_menu = std::getenv("BB_BLOODBORNE_MENU") != nullptr;
++    if (bloodborne_menu) {
+     ImGui::SeparatorText("Game effects (restart required)");
+     static const char* lods[] = {"Highest (-2)", "Original", "Lower (1)", "Lowest (2)"};
+     static constexpr int lod_values[] = {-2, 0, 1, 2};
+@@ -354,6 +368,7 @@ void Menu() {
+     }
+     Hint("Effects are applied through game patches at startup (patches/Bloodborne.xml). Motion blur and dynamic shadows can increase GPU load.");
+     Hint("Free camera: hold Cross and press L3 (keyboard: Space + Z). Debug menu: left touchpad / Tab. Requires DbgFont14h.ccm and DbgFont14h.tpf in dvdroot_ps4/font from the debug-font mod. Right touchpad: Backspace.");
++    }
+ 
+     bool restart = s.object_motion != s.startup_object_motion ||
+                    s.model_lod != s.startup_model_lod ||
+@@ -371,6 +386,7 @@ void Menu() {
+         }
+     }
+ 
++    } // !no_upscaler
+     ImGui::SeparatorText("Other");
+     Checkbox("Show FPS counter", s.show_fps);
+ 
+@@ -397,7 +413,7 @@ void Menu() {
+         quit_armed = false;
+     }
+     ImGui::SameLine();
+-    ImGui::TextDisabled("Settings are saved to bbport.ini");
++    ImGui::TextDisabled("Settings are saved to dcport.ini");
+     ImGui::End();
+     if (!keep_open) {
+         SetOpen(false);
+@@ -464,7 +480,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count)
+     io.IniFilename = nullptr; // window positions are not kept
+     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+-    io.BackendPlatformName = "bbport";
++    io.BackendPlatformName = "dcport";
+ 
+     ImGui::StyleColorsDark();
+     ImGuiStyle& style = ImGui::GetStyle();
+diff --git a/gpu/shim/bbport_settings.cpp b/gpu/shim/bbport_settings.cpp
+index 7743165..c2f9b33 100644
+--- a/gpu/shim/bbport_settings.cpp
++++ b/gpu/shim/bbport_settings.cpp
+@@ -14,7 +14,7 @@ namespace {
+ 
+ const char* Path() {
+     const char* env = std::getenv("BB_CONFIG");
+-    return env && env[0] ? env : "bbport.ini";
++    return env && env[0] ? env : "dcport.ini";
+ }
+ 
+ float Clamp(float v, float lo, float hi) {
+@@ -191,7 +191,7 @@ void Save() {
+         return;
+     }
+     std::fprintf(file,
+-                 "# bbport settings (in-game menu: Insert / L3+R3)\n"
++                 "# DCport settings (in-game menu: Insert / L3+R3)\n"
+                  "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
+                  "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
+                  "debug_view=%d\nshow_fps=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
+diff --git a/gpu/shim/bbport_toggles.h b/gpu/shim/bbport_toggles.h
+index 57a9486..5eaf908 100644
+--- a/gpu/shim/bbport_toggles.h
++++ b/gpu/shim/bbport_toggles.h
+@@ -119,6 +119,22 @@ inline std::atomic<std::uint64_t> reduced_draws{0}, scene_draws{0};
+ /// for host copies before a submission or fence, and for GPU ticks.
+ inline std::atomic<std::uint64_t> sync_recording_ns{0}, host_copies_wait_ns{0}, tick_wait_ns{0},
+     copy_threads_wait_ns{0}, host_copy_waits{0};
++/// Driveclub bring-up: GPU waits by call site (0 EOS GDS finish, 1 buffer download finish,
++/// 2 image download finish, 3 fault buffer wait, 4 stream buffer wait), ns and count.
++inline std::atomic<std::uint64_t> site_wait_ns[5]{}, site_waits[5]{};
++/// Async readback (BufferCache::AsyncReadbackFrame): ranges and bytes copied, by size bucket
++/// (<=256 B, <=4 KiB, <=64 KiB, larger).
++inline std::atomic<std::uint64_t> async_ranges[4]{}, async_bytes{0};
++struct SiteTimer {
++    int site;
++    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++    ~SiteTimer() {
++        site_wait_ns[site].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                         std::chrono::steady_clock::now() - start).count(),
++                                     std::memory_order_relaxed);
++        site_waits[site].fetch_add(1, std::memory_order_relaxed);
++    }
++};
+ struct WaitTimer {
+     std::atomic<std::uint64_t>& total;
+     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+diff --git a/packaging/windows/bb-probe.rc b/packaging/windows/bb-probe.rc
+index 46d615e..a980e63 100644
+--- a/packaging/windows/bb-probe.rc
++++ b/packaging/windows/bb-probe.rc
+@@ -1,4 +1,27 @@
+ #include <winuser.h>
+ CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "bb-probe.manifest"
+ // The first icon is the one Explorer and the game window show.
+-1 ICON "../../launcher/bloodborne.ico"
++1 ICON "../../launcher/dcport.ico"
++
++// DCport: DRIVECLUB for Windows (Properties -> Details).
++1 VERSIONINFO
++FILEVERSION 0,1,0,0
++PRODUCTVERSION 0,1,0,0
++BEGIN
++    BLOCK "StringFileInfo"
++    BEGIN
++        BLOCK "040904b0"
++        BEGIN
++            VALUE "FileDescription", "DCport - DRIVECLUB runtime"
++            VALUE "ProductName", "DCport"
++            VALUE "FileVersion", "0.1.0"
++            VALUE "ProductVersion", "0.1.0"
++            VALUE "LegalCopyright", "GPL-2.0-or-later. Built on bbport (deadinside28, Supermedo) and shadPS4."
++            VALUE "OriginalFilename", "DriveClub.exe"
++        END
++    END
++    BLOCK "VarFileInfo"
++    BEGIN
++        VALUE "Translation", 0x409, 1200
++    END
++END
+diff --git a/src/probe.c b/src/probe.c
+index 07344eb..6b06555 100644
+--- a/src/probe.c
++++ b/src/probe.c
+@@ -13,6 +13,7 @@
+ #endif
+ #ifdef _WIN32
+ #include <windows.h>
++#include <signal.h>
+ #else
+ #include <sys/mman.h>
+ #include <malloc.h>
+@@ -73,8 +74,20 @@ static void protect(void *p, size_t size, unsigned flags) {
+     if (mprotect(p, size, mode)) fail("mprotect failed");
+ #endif
+ }
+-static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argument) {
++static ABI uint64_t unresolved(uint32_t id, uintptr_t argument) {
+     if (id >= import_count) fail("bad import trap index");
++    /* BB_LENIENT_IMPORTS=1: an import nothing implements returns 0 (logged once each) instead of
++     * stopping, to bring up games other than the one the runtime was written for. */
++    static int lenient = -1;
++    if (lenient < 0) lenient = getenv("BB_LENIENT_IMPORTS") && !strcmp(getenv("BB_LENIENT_IMPORTS"), "1");
++    if (lenient) {
++        static unsigned char logged[100000];
++        if (id < sizeof(logged) && !__atomic_exchange_n(&logged[id], 1, __ATOMIC_RELAXED))
++            printf("Lenient import: %s (%s) returns 0; first argument 0x%" PRIxPTR "\n",
++                   names[id], runtime_import_name(names[id]), argument);
++        fflush(stdout);
++        return 0;
++    }
+     printf("STOP: first unsupported PS4 import: %s (index %u)\n", names[id], id);
+     printf("API: %s\n", runtime_import_name(names[id]));
+     printf("Caller return offset: 0x%" PRIxPTR "; first argument: 0x%" PRIxPTR "\n",
+@@ -146,7 +159,7 @@ static void check_cpu(void) {
+     snprintf(text,sizeof(text),"This processor cannot run the game:\n%s\n\nMissing instructions: %s\n\n"
+              "The game uses instructions of the PS4's processor. They need an Intel Core of the 4th "
+              "generation (Haswell, 2013) or newer, or an AMD Ryzen.",name,missing);
+-    MessageBoxA(NULL,text,"Bloodborne",MB_OK|MB_ICONERROR|MB_SETFOREGROUND);
++    MessageBoxA(NULL,text,"DRIVECLUB",MB_OK|MB_ICONERROR|MB_SETFOREGROUND);
+ #endif
+     exit(24);
+ }
+@@ -228,6 +241,29 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
+ static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
++/* abort() (an uncaught C++ exception, a library check) ends the process with 0xC0000409 and no
++ * message: say so, with the host call stack as module+offset (llvm-symbolizer resolves them). */
++static void abort_handler(int sig) {
++    (void)sig;
++    printf("STOP: the runtime aborted (abort/terminate); host stack:\n");
++    void *frames[48];
++    const USHORT count = RtlCaptureStackBackTrace(1, 48, frames, NULL);
++    for (USHORT i = 0; i < count; ++i) {
++        HMODULE module = NULL;
++        char name[MAX_PATH] = "?";
++        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                               (LPCSTR)frames[i], &module) && module) {
++            GetModuleFileNameA(module, name, sizeof(name));
++            const char *base = strrchr(name, '\\');
++            printf("  #%u %s+0x%llx\n", (unsigned)i, base ? base + 1 : name,
++                   (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)module));
++        } else {
++            printf("  #%u %p\n", (unsigned)i, frames[i]);
++        }
++    }
++    fflush(NULL);
++}
+ /* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
+  * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
+ uint32_t runtime_thread_tcb_offset(void);
+@@ -493,6 +529,7 @@ int main(int argc, char **argv) {
+     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
+     AddVectoredExceptionHandler(1, vectored_fault);
+     SetUnhandledExceptionFilter(unhandled_fault);
++    signal(SIGABRT, abort_handler);
+     if (getenv("BB_STRICT_HANDLES")) {
+         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
+         strict.RaiseExceptionOnInvalidHandleReference=1;
+@@ -616,7 +653,7 @@ int main(int argc, char **argv) {
+     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
+     fclose(f);
+     if (!cpu_only) {
+-        char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
++        char title[128]="DRIVECLUB", serial[16]="UNKNOWN", sfo[4096];
+         uint32_t attributes=0;
+         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
+         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
+diff --git a/src/runtime.c b/src/runtime.c
+index 25865ae..005a9d4 100644
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -236,16 +236,27 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
+     if (save) return save;
+     uintptr_t file = runtime_file_resolve(name);
+     if (file) return file;
+-    return bbgpu_resolve(name);
++    uintptr_t gpu = bbgpu_resolve(name);
++    if (gpu) return gpu;
++    return runtime_dc_resolve(name);
+ }
+ static const struct { const char *nid, *symbol; } import_names[]={
+ #include "import_names.inc"
+ };
+-/* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
++static const struct { const char *nid, *symbol; } all_names[]={
++#include "nid_names_all.inc"
++};
++static int compare_nid(const void *key, const void *entry) {
++    return strncmp((const char *)key, *(const char *const *)entry, 11);
++}
++/* Symbol name for a scoped NID: the exact Bloodborne spelling first, then the bare NID
++ * (other games number their library keys differently), or NULL when unknown. */
+ const char *runtime_symbol(const char *nid) {
+     for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
+         if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
+-    return NULL;
++    if (strlen(nid) < 11 || (nid[11] && nid[11] != '#')) return NULL;
++    const void *found=bsearch(nid,all_names,sizeof(all_names)/sizeof(*all_names),sizeof(*all_names),compare_nid);
++    return found ? ((const char *const *)found)[1] : NULL;
+ }
+ /* Same symbol name means same contract whether imported from libkernel or
+  * libScePosix, so newer modules resolve by name through runtime_symbol. */
+diff --git a/src/runtime.h b/src/runtime.h
+index 773ee79..1e4e569 100644
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -85,8 +85,15 @@ uintptr_t runtime_pad_resolve(const char *name);
+ void runtime_pad_report(void);
+ uintptr_t runtime_rtc_resolve(const char *name);
+ const char *runtime_file_user_dir(void);
++const char *runtime_file_app_dir(void);
++ABI int32_t runtime_addcont_info(uint32_t service, const char *label, void *info);
++ABI int32_t runtime_addcont_mount(uint32_t service, const char *label, char *mount_point);
+ void runtime_savedata_configure(const char *title);
+ uintptr_t runtime_savedata_resolve(const char *name);
+ void runtime_savedata_report(void);
+ void runtime_thread_attach_host(const char *name);
++/* Driveclub's system functions the Bloodborne runtime has no contract for (runtime_dc.c). */
++uintptr_t runtime_dc_resolve(const char *name);
++/* libSceFont on FreeType (runtime_font.c). */
++uintptr_t runtime_font_resolve(const char *name);
+ #endif
+diff --git a/src/runtime_content.c b/src/runtime_content.c
+index 045f3c0..4da5a08 100644
+--- a/src/runtime_content.c
++++ b/src/runtime_content.c
+@@ -1,6 +1,7 @@
+ /* Offline AppContent provider for the configured base-game profile.
+- * No package/DLC mounting, downloads, entitlement or license emulation; add-on folders in
+- * <user>/addcont/<title id> and BB_DLC_DIR are reported as installed (see addon_list). */
++ * No downloads or license checks: add-on folders the player supplies (their own dumped
++ * entitlement folders) in <user>/addcont/<title id>, BB_DLC_DIR or the game folder itself are
++ * reported as installed (see addon_list); mounting one maps /addcontN onto its folder. */
+ #include "runtime.h"
+ #include <dirent.h>
+ #include <stdio.h>
+@@ -75,35 +76,33 @@ static ABI int32_t param_int(uint32_t id,int32_t *out) {
+ /* SceAppContentAddcontInfo: entitlement label (16 chars + NUL), padding, download status. */
+ #define LABEL_SIZE 17
+ #define ADDON_INSTALLED 4u
+-#define MAX_ADDONS 64
++#define MAX_ADDONS 2048
+ typedef struct { char label[LABEL_SIZE]; char padding[3]; uint32_t status; } AddonInfo;
+ /* The add-on folders of one folder: each subfolder is named by its entitlement label (up to 16
+- * characters), as dumped (SPEXPANSIONDLC03/sce_sys/...). Labels seen before are skipped. */
+-static void scan_labels(const char *folder,char labels[][LABEL_SIZE],uint32_t *count) {
++ * characters), as dumped (DCXTOURXXXXXX001/sce_sys/...). Labels seen before are skipped. In the
++ * game folder only subfolders with their own sce_sys/param.sfo count (not sce_sys, sce_module). */
++static char label_dirs[MAX_ADDONS][512];
++static void scan_labels(const char *folder,char labels[][LABEL_SIZE],uint32_t *count,int need_sfo) {
+     DIR *dir=opendir(folder);
+     for (struct dirent *e; dir && (e=readdir(dir));) {
+-        char path[4096];
++        char path[4096], sfo[4200];
+         struct stat entry;
+         size_t n=strlen(e->d_name);
+         if (e->d_name[0]=='.' || n>=LABEL_SIZE || *count>=MAX_ADDONS) continue;
+         if (snprintf(path,sizeof(path),"%s/%s",folder,e->d_name)>=(int)sizeof(path) ||
+-            stat(path,&entry) || !S_ISDIR(entry.st_mode)) continue;
++            stat(path,&entry) || !S_ISDIR(entry.st_mode) || strlen(path)>=sizeof(label_dirs[0])) continue;
++        if (need_sfo) {
++            snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",path);
++            if (stat(sfo,&entry) || !S_ISREG(entry.st_mode)) continue;
++        }
+         int seen=0;
+         for (uint32_t i=0;i<*count;++i) seen|=!strcmp(labels[i],e->d_name);
+-        if (!seen) memcpy(labels[(*count)++],e->d_name,n+1);
++        if (!seen) { memcpy(labels[*count],e->d_name,n+1); snprintf(label_dirs[*count],sizeof(label_dirs[0]),"%s",path); ++*count; }
+     }
+     if (dir) closedir(dir);
+ }
+-/* Add-ons are the folders <user>/addcont/<title id>/<entitlement label> (shadPS4's layout) and
+- * those of BB_DLC_DIR (the launcher's DLC folder: <label> folders), each reported as installed.
+- * No add-on data is mounted: Bloodborne: The Old Hunters (SPEXPANSIONDLC03) needs only the
+- * entitlement, its data ships with patch 1.09. Without a list the count is returned, with one
+- * at most capacity entries are written. Never touch unused list slots. */
+-static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
+-    require_initialized();
+-    if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
+-    if ((!capacity || !list) && !hits) return PARAMETER;
+-    static char labels[MAX_ADDONS][LABEL_SIZE];
++/* Folders are scanned once per run (DRIVECLUB has over a thousand add-ons and asks per label). */
++static uint32_t scan_all(char labels[][LABEL_SIZE]) {
+     uint32_t found=0;
+     char root[4096];
+     int fits=snprintf(root,sizeof(root),"%s/addcont",runtime_file_user_dir())<(int)sizeof(root);
+@@ -111,11 +110,34 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
+     for (struct dirent *t; titles && (t=readdir(titles));) {
+         char title[4096];
+         if (t->d_name[0]=='.' || snprintf(title,sizeof(title),"%s/%s",root,t->d_name)>=(int)sizeof(title)) continue;
+-        scan_labels(title,labels,&found);
++        scan_labels(title,labels,&found,0);
+     }
+     if (titles) closedir(titles);
+     const char *dlc=getenv("BB_DLC_DIR");
+-    if (dlc && *dlc) scan_labels(dlc,labels,&found);
++    if (dlc && *dlc) scan_labels(dlc,labels,&found,0);
++    const char *app=runtime_file_app_dir();
++    if (app && *app) scan_labels(app,labels,&found,1);
++    return found;
++}
++static char cached_labels[MAX_ADDONS][LABEL_SIZE];
++static uint32_t cached_count;
++static int cached;
++static uint32_t collect_labels(char labels[][LABEL_SIZE]) {
++    if (!cached) { cached_count=scan_all(cached_labels); cached=1; }
++    memcpy(labels,cached_labels,(size_t)cached_count*LABEL_SIZE);
++    return cached_count;
++}
++/* Add-ons are the folders <user>/addcont/<title id>/<entitlement label> (shadPS4's layout) and
++ * those of BB_DLC_DIR (the launcher's DLC folder: <label> folders), each reported as installed.
++ * No add-on data is mounted: Bloodborne: The Old Hunters (SPEXPANSIONDLC03) needs only the
++ * entitlement, its data ships with patch 1.09. Without a list the count is returned, with one
++ * at most capacity entries are written. Never touch unused list slots. */
++static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
++    require_initialized();
++    if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
++    if ((!capacity || !list) && !hits) return PARAMETER;
++    static char labels[MAX_ADDONS][LABEL_SIZE];
++    uint32_t found=collect_labels(labels);
+     uint32_t count=list && capacity && found>capacity ? capacity : found;
+     if (list && capacity) for (uint32_t i=0;i<count;++i) {
+         AddonInfo info;
+@@ -128,6 +150,38 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
+     if (found!=reported) printf("Runtime: AppContent add-ons reported installed: %u\n",(unsigned)(reported=found));
+     ++lists; return 0;
+ }
++/* Index of an installed add-on by entitlement label (SceNpUnifiedEntitlementLabel: 16 chars). */
++static int find_label(const char *label,char labels[][LABEL_SIZE],uint32_t found) {
++    if (!label) return -1;
++    char want[LABEL_SIZE]; memcpy(want,label,LABEL_SIZE-1); want[LABEL_SIZE-1]=0;
++    for (uint32_t i=0;i<found;++i) if (!strcmp(labels[i],want)) return (int)i;
++    return -1;
++}
++#define ADDCONT_NOT_FOUND ((int32_t)0x80D90007)
++ABI int32_t runtime_addcont_info(uint32_t service,const char *label,void *info) {
++    static char labels[MAX_ADDONS][LABEL_SIZE];
++    if (!label || !info) return PARAMETER;
++    uint32_t found=collect_labels(labels);
++    int i=find_label(label,labels,found);
++    if (i<0 || service) return ADDCONT_NOT_FOUND;
++    AddonInfo out; memset(&out,0,sizeof(out));
++    memcpy(out.label,labels[i],strlen(labels[i])); out.status=ADDON_INSTALLED;
++    memcpy(info,&out,sizeof(out));
++    return 0;
++}
++/* Mounting maps /addcont<N> onto the add-on's folder (entitlement-only add-ons have no data). */
++ABI int32_t runtime_addcont_mount(uint32_t service,const char *label,char *mount_point) {
++    static char labels[MAX_ADDONS][LABEL_SIZE];
++    if (!label || !mount_point) return PARAMETER;
++    uint32_t found=collect_labels(labels);
++    int i=find_label(label,labels,found);
++    if (i<0 || service) return ADDCONT_NOT_FOUND;
++    char guest[16]; snprintf(guest,sizeof(guest),"/addcont%d",i);
++    if (runtime_file_mount(guest,label_dirs[i])) return BUSY;
++    memset(mount_point,0,16); memcpy(mount_point,guest,strlen(guest));
++    printf("Runtime: AppContent add-on %s mounted at %s\n",labels[i],guest);
++    return 0;
++}
+ uintptr_t runtime_content_resolve(const char *name) {
+     if (!strcmp(name,"g8cM39EUZ6o#M#N")) return (uintptr_t)module_load;
+     if (!strcmp(name,"fMP5NHUOaMk#M#N")) return (uintptr_t)module_loaded;
+diff --git a/src/runtime_file.c b/src/runtime_file.c
+index c64c0f9..a09cc57 100644
+--- a/src/runtime_file.c
++++ b/src/runtime_file.c
+@@ -105,11 +105,13 @@ void runtime_file_unmount(const char *guest) {
+     }
+     pthread_mutex_unlock(&lock);
+ }
+-static char user_root[512]="user";
++static char user_root[512]="user", app_root[512]="";
+ const char *runtime_file_user_dir(void) { return user_root; }
++const char *runtime_file_app_dir(void) { return app_root; }
+ void runtime_file_configure(const char *app0,const char *user) {
+     char path[600];
+     snprintf(user_root,sizeof(user_root),"%s",user);
++    snprintf(app_root,sizeof(app_root),"%s",app0);
+     runtime_file_mount("/app0",app0);
+     runtime_file_mount("/hostapp",app0);
+     const char *writable[]={"temp0","download0","data"};
+diff --git a/src/runtime_input_config.c b/src/runtime_input_config.c
+index 8e359d6..b202c5b 100644
+--- a/src/runtime_input_config.c
++++ b/src/runtime_input_config.c
+@@ -504,7 +504,7 @@ void input_config_defaults(InputConfig *out) {
+  * single binding of that kind. launcher/bbport_input_config.py has a copy of the whole text
+  * (tests/test_input_defaults.py checks that they match). */
+ #define DEFAULT_HEADER \
+-"# bbport input (shadPS4 syntax: output = input, one input per line).\n" \
++"# DCport input (shadPS4 syntax: output = input, one input per line).\n" \
+ "# A shadPS4 input config (user/input_config/CUSA03173.ini) can be copied over this file.\n" \
+ "# F7 toggles the mouse, F8 reloads this file.\n" \
+ "\n"
+diff --git a/gpu/shadps4/video_core/host_shaders/dc_merge.comp b/gpu/shadps4/video_core/host_shaders/dc_merge.comp
+new file mode 100644
+index 0000000..0fbf48a
+--- /dev/null
++++ b/gpu/shadps4/video_core/host_shaders/dc_merge.comp
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Driveclub: the upscaled scene back into the game's R11G11B10 scene color, stored as the
++// color block would (negatives and NaN as 0, overflow as the largest finite value).
++#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++
++layout(local_size_x = 8, local_size_y = 8) in;
++
++layout(binding = 0) uniform texture2D upscaled;
++layout(binding = 1) uniform writeonly image2D scene_img;
++layout(binding = 2) uniform texture2D motion_tex; // pixels, previous - current
++
++layout(push_constant) uniform Constants {
++    uvec2 size;
++    uint mode; // 0 upscaled scene, 1 motion vectors (BB_DC_DEBUG_MOTION=1)
++};
++
++void main() {
++    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
++    if (any(greaterThanEqual(uvec2(pixel), size))) {
++        return;
++    }
++    vec3 color = texelFetch(upscaled, pixel, 0).rgb;
++    if (mode == 1u) {
++        // Motion: red right, green down, blue its length; 0.5 is still (16 px full scale).
++        const vec2 m = texelFetch(motion_tex, pixel, 0).xy;
++        color = vec3(0.5 + m / 32.0, length(m) / 16.0) * 0.5;
++    }
++    const vec3 stored = mix(vec3(0.0), min(color, vec3(65024.0)), greaterThan(color, vec3(0.0)));
++    imageStore(scene_img, pixel, vec4(stored, 1.0));
++}
+diff --git a/gpu/shadps4/video_core/host_shaders/dc_motion.comp b/gpu/shadps4/video_core/host_shaders/dc_motion.comp
+new file mode 100644
+index 0000000..de5d757
+--- /dev/null
++++ b/gpu/shadps4/video_core/host_shaders/dc_motion.comp
+@@ -0,0 +1,63 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Driveclub: motion vectors for the temporal upscaler, by the reprojection of the game's own TAA
++// resolve (compute shader 0x403f86d4): the view position from the depth and the frame's view
++// ray, through the current -> previous transform of the pixel's object (the world or a car),
++// projected with the previous frame's camera. Pixels, previous - current, like camera_motion.
++#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++
++layout(local_size_x = 8, local_size_y = 8) in;
++
++// The TAA resolve's buffers: frame constants, camera constants, and the object transforms
++// (48 dwords per object; rows 16, 20, 24, 28 map view x, y, z and 1 to the previous clip).
++layout(binding = 0, std430) readonly buffer Frame { uint frame_data[]; };
++layout(binding = 1, std430) readonly buffer Camera { uint camera_data[]; };
++layout(binding = 2, std430) readonly buffer Objects { uint object_data[]; };
++layout(binding = 3) uniform texture2D gbuffer_tex; // RGBA8; alpha * 255, low 6 bits: object
++layout(binding = 4) uniform texture2D depth_tex;   // D32, reversed (1 = near)
++layout(binding = 5, rg16f) uniform writeonly image2D motion_img;
++
++layout(push_constant) uniform Constants {
++    vec2 size;      // pixels
++    vec2 jitter;    // this frame's viewport shift in pixels (x right, y down)
++    uvec4 offsets;  // dwords from each binding's (aligned) start to the game's buffer
++};
++
++float F(uint v) {
++    return uintBitsToFloat(v);
++}
++
++float Fr(uint i) { return F(frame_data[offsets.x + i]); }
++float Ca(uint i) { return F(camera_data[offsets.y + i]); }
++
++vec4 Row(uint base) {
++    base += offsets.z;
++    return vec4(F(object_data[base]), F(object_data[base + 1u]), F(object_data[base + 2u]),
++                F(object_data[base + 3u]));
++}
++
++void main() {
++    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
++    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
++        return;
++    }
++    // Depth was rasterised through a shifted viewport: the unjittered position, and no jitter
++    // in the motion vectors.
++    const vec2 uv = (vec2(pixel) + 0.5) / size - jitter / size;
++    const float depth = texelFetch(depth_tex, pixel, 0).r;
++    const uint object = uint(texelFetch(gbuffer_tex, pixel, 0).a * 255.0 + 0.5) & 63u;
++
++    const float ray_x = (Fr(76u) * uv.x + Fr(78u)) * Fr(94u) + Fr(92u);
++    const float ray_y = (Fr(77u) * uv.y + Fr(79u)) * Fr(95u) + Fr(93u);
++    const float z = 1.0 / -(Ca(118u) * depth + Ca(119u));
++    const float view_x = z * ray_x;
++    const float view_y = z * ray_y;
++
++    const uint base = object * 48u;
++    const vec4 col_x = Row(base + 16u), col_y = Row(base + 20u), col_z = Row(base + 24u),
++               col_w = Row(base + 28u);
++    const vec4 prev_clip = view_x * col_x + view_y * col_y - z * col_z + col_w;
++    const vec2 prev_uv =
++        vec2(Ca(100u), Ca(101u)) * prev_clip.xy / prev_clip.w + vec2(Ca(102u), Ca(103u));
++    imageStore(motion_img, pixel, vec4((prev_uv - uv) * size, 0.0, 0.0));
++}
+diff --git a/gpu/shadps4/video_core/host_shaders/ms_depth_to_color.frag b/gpu/shadps4/video_core/host_shaders/ms_depth_to_color.frag
+new file mode 100644
+index 0000000..941eb89
+--- /dev/null
++++ b/gpu/shadps4/video_core/host_shaders/ms_depth_to_color.frag
+@@ -0,0 +1,25 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#version 450 core
++#extension GL_EXT_samplerless_texture_functions : require
++
++// Resolves a multi-sample depth image into a single-sample color image.
++// Source is bound with aspect=Depth; destination is any Rxf color format
++// whose R channel will receive the depth value. G/B left at 0, A at 1 so
++// a shader that reads this as a sampler2D and swizzles to .rrrr or .r
++// sees the expected depth value either way.
++//
++// Sample 0 is representative — averaging all samples would be wrong for
++// depth-based effects that want a specific visibility decision rather than
++// an intermediate value.
++
++layout (binding = 0, set = 0) uniform texture2DMS depth_ms;
++
++layout (location = 0) out vec4 out_color;
++
++void main()
++{
++    const float d = texelFetch(depth_ms, ivec2(gl_FragCoord.xy), 0).r;
++    out_color = vec4(d, 0.0, 0.0, 1.0);
++}
+diff --git a/src/nid_names_all.inc b/src/nid_names_all.inc
+new file mode 100644
+index 0000000..024c6a6
+--- /dev/null
++++ b/src/nid_names_all.inc
+@@ -0,0 +1,968 @@
++/* NID -> symbol name for imports of CUSA00003 and its bundled modules, from shadPS4
++ * aerolib.inl (GPL-2.0-or-later); sorted by NID for bsearch (runtime_symbol). */
++{"+-du9tWgE9s","sceCompanionHttpdTerminate"},
++{"+BzXYkqYeLE","scePthreadSetspecific"},
++{"+L98PIbGttk","scePthreadRwlockUnlock"},
++{"+P6FRGH4LfA","memmove"},
++{"+U1R4WtXvoc","pthread_detach"},
++{"+anuSx2avHQ","sceNpInGameMessageDeleteHandle"},
++{"+r3rMFwItV4","sceKernelPread"},
++{"+wU6CGuZcWk","sceUsbdHandleEventsTimeout"},
++{"+xuDhxlWRPg","sceGnmSetupMipStatsReport"},
++{"-0c9TCTwnGs","sceCompanionHttpdRegisterRequestCallback2"},
++{"-2IRUCO--PM","sceKernelReadTsc"},
++{"-6srIGbLTIU","scePngDecQueryMemorySize"},
++{"-Bl9-SZ2noc","_ZNSt6_WinitC1Ev"},
++{"-EHnU68gExU","sceGameLiveStreamingPermitServerSideRecording"},
++{"-L+-8F0+gBc","_ZTVSt13runtime_error"},
++{"-LFO7jhD5CE","ungetc"},
++{"-PoIzr3PEk0","sceSslGetMemoryPoolStats"},
++{"-Q1-u1a7p0g","scePlayGoPrefetch"},
++{"-QgqOT5u2Vk","_Assert"},
++{"-SUR+UoLS6c","sceNpTssGetData"},
++{"-ULUBK21QgE","sceFiosDirectoryCreate"},
++{"-VVn74ZyhEs","difftime"},
++{"-Wreprtu0Qs","scePthreadAttrSetdetachstate"},
++{"-ZR+hG7aDHw","sceKernelSleep"},
++{"-hn1tcVHq5Q","sceLibcMspaceCreate"},
++{"-qLsfDAywIY","sceAjmBatchWait"},
++{"-sgi7EeLSO8","sceUsbdFreeTransfer"},
++{"-xm7kZQNpHI","sceHttpSetEpoll"},
++{"0-KXaS70xy4","pthread_getspecific"},
++{"0-p4O8FINmU","sceFiosDHCloseSync"},
++{"0AgCOypbQ90","_Atomic_compare_exchange_weak_4"},
++{"0H2vBYbTLHI","sceGnmDrawInitDefaultHardwareState200"},
++{"0K1yQ6Lv-Yc","sceSslTerm"},
++{"0S9tTH0uqTU","sceHttpSetConnectTimeOut"},
++{"0SCgzfVQHpo","sceCompanionHttpdStop"},
++{"0Sp9vJcB1-w","sceNpProfileDialogTerminate"},
++{"0TyVk4MSLt0","pthread_cond_init"},
++{"0UvTFeomAUM","sceNpSignalingActivateConnection"},
++{"0WMHDb5Dt94","modf"},
++{"0a2TBNfE3BU","sceHttpGetStatusCode"},
++{"0aR2aWmQal4","sceNpCommerceDialogInitialize"},
++{"0cBgduPRR+M","sceNetCtlGetResult"},
++{"0gYjPTR-6cY","sceHttpCreateTemplate"},
++{"0hlfW1O4Aa4","localeconv"},
++{"0ktE1PhzGFU","sceUsbdAllocTransfer"},
++{"0onIrKx9NIE","sceHttpGetLastErrno"},
++{"0x7rx8TKy2Y","_Unlockfilelock"},
++{"0yzYdZf0IwE","sceRudpSetOption"},
++{"1-LFLmRFxxM","sceKernelMkdir"},
++{"12wOHk8ywb0","sceKernelPollSema"},
++{"1471ajPzxh0","pthread_rwlock_destroy"},
++{"14bOACANTBo","scePthreadOnce"},
++{"16sMmVuOvgU","sceHttpGetMemoryPoolStats"},
++{"188x57JYp0g","sceKernelCreateSema"},
++{"18B2NS1y9UU","sceRtcGetCurrentTick"},
++{"1D0H2KNjshE","powf"},
++{"1FGvU0i9saQ","scePthreadMutexattrSetprotocol"},
++{"1FZBKy8HeNU","sceVideoOutGetVblankStatus"},
++{"1G3lF1Gg1k8","sceKernelOpen"},
++{"1Pk0qZQGeWo","sscanf"},
++{"1QjhKxrsOB8","sceFontUnbindRenderer"},
++{"1TDo-ImqkJc","_Stdin"},
++{"1e2BNwI-XzE","sceHttpSendRequest"},
++{"1j3S3n-tTW4","sceKernelGetTscFrequency"},
++{"1jfXLRVzisc","sceKernelUsleep"},
++{"1kzQRoWEgSA","sceJpegDecDecode"},
++{"1mecP7RgI2A","gmtime"},
++{"1n37q1Bvc5Y","sceSystemServiceGetDisplaySafeAreaInfo"},
++{"1qXLHIpROPE","sceGnmInsertWaitFlipDone"},
++{"1tKyG7RlMJo","scePthreadGetprio"},
++{"1uJgoVq3bQU","_Getptolower"},
++{"1vo6qqqa9F4","_ZdlPvS_"},
++{"1xxcMiGu2fo","sceUserServiceGetUserName"},
++{"23CPPI1tyBY","sceKernelGetEventFilter"},
++{"26PM5Mzl8zc","sceGnmLogicalCuIndexToPhysicalCuIndex"},
++{"28xmRUFao68","sceNpTrophyUnlockTrophy"},
++{"29oKvKXzEZo","sceGnmMapComputeQueue"},
++{"2HajCEGgG4s","sceNpSignalingGetPeerNetInfoResult"},
++{"2HnmKiLmV6s","_Atomic_fetch_sub_4"},
++{"2MOy+rUfuhQ","pthread_cond_signal"},
++{"2Of0f+3mhhE","scePthreadMutexDestroy"},
++{"2Q0z6rnBrTE","pthread_attr_setstacksize"},
++{"2Tb92quprl0","scePthreadCondInit"},
++{"2X5agFjKxMc","calloc"},
++{"2Z+PpY6CaJg","pthread_mutex_unlock"},
++{"2eKbgcboJso","sceNetSendmsg"},
++{"2edrkr0c-wg","sceNpWebApiUnregisterServicePushEventCallback"},
++{"2mKX2Spso7I","sceNetSetsockopt"},
++{"2rsFmlGWleQ","sceNpCheckNpAvailability"},
++{"2sWzhYqFH4E","_Stdout"},
++{"2xxUtuC-RzE","sceScreenShotEnable"},
++{"3+UPM-9E6xY","modff"},
++{"304ooNZxWDY","sceNetRecvfrom"},
++{"32HQAQdwM2o","sceSaveDataMount"},
++{"3CHi1K1wsCQ","sceNetHtonll"},
++{"3G4zhgKuxE8","sceFontRenderCharGlyphImage"},
++{"3GPpjQdAMTw","__cxa_guard_acquire"},
++{"3KOuC4RmZZU","sceNpSignalingInitialize"},
++{"3OdRkSjOcog","sceFontBindRenderer"},
++{"3PtV6p3QNX4","scePthreadEqual"},
++{"3Zl8BePTh9Y","sceNpCheckCallback"},
++{"3bh2aBvvmvM","sceNpTusCreateRequest"},
++{"3cUUypQzMiI","__cxa_begin_catch"},
++{"3e+4Iv7IJ8U","accept"},
++{"3e4k2mzLkmc","sceNpPartyCheckCallback"},
++{"3hBvwqEwqj8","sceRudpEnd"},
++{"3k6kx-zOOSQ","sceKernelMlock"},
++{"3kg7rT0NQIs","scePthreadExit"},
++{"3qxgM4ezETA","scePthreadAttrSetaffinity"},
++{"3rHWaV-1KC4","sceAppContentAddcontUnmount"},
++{"3vyRmRU3CL8","sceGameCustomDataDialogClose"},
++{"4+h9EzwKF4I","scePthreadAttrSetschedpolicy"},
++{"45ggEzakPJQ","sceNetSocketClose"},
++{"4AAcTU9R3XM","scePlayGoSetInstallSpeed"},
++{"4I8vEpuEhZ8","sceHttpDeleteTemplate"},
++{"4J2sUJmuHZQ","sceKernelGetProcessTime"},
++{"4MgRw-bVNQU","sceGnmUpdatePsShader"},
++{"4R6-OvI2cEA","sceKernelAddUserEvent"},
++{"4UFagYlfuAM","sceRazorCaptureSinceLastFlip"},
++{"4czppHBiriw","sceKernelSignalSema"},
++{"4oXYe9Xmk0Q","sceKernelGetGPI"},
++{"4qGrR6eoP9Y","scePthreadDetach"},
++{"4tPhsP6FpDI","sceSaveDataDialogOpen"},
++{"4wSze92BhLI","sceKernelWrite"},
++{"52NcYU9+lEo","sceKernelRename"},
++{"54phPH2LZls","sceVoiceStart"},
++{"57ZK+ODEXWY","sceKernelAddTimerEvent"},
++{"59tL1AQBb8U","sceHttpUnsetEpoll"},
++{"5J9GGMludxY","sceNpTusSetMultiSlotVariableAsync"},
++{"5Mn7TYwpl30","sceNpWebApiDeleteHandle"},
++{"5NE8Sjc7VC8","sceAudioInOpen"},
++{"5TvttyRuU84","sceGameCustomDataDialogOpen"},
++{"5Xa2ACNECdo","strcpy_s"},
++{"5bBacGLyLOs","gmtime_s"},
++{"5yYjEdd4t8Y","sceNpSignalingCreateContext"},
++{"62KCwEMmzcM","scePthreadAttrDestroy"},
++{"6381dWF+xsQ","sceHttpCreateEpoll"},
++{"656LMQSrg6U","sceSystemServiceReceiveEvent"},
++{"65VH0Qaaz6s","sceSaveDataGetMountInfo"},
++{"6BpEZuDT7YI","pthread_key_delete"},
++{"6Oc0bLsIYe0","sceNetGetMacAddress"},
++{"6PBNpsgyaxw","sceRudpEnableInternalIOThread"},
++{"6UEembipgrM","sceNpSignalingDeactivateConnection"},
++{"6ULAa0fq4jA","scePthreadRwlockInit"},
++{"6UgtwV+0zb4","scePthreadCreate"},
++{"6XG4B33N09g","sched_yield"},
++{"6Z83sYWFlA8","_exit"},
++{"6bwFkosYRQg","sceNpAuthCreateRequest"},
++{"6fIC3XKt2k0","sceMsgDialogUpdateStatus"},
++{"6kPnj51T62Y","sceVideoOutGetResolutionStatus"},
++{"6ncge5+l5Qs","scePadClose"},
++{"6sJWiWSRuqk","strncpy"},
++{"6vGCkkQJOcI","sceFontSetupRenderScalePixel"},
++{"6xVpy0Fdq+I","_sigprocmask"},
++{"79M-JqvvGo0","sceNpWebApiCreateHandle"},
++{"7H0iTOciTLo","pthread_mutex_lock"},
++{"7Ly52zaL44Q","asin"},
++{"7PkSz+qnTto","fsetpos"},
++{"7VGfMerK6m0","sceUsbdFillControlTransfer"},
++{"7aGTPfrqT9s","scePngEncCreate"},
++{"7dlAxeH-htg","_Stofx"},
++{"7pNKcscKrf8","_Stoll"},
++{"7qZVNgEu+SY","sceGnmInsertPopMarker"},
++{"8+s5BzZjxSg","scePthreadAttrGetaffinity"},
++{"8533Q+LU7EQ","sceNpLookupCreateTitleCtx"},
++{"85zul--eGXs","sceSaveDataSetParam"},
++{"88Vv-AzHVj8","fmodf"},
++{"8G2LB+A3rzg","atexit"},
++{"8IGjwtnvYwI","sceFiosIsValidHandle"},
++{"8Kcp5d-q1Uo","sceNetInetPton"},
++{"8KrqbaaPkE0","sceUsbdFillControlSetup"},
++{"8Q60JLJ6Rv4","getc"},
++{"8VBTeRf1ZwI","sceNpGetAccountDateOfBirth"},
++{"8lfvnRMqwEM","sceRtcGetCurrentClock"},
++{"8qB9Ar4P5nc","sceUsbdGetDeviceList"},
++{"8rhLl1-0W-o","sceNpProfileDialogGetResult"},
++{"8u8lPzUEq+U","memchr"},
++{"8zTFvBIAIN8","memset"},
++{"8zsu04XNsZ4","expf"},
++{"9030RnBDoh4","scePngEncQueryMemorySize"},
++{"959qrazPIrg","sceKernelGetProcParam"},
++{"99b82IKXpH4","sceAppContentAppParamGetInt"},
++{"99bMGglFW3I","sceRtcParseRFC3339"},
++{"9BcDykPmo1I","__error"},
++{"9ByRMdo7ywg","_ZTVN10__cxxabiv121__vmi_class_type_infoE"},
++{"9LCjpWyQ5Zc","pow"},
++{"9T2pDF2Ryqg","sceNetHtonl"},
++{"9TrhuGzberQ","sceVoiceInit"},
++{"9U9m1YH0ScQ","sceRudpProcessEvents"},
++{"9UK1vLZQft4","scePthreadMutexLock"},
++{"9XAxK2PMwk8","sceErrorDialogTerminate"},
++{"9kPCz7Or+1Y","sceSystemServiceReenableMusicPlayer"},
++{"9m8EcOGzcIQ","sceHttpGetAuthEnabled"},
++{"9nf8joUTSaQ","_Unlocksyslock"},
++{"9rAeANT2tyE","__cxa_guard_release"},
++{"9thMn+uB1is","sceRazorCaptureCommandBuffersOnlySinceLastFlip"},
++{"9vA2aW+CHuA","sceNetInetNtop"},
++{"9wO9XrMsNhc","sceNetRecv"},
++{"9yDWMxEFdJU","strrchr"},
++{"9yK6Fk8mKOQ","sceGameLiveStreamingTerminate"},
++{"A+uGq+3KFtQ","sceGnmMapComputeQueueWithPriority"},
++{"A2CQ3kgSopQ","sceNpSetContentRestriction"},
++{"A9cVMUtEp4Y","sceHttpInit"},
++{"AE+mHBHneyk","sceUsbdClaimInterface"},
++{"AEJdIVZTEmo","qsort"},
++{"AEuF3F2f8TA","fgetc"},
++{"AHxyhN96dy4","ferror"},
++{"AN3h0EBSX7A","sceNpSignalingGetConnectionInfo"},
++{"AOujSGqU+ms","sceFiosFHCloseSync"},
++{"AUXVxWeJU-A","sceKernelUnlink"},
++{"AV6ipCNa4Rw","strcasecmp"},
++{"AcslpN1jHR8","scePadDeviceClassGetExtendedInformation"},
++{"Aeu5wVKkF9w","sceHttpCreateRequestWithURL"},
++{"AifdcI1aKas","sceNpSnsFacebookDialogGetResult"},
++{"Al8MZJh-4hM","wmemset"},
++{"Ao2YNSA7-Qo","sceVoiceStop"},
++{"Apb4YDxKsRI","sceNetResolverStartAton"},
++{"AqBioC2vF3I","read"},
++{"ArSg-TGinhk","sceGnmUnmapComputeQueue"},
++{"Av3zjWi64Kw","strftime"},
++{"AxoDrINp4J8","sceAjmInstanceCreate"},
++{"BB+kb08Tl9A","scePthreadRwlockDestroy"},
++{"BIkMmUfNKWM","sceNpTusCreateNpTitleCtx"},
++{"BKMEGvfCPyU","sceUsbdAttachKernelDriver"},
++{"BKidCxmLC5w","_Stoldx"},
++{"BMR4F-Uek3E","sceSaveDataUmount"},
++{"BOVKAzRmuTQ","sceAvPlayerDisableStream"},
++{"BPE9s9vQQXo","mmap"},
++{"BQ3tey0JmQM","sceCommonDialogIsUsed"},
++{"BmMjYxmew1w","scePthreadCondTimedwait"},
++{"Bn2ZF4ZjeuQ","sceFiosFHReadSync"},
++{"BohEAQ7DlUE","sceAudioInGetSilentState"},
++{"BohYr-F7-is","sceKernelSetPrtAperture"},
++{"Bq8m04PN1zw","_ZTVSt12system_error"},
++{"BtqmpTRXHgk","sceRtcGetTime_t"},
++{"C4UgDHHPvdw","sceNetResolverCreate"},
++{"CAbbX6BuQZ0","sceRudpCreateContext"},
++{"CBiu4mCE1DA","sceVideoOutSetFlipRate"},
++{"CCbC+lqqvF0","sceNpCommerceDialogGetStatus"},
++{"CN7EbEV7MFU","sceAppContentDownloadDataFormat"},
++{"CQtPRSF6Ds8","sceNpWebApiReadData"},
++{"CUKn5pX-NVY","sceFontAttachDeviceCacheBuffer"},
++{"CcIH40dYS88","sceNpTusDeleteRequest"},
++{"CdWp0oHWGr0","sceUserServiceGetInitialUser"},
++{"Cg4srZ6TKbU","sceKernelRead"},
++{"CoPMx369EqM","sceGameLiveStreamingGetCurrentStatus"},
++{"CpWcnrEZbLA","_Stof"},
++{"CrLqDwWLoXM","sceVoiceGetPortInfo"},
++{"D0OdFMjp46I","sceKernelCreateEqueue"},
++{"DFmMT80xcNI","sysctl"},
++{"DGMG3JshrZU","sceKernelSetVirtualRangeName"},
++{"DLORcroUqbc","sceKernelGetOpenPsId"},
++{"DRuBt2pvICk","_read"},
++{"DYhhWbJSeRg","sceVideoOutColorSettingsSetGamma_"},
++{"DfSCDRA3EjY","sceNpCommerceDialogOpen"},
++{"DfivPArhucg","memcmp"},
++{"Dkm5qe8j3XE","sceUsbdGetConfigDescriptor"},
++{"DrUu8cPrje8","scePadOutputReport"},
++{"DuW5ZqZv-70","_ZNKSt9exception6_RaiseEv"},
++{"DzES9hQF4f4","scePthreadAttrSetschedparam"},
++{"E+tyo3lp5Lw","pthread_attr_setdetachstate"},
++{"E1Wrwd07Lr8","sceNpTrophyDestroyContext"},
++{"EH-x713A99c","atan2f"},
++{"EMutwaQ34Jo","perror"},
++{"EQ6SCLMqzkM","sceUsbdFreeDeviceList"},
++{"ET4Gr-Uu07s","sceAvPlayerStart"},
++{"EY28T2bkN7k","sceHttpAddRequestHeader"},
++{"Ec63y59l9tw","sceNpSetNpTitleId"},
++{"Ecwid6wJMhY","_Stolx"},
++{"EgmLo6EWgso","pthread_rwlock_unlock"},
++{"ElslOCpOIns","sceAjmBatchJobRunBufferRa"},
++{"EotR8a3ASf4","pthread_self"},
++{"Ez8xjo9UF4E","recv"},
++{"EzzSJz6yuMc","sceFiosFHSyncSync"},
++{"F6e0kwo4cnk","sceKernelTriggerUserEvent"},
++{"F8bUHwAG284","scePthreadMutexattrInit"},
++{"FJrT5LuUBAU","pthread_exit"},
++{"FN4gaPmuFV8","write"},
++{"FQ9NFbBHb5Y","_ZSt7_BADOFF"},
++{"FUHG8sQ3R58","sceGnmSetEsShader"},
++{"FXP359ygujs","sceFontDestroyLibrary"},
++{"Fc8qxlKINYQ","sceVideoRecordingSetInfo"},
++{"FhU9oYrbXoA","sceUsbdSetConfiguration"},
++{"Fjc4-n1+y2g","__elf_phdr_match_addr"},
++{"Fm-dmyywH9Q","fileno"},
++{"Fq6+0Fm55xU","sceUsbdExit"},
++{"FxVZqBAA7ks","_write"},
++{"G-39lsdSgXo","sceFiosRenameSync"},
++{"G3AnLNdRBjE","sceNpWebApiInitialize"},
++{"GBUY7ywdULE","scePthreadRename"},
++{"GFhVUpRmbHE","sceNpInGameMessageInitialize"},
++{"GGqucL9F+YI","sceFiosDHOpenSync"},
++{"GMpvxPFW924","vprintf"},
++{"GNcF4oidY0Y","sceNpTrophyDestroyHandle"},
++{"GNlx+y7xPdE","sceGnmUpdateHsShader"},
++{"GZWjF-YIFFk","asinf"},
++{"Gaxrp3EWY-M","sceNpNotifyPlusFeature"},
++{"Ghz9iWDUtC4","sceNpGetAccountCountry"},
++{"GjlCrU4GcIY","sceUsbdGetDeviceAddress"},
++{"Gl6w5i0JokY","sceAppContentDownloadDataGetAvailableSpaceKb"},
++{"GnVDzYfy-KI","sceHttpSetCookieSendCallback"},
++{"GpLQDNKICac","sceNpCreateRequest"},
++{"H2e8t5ScQGc","__cxa_finalize"},
++{"H3uq7x0sZOI","sceNpTusDeleteNpTitleCtx"},
++{"H7-fgvEutM0","sceGnmGetEqTimeStamp"},
++{"H8AprKeZtNg","_Stderr"},
++{"H8wG9Bk-nPc","sceNpAuthDeleteRequest"},
++{"HF7lK46xzjY","pthread_mutexattr_destroy"},
++{"HHo1BAljZO8","sceGnmDisableMipStatsReport"},
++{"HLwz1fRIycA","sceNpTrophyGetGameIcon"},
++{"HQOwnfMGipQ","sceNetErrnoLoc"},
++{"HTrcDKlFKuM","sceMsgDialogClose"},
++{"HUbZmOnT-Dg","atan2"},
++{"HXzjK9yI30k","sceVideoOutAddFlipEvent"},
++{"HarYYlaFGJY","sceUsbdClose"},
++{"Hi3onqHSN6M","sceNpSnsFacebookDialogOpen"},
++{"HoLVWNanBBc","getpid"},
++{"How7B8Oet6k","scePthreadGetname"},
++{"Hvd3S--n25w","sceUsbdFreeConfigDescriptor"},
++{"HwEtHFCpU5U","sceGameCustomDataDialogTerminate"},
++{"Hwh11+m5KoI","sceJpegDecDelete"},
++{"I88KChlynSs","sceErrorDialogInitialize"},
++{"IHPqcbc0zCA","scePadDeviceClassParseData"},
++{"IKP8typ0QUk","sem_post"},
++{"IWIBBdTHit4","sceKernelMapFlexibleMemory"},
++{"Ik-KpLTlf7Q","sceHttpTerm"},
++{"Inp1lfL+Jdw","sceNetEpollDestroy"},
++{"J-6d0WTjzMc","sceRudpActivate"},
++{"JA4+sS39GMs","sceNpLookupCreateAsyncRequest"},
++{"JBN6N-EY+3M","sceHttpsGetSslError"},
++{"JBcgYuW8lPU","acos"},
++{"JGgj7Uvrl+A","scePthreadCondBroadcast"},
++{"JM4EBvWT9rc","tanh"},
++{"JPh3Zgg0Zwc","sceJpegDecCreate"},
++{"JfEPXVxhFqA","sceAudioOutInit"},
++{"JrwFIMzKNr0","ldexp"},
++{"JzhYTP2fG18","sceNpWebApiAbortRequest"},
++{"K-jXhbt2gn4","pthread_mutex_trylock"},
++{"K0QxEbD7q+c","sceGameLiveStreamingPermitLiveStreaming"},
++{"K1d1LqZRQHQ","sceHttpSetResolveRetry"},
++{"K7RlrTkI-mw","sceNetPoolDestroy"},
++{"KCItz6QkeGs","sceNpWebApiSendMultipartRequest"},
++{"KK3Bdg1RWK0","sceSaveDataDialogUpdateStatus"},
++{"KMcEa+rHsIo","sceAvPlayerAddSource"},
++{"KXUpebrFk1U","sceFontOpenFontMemory"},
++{"KXltnCwEJHQ","sceGnmSetCsShader"},
++{"KZ1Mj9yEGYc","sceNpGetAccountLanguage"},
++{"KaPL3fbTLCA","sceRudpWrite"},
++{"KdP-nULpuGw","fgets"},
++{"KeOZ19X8-Ug","_Cosh"},
++{"Kh6bS2HQKbo","sceHttpSetCookieRecvCallback"},
++{"Kl-TbrDU9YM","sceFiosFHWriteSync"},
++{"KsVTc04kN9k","sceFiosDeleteSync"},
++{"KxGkOrQJTqY","sceNpAuthGetAuthorizationCode"},
++{"L-Q3LEjIbgA","sceKernelMapDirectMemory"},
++{"L0EHgZZNVas","sceUsbdSubmitTransfer"},
++{"L1SBTkC+Cvw","abort"},
++{"L97d+3OgMlE","sceFontGetCharGlyphMetrics"},
++{"LHuSmO3SLd8","sceNpTrophyGetTrophyUnlockState"},
++{"LJDwdSNTnDg","sceKernelDeleteUserEvent"},
++{"LR5cwFMMCVE","sceNpCommerceDialogUpdateStatus"},
++{"LSinoSQH790","sceJpegDecParseHeader"},
++{"LTov9gMEqCU","_ZNSt8ios_base7_AddstdEPS_"},
++{"Lg+NCE6pTwQ","sceNpProfileDialogInitialize"},
++{"LozEOU8+anM","sceAudioInInput"},
++{"Lr8ovHH9l6A","sceMsgDialogGetResult"},
++{"Ls4tzzhimqQ","strcat"},
++{"LxcEU+ICu8U","feof"},
++{"M1Gma1ocrGE","scePlayGoOpen"},
++{"M2ZF-ClLhgY","sceErrorDialogOpen"},
++{"M6ggviwXpLs","sceRudpPollWait"},
++{"MBuItvba6z8","sceKernelReleaseDirectMemory"},
++{"MELi-cKqWq0","_ZSt19_Xbad_function_callv"},
++{"MHur6qCsUus","sceAjmFinalize"},
++{"MLWl90SFWNE","_ZdaPv"},
++{"MOBxtefPZUg","_ZNSt9exceptionD2Ev"},
++{"MPe0EeBGM-E","scePlayGoTerminate"},
++{"MTxxrOCeSig","sceVideoOutSetWindowModeMargins"},
++{"MU25eqxSDTw","_Sinh"},
++{"MUjC4lbHrK4","fflush"},
++{"MZO7FXyAPU8","remove"},
++{"MlW6deWfPp0","sceUsbdCheckConnected"},
++{"MpxhMh8QFro","fwrite"},
++{"MrRFrdgpsx8","sceFiosFHTell"},
++{"N+mr7GjTvr8","sceNpAuthCreateAsyncRequest"},
++{"N1EBMeGhf7E","sceFontSetScalePixel"},
++{"N2f485TmJms","_ZNSt8ios_base7failureD1Ev"},
++{"NFLs+dRJGNg","memcpy_s"},
++{"NL836gOLANs","fopen_s"},
++{"NLq2b1jOaN0","sceKernelFutimes"},
++{"NLwJ3q+64bY","_ZSt7nothrow"},
++{"NN01qLRhiqU","rename"},
++{"NPhw0UXaNrk","sceNpSignalingTerminate"},
++{"NU-T4QowTNA","_ZSt18_Xinvalid_argumentPKc"},
++{"NVadfnzQhHQ","exp"},
++{"Nd91WaWmG2w","sceNetResolverStartNtoa"},
++{"NkJwDzKmIlw","sceAvPlayerClose"},
++{"Nlev7Lg8k3A","sceNetInit"},
++{"Nn7zKwnA5q0","scePlayGoGetToDoList"},
++{"NnNaWa16OvE","_ZNSt11range_errorD1Ev"},
++{"Noj9PsJrsa8","wmemmove"},
++{"OA6FbORefbo","sceCompanionHttpdInitialize2"},
++{"ODJK2sn9w4A","sceAvPlayerEnableStream"},
++{"OGybVuPAhAY","reallocalign"},
++{"OIIm19xu+NM","sceGameLiveStreamingGetProgramInfo"},
++{"OJjm-QOIHlI","sceLibcMspaceMalloc"},
++{"OMDRKKAZ8I4","sceKernelDebugRaiseException"},
++{"OMYRTU0uc4w","sceRudpTerminate"},
++{"ON7Sf5XEMmI","sceNpInGameMessageSendData"},
++{"OOrLKB0bSDs","sceSharePlayGetCurrentConnectionInfo"},
++{"OVths0xGfho","sceAvPlayerSetLooping"},
++{"OXXX4mUk3uk","sceNetConnect"},
++{"OXmauLdQ8kY","atan"},
++{"OjWstbIRPUo","__Ux86_64_setcontext"},
++{"Oo0S5PH7FIQ","sceVoiceEnd"},
++{"Op8TBGY5KHg","pthread_cond_wait"},
++{"Ou3iL1abvng","__stack_chk_fail"},
++{"Ovb2dSJOAuE","strcmp"},
++{"Ox9i0c7L5w0","scePthreadRwlockRdlock"},
++{"OxhIB8LB-PQ","pthread_create"},
++{"Oy6IpwgtYOk","lseek"},
++{"OzKvTvg3ZYU","sceNpAbortRequest"},
++{"P330P3dFF68","Need_sceLibc"},
++{"P5pdoykPYTk","sceHttpReadData"},
++{"P6A3ytpsiYc","sceHttpDeleteConnection"},
++{"P8F2oavZXtY","_ZNSt8ios_baseD2Ev"},
++{"PDX01ziUz+4","_ZSt13_Syserror_mapi"},
++{"PDxS48xGQLs","sceHttpSetChunkedTransferEnabled"},
++{"PIWqhn9oSxc","sceNetAccept"},
++{"PTiFIUxCpJc","sceHttpSetRequestContentLength"},
++{"PVT+fuoS9gU","sceGnmDeleteEqEvent"},
++{"PZSoY8j0Pko","scePadGetFeatureReport"},
++{"PfQ+f6ws764","sceNpWebApiDeleteServicePushEventFilter"},
++{"PfSTDCgNMgc","sceNpWebApiRegisterPushEventCallback"},
++{"PkdLsRA4ON0","sceGameCustomDataDialogUpdateStatus"},
++{"PrdHuuDekhY","scePthreadKeyDelete"},
++{"Q1BL70XVV0o","_ZSt18uncaught_exceptionv"},
++{"Q2V+iqvjgC0","vsnprintf"},
++{"Q3VBxCXhUHs","memcpy"},
++{"Q3dyFuwGn64","sceAjmModuleRegister"},
++{"Q4qBuN-c0ZM","sceNetSocket"},
++{"QBFoAIjJoXQ","sceVoiceSetVolume"},
++{"QBi7HCK03hw","sceKernelClockGettime"},
++{"QI-x0SL8jhw","acosf"},
++{"QKd0qM58Qes","sceKernelStopUnloadModule"},
++{"QMFyLoqNxIg","setvbuf"},
++{"QOQtbeDqsT4","sceAudioOutOutput"},
++{"QZP6I9ZZxpE","clock"},
++{"Qazy8LmXTvw","ftell"},
++{"QbD+eENEwo8","scePngDecDelete"},
++{"QlcJbyd6jxM","_Stodx"},
++{"Qoo175Ig+-k","_ZSt21_sceLibcClassicLocale"},
++{"QrZZdJ8XsX0","fputs"},
++{"QxqK-IdpumU","_Getpmbstate"},
++{"R1Jvn8bSCW8","sceKernelDeleteSema"},
++{"R9lA82OraNs","sceAppContentInitialize"},
++{"RCCY01Xd+58","sceNetResolverStartNtoaMultipleRecords"},
++{"REfUTmTchMw","sceUsbdReleaseInterface"},
++{"RIa6GnWp+iU","strerror"},
++{"RLf56F-WjKQ","sceUsbdKernelDriverActive"},
++{"RRKFcKQ1Ka4","sceUsbdControlTransfer"},
++{"RU74kek-N0c","sceGnmLogicalCuMaskToPhysicalCuMask"},
++{"RUrWdwTWZy8","scePngEncDelete"},
++{"RXXqi4CtF8w","pthread_cond_destroy"},
++{"RbLbuKv8zho","sceAjmInstanceDestroy"},
++{"Rbvt+5Y2iEw","sceNetNtohs"},
++{"RbzWN8X21hY","_ZTVSt11range_error"},
++{"S1GkePI17zQ","sceSaveDataDelete"},
++{"S7QTn72PrDw","sceNpDeleteRequest"},
++{"SF47kB2MNTo","sceNetEpollCreate"},
++{"SHlt7EhOtqA","fgetpos"},
++{"SK-S7daqJSE","sceNpAuthWaitAsync"},
++{"SUEVes8gvmw","sceRudpSetEventHandler"},
++{"SsRbbCiWoGw","sceFontSupportSystemFonts"},
++{"St4apgcBNfo","_ZTIi"},
++{"St9nbxSoezk","clearerr"},
++{"T-mGo9f3Pu4","sceHttpSetAutoRedirect"},
++{"T6tnM1Uti4g","sceNpLookupNpId"},
++{"T72hz6ffq08","scePthreadYield"},
++{"T7uyNqP7vQA","tan"},
++{"TJCAxto9SEU","sceNpTrophyRegisterContext"},
++{"TLV4mswiZ4A","sceGnmDriverCaptureInProgress"},
++{"TOhg7P6kTH4","sceUsbdInit"},
++{"TSM6whtekok","sceNetShutdown"},
++{"TVfbf1sXt0A","_ZSt4cerr"},
++{"Tc-hAYDKtQc","sceHttpSetResolveTimeOut"},
++{"U2JJtSqNKZI","sceVideoOutGetEventId"},
++{"U5ExQGyyx9s","sceHttpsSetSslVersion"},
++{"U6h4e5JRPaQ","scePngDecParseHeader"},
++{"U8AQMlOFBc8","sceNpSignalingGetLocalNetInfo"},
++{"UJ+Z7Q+4ck0","sceNetCtlRegisterCallback"},
++{"UJwNuMBcUAk","sceGnmSetGsShader"},
++{"UK2Tl2DWUns","sceKernelClose"},
++{"UTXzJbWhhTE","scePthreadAttrSetstacksize"},
++{"UaLjloJinow","sceSharePlayTerminate"},
++{"Uco1I0dlDi8","scePlayGoClose"},
++{"Ujf3KzMvRmI","memalign"},
++{"UoYY0DWMC0U","sceGnmGetEqEventType"},
++{"Up36PTk687E","sceVideoOutOpen"},
++{"UqDGjXA5yUM","munmap"},
++{"Uw3OTZFPNt4","_ZNSt6_WinitD1Ev"},
++{"V31V01UiScY","sceGnmUpdateVsShader"},
++{"V4EVrruHuy8","sceNpLookupPollAsync"},
++{"VADc3MNQ3cM","signal"},
++{"VANhIWcqYak","sceAppContentAddcontMount"},
++{"VJ6oMq-Di2U","sceUsbdOpen"},
++{"VJNjFtqiF5w","sceGnmSetHsShader"},
++{"VPbJwTCgME0","srand"},
++{"VUzjXknPPBs","mbstowcs"},
++{"VW3TVZiM4-E","sceKernelFtruncate"},
++{"VfRSmPmj8Q8","sceNpRegisterStateCallback"},
++{"Vh1bhUG6mSs","sceNpInGameMessagePrepare"},
++{"VkTAsrZDcJ0","sigfillset"},
++{"Vku4big+IYM","sceCompanionHttpdGetEvent"},
++{"Vla-Z+eXlxo","sceLibcMspaceFree"},
++{"Vo5V8KAwCmk","sceSystemServiceHideSplashScreen"},
++{"W0Hpm2X0uPE","scePthreadSetprio"},
++{"W1Etj-jlW7Y","sceGnmInsertPushMarker"},
++{"WC216DD3El4","scePngDecDecode"},
++{"WFIiSfXGUq8","scePadOpenExt"},
++{"WKAXJ4XBPQ4","scePthreadCondWait"},
++{"WWiGuh9XfgQ","sceErrorDialogUpdateStatus"},
++{"WaSFJoRWXaI","sceFontCreateRendererWithEdition"},
++{"WfAiBW8Wcek","sceAjmBatchErrorDump"},
++{"Wi7DtlLV+KI","sceAjmModuleUnregister"},
++{"WiH8rbVv5s4","_ZNSt9bad_allocD2Ev"},
++{"WkkeywLJcgU","wcslen"},
++{"Wl2o5hOVZdw","sceKernelPrintBacktraceWithModuleInfo"},
++{"WlyEA-sLDf0","sceKernelTruncate"},
++{"Wnp1OVcrZgk","sceAvPlayerGetAudioData"},
++{"Wq4RNB3snSQ","sceHttpGetNonblock"},
++{"WrOLvHU0yQM","pthread_setspecific"},
++{"XD3mDeybCnk","scePthreadRwlockTryrdlock"},
++{"XDncXQIJUSk","sceNpGetOnlineId"},
++{"XKRegsFpEpk","catchReturnFromMain"},
++{"XNUoD2B9a6A","sceHttpSetCookieEnabled"},
++{"XUWtxI31YEY","sceUsbdControlTransferGetData"},
++{"XUjdsSTTZ3U","sceNpWebApiDeleteContext"},
++{"XbbJC3E+L5M","sceSystemServicePowerTick"},
++{"XbkjbobZlCY","sceNpTrophyCreateContext"},
++{"XhWHn6P5R7U","pthread_rwlock_trywrlock"},
++{"Xru92wHJRmg","sceVideoOutAddVblankEvent"},
++{"XwLA5cTHjt4","__gxx_personality_v0"},
++{"Xx974EW-QFY","sceFontSelectRendererFt"},
++{"Y7aJ1uydPMo","realloc"},
++{"YCV5dGGBcCo","sem_wait"},
++{"YDnLaav6W6Q","_Stoulx"},
++{"YJ0cMAlLuxQ","sceUsbdGetMaxPacketSize"},
++{"YNzNkJzYqEg","strncpy_s"},
++{"YQ0navp+YIc","puts"},
++{"YSUOhyK9Jd4","sceNpSnsFacebookDialogClose"},
++{"YWQFUyXIVdU","sceKernelDeleteTimerEvent"},
++{"YWTpt45PxbI","sceNetDumpRead"},
++{"YX9dAus6baE","sceNpLookupWaitAsync"},
++{"YYP3f2W09og","sceNpTrophyGetGameInfo"},
++{"Ye20uNnlglA","abs"},
++{"YeJl6yDlhW0","sceVoiceWriteToIPort"},
++{"YndgXqQVV7c","scePadReadState"},
++{"YuH2FA7azqQ","sceSaveDataDialogTerminate"},
++{"Z4QosVuAsA0","pthread_once"},
++{"Z4wwCFiBELQ","sceNetCtlTerm"},
++{"ZE6RNL+eLbk","tanf"},
++{"ZL9FV4mJXxo","__cxa_rethrow"},
++{"ZT4ODD2Ts9o","Need_sceLibcInternal"},
++{"ZVw46bsasAk","sceNetEpollControl"},
++{"ZkZhskCPXFw","sceSaveDataInitialize"},
++{"ZtjspkJQ+vw","_FSin"},
++{"Zxa0VhQVTsk","sceKernelWaitSema"},
++{"a4VsZ4oqn68","sceHttpSetResponseHeaderMaxSize"},
++{"a8R9-75u4iM","sceNpGetAccountId"},
++{"aCYPMSUIaP8","sceHttpGetAllResponseHeaders"},
++{"aEzKdJzATZ0","sceNpPartyGetState"},
++{"aI+OeCz8xrQ","scePthreadSelf"},
++{"aNeavPDNKzA","sendmsg"},
++{"aPIZJTXC+cU","sceGnmInsertPushColorMarker"},
++{"aPcyptbOiZs","sigprocmask"},
++{"aS66RI0gGgo","sceAvPlayerInit"},
++{"aX8H2+BBlWE","ldexpl"},
++{"aZK8lNei-Qw","fputc"},
++{"aesyjrHVWy4","strncmp"},
++{"aj3L-iaFmyk","sceGnmInsertSetColorMarker"},
++{"ajVj3QG2um4","sceVoiceDisconnectIPortFromOPort"},
++{"amuBfI-AQc4","sceRudpInit"},
++{"apHKv46QaCw","_ZTVSt12bad_weak_ptr"},
++{"aqyjhIx7jaY","_ZSt7_FiopenPKwNSt5_IosbIiE9_OpenmodeEi"},
++{"asz3TtIqGF8","sceNpWebApiTerminate"},
++{"b+uAV89IlxE","sceAudioOutSetVolume"},
++{"b-xTWRgI1qw","_Dtest"},
++{"b06Hh0DPEaE","sceMsgDialogOpen"},
++{"b08AgtPlHPg","sceGnmAreSubmitsAllowed"},
++{"b0xyllnVY-I","sceGnmAddEqEvent"},
++{"b44anV2D7K0","sceFiosFHOpenSync"},
++{"b4qaXPzMJxo","sceNpSignalingTerminateConnection"},
++{"b7kJI+nx2hg","sceVoiceDeletePort"},
++{"bD-JizUb3JM","sceNpSignalingGetConnectionStatus"},
++{"bDupEgbQ6Fk","sceFiosFileDeleteSync"},
++{"bErx49PgxyY","sceNetBind"},
++{"bIHoZCTomsI","scePthreadRwlockTrywrlock"},
++{"bMG3cVmUmuk","sceNpInGameMessageTerminate"},
++{"bQVd5YzCal0","sceGnmSetPsShader"},
++{"bX5IbRvECXk","sceGnmDingDong"},
++{"bY-PO6JhzhQ","close"},
++{"bcPB2rnhQqo","sceNpTusGetMultiSlotVariableAsync"},
++{"beAsSTVWVPQ","sceRudpSetMaxSegmentSize"},
++{"beRjXBn-z+o","sceNetSend"},
++{"bhomgbiQgeo","sceUsbdGetDeviceDescriptor"},
++{"bt3CTBKmGyI","scePthreadSetaffinity"},
++{"bwFjS+bX9mA","sceUserServiceTerminate"},
++{"byV+FWlAnB4","_ZTVN10__cxxabiv117__class_type_infoE"},
++{"bzQExy189ZI","_init_env"},
++{"c41UEHVtiEA","_Stod"},
++{"c88Yy54Mx0w","sceSaveDataSaveIcon"},
++{"cCXjU72Z0Ow","_Sin"},
++{"cDW233RAwWo","sem_destroy"},
++{"cKYtVmeSTcw","sceFontOpenFontSet"},
++{"cQ6DGsQEjV4","sceVoiceReadFromOPort"},
++{"cQke9UuBQOk","sceKernelMunmap"},
++{"cTGkc6-TBlI","sceNetTerm"},
++{"ca7v6Cxulzs","sceKernelSetGPO"},
++{"cdqOFyupRS4","sceNpSnsFacebookDialogTerminate"},
++{"cfAXurvfl5o","__cxa_allocate_exception"},
++{"cjZEuzHkgng","_Atomic_load_4"},
++{"cmo1RIYva9o","scePthreadMutexInit"},
++{"co2NCj--pnc","sceSharePlaySetProhibition"},
++{"cpCOXWMgha0","rand"},
++{"crb5j7mkk1c","_is_signal_return"},
++{"d88anrgNoKY","sceGnmDriverTriggerCapture"},
++{"d8FcbzfAdQw","sceAvPlayerGetStreamInfo"},
++{"dQHWEsJtoE4","pthread_mutexattr_init"},
++{"dWM80AX39o4","sceGameLiveStreamingEnableLiveStreaming"},
++{"dgJBaeJnGpo","sceNetPoolCreate"},
++{"djxxOmW6-aw","__progname"},
++{"dl+4eHSzUu4","sceAjmInitialize"},
++{"dmDybN--Fn8","sceAjmBatchJobControlBufferRa"},
++{"drjIbDbA7UQ","sceNetEpollWait"},
++{"dyIhnXq-0SM","sceSaveDataDirNameSearch"},
++{"eBL+l6HG9xk","sceNpTrophyGetTrophyIcon"},
++{"eLdDw6l0-bU","snprintf"},
++{"ePw-kqZmelo","sceMsgDialogTerminate"},
++{"eR2bZFAAU0Q","sceSysmoduleUnloadModule"},
++{"eT2UsmTewbU","_ZSt11_Xbad_allocv"},
++{"eV9wAD2riIA","sceKernelStat"},
++{"eXbUSpEaTsA","scePthreadAttrSetinheritsched"},
++{"efhK-YSUYYQ","localtime"},
++{"eiqMCt9UshI","sceNpCreateAsyncRequest"},
++{"ejekcaNQNq0","sceKernelGettimeofday"},
++{"ekNvsT22rsY","sceAudioOutOpen"},
++{"ekXHb1kDBl0","sceErrorDialogClose"},
++{"en7gNVnh878","sceSaveDataDialogIsReadyToDisplay"},
++{"eoht7mQOCmo","scePthreadGetspecific"},
++{"exAxkyVLt0s","sceFontDestroyRenderer"},
++{"f1zwJ3jAI2k","_Unwind_Resume"},
++{"f33OrruQYbM","sceRazorIsLoaded"},
++{"f42K37mm5RM","sceHttpsEnableOption"},
++{"f7KBOafysXo","sceKernelGetModuleInfoFromAddr"},
++{"f7uOxY9mM1U","__stack_chk_guard"},
++{"f85orjx7qts","sceGnmRequestMipStatsReportAndReset"},
++{"fEoW6BJsPt4","sceLibcMspaceMallocUsableSize"},
++{"fFFkk0xfGWs","sceAjmBatchStartBuffer"},
++{"fH46Lag88XY","sceSaveDataDialogClose"},
++{"fJnpuVVBbKk","_Znwm"},
++{"fL3O02ypZFE","wmemcpy"},
++{"fMP5NHUOaMk","sceSysmoduleIsLoaded"},
++{"fPhymKNvK-A","sceUserServiceGetLoginUserIdList"},
++{"fRc1ahQppR4","sceRudpGetSizeWritable"},
++{"fTx66l5iWIA","sceKernelFsync"},
++{"fZOeZIOEmLw","send"},
++{"fZo48un7LK4","sceSystemServiceParamGetInt"},
++{"fffwELXNVFA","fprintf"},
++{"fjV7C8H0Y8k","sceNpSnsFacebookDialogUpdateStatus"},
++{"fzyMKs9kim0","sceKernelWaitEqueue"},
++{"g+PZd2hiacg","scePthreadCondDestroy"},
++{"g7zzzLDYGw0","strdup"},
++{"g8cM39EUZ6o","sceSysmoduleLoadModule"},
++{"gAhCn6UiU4Y","sceGnmSetVsShader"},
++{"gNQ1V2vfXDE","setjmp"},
++{"gObODli-OH8","sceGnmRequestFlipAndSubmitDone"},
++{"gQX+4GDQjpM","malloc"},
++{"gcUjwU3fa0M","sceHttpsGetCaList"},
++{"gdUCnU0gHdI","sceFontRenderSurfaceInit"},
++{"geDaqgH9lTg","scePthreadKeyCreate"},
++{"gfP0im5Z3g0","ldiv"},
++{"gjP9-KQzoUk","scePadGetControllerInformation"},
++{"gjbmYpP-XJQ","strcoll"},
++{"gkWgn0p1AfU","freopen"},
++{"gky0+oaNM4k","sceNetCtlInit"},
++{"gvD1greCu0A","sceNetSendto"},
++{"h9CcP3J0oVM","pthread_join"},
++{"h9wmFZX4i-4","sceHttpSetRedirectCallback"},
++{"hGbf2QTBmqc","scePadGetExtControllerInformation"},
++{"hHlZQUnlxSM","getrusage"},
++{"hI7oVeOluPM","recvmsg"},
++{"haVZE9FgKqE","sceNpProfileDialogUpdateStatus"},
++{"hay1CfTmLyA","sceSaveDataDialogProgressBarSetValue"},
++{"hcuQgD53UxM","printf"},
++{"hdTyRzCXQeQ","sceAvPlayerStreamCount"},
++{"hdm0YfMa7TQ","_Znam"},
++{"hdpVEUDFW3s","sceSslInit"},
++{"hggKhPySVgI","sceGameLiveStreamingPostSocialMessage"},
++{"hqi8yMOCmG0","_ZNSt8_LocinfoC1EPKc"},
++{"htyBOoWeS58","sceHttpsSetSslCallback"},
++{"hv1luiJrqQM","scePadInit"},
++{"hvG6GfBMXg8","sceHttpAbortRequest"},
++{"hwVSPCmp5tM","sceKernelCheckedReleaseDirectMemory"},
++{"hx+LIg-1koI","sceNpSignalingDeleteContext"},
++{"i3STzxuwPx0","sceRudpGetStatus"},
++{"i6-sR91Wt-4","sceVideoOutSetBufferAttribute"},
++{"iBt3Oe00Kvc","sceGnmFlushGarlic"},
++{"iCO804ZgzdA","sceGnmValidateCommandBuffers"},
++{"iGjsr1WAtI0","pthread_rwlock_rdlock"},
++{"iMp8QpE+XO4","scePthreadMutexattrSettype"},
++{"iPBqs+YUUFw","_Atomic_fetch_add_4"},
++{"iQr9UxPHUFs","sceNpLookupCreateRequest"},
++{"iQw3iQPhvUQ","sceNetCtlCheckCallback"},
++{"iSZjWw1TGiA","sceHttpGetCookieEnabled"},
++{"iWQWrwiSt8A","sceNetHtons"},
++{"ilwLM4zOmu4","sceNpGetParentalControlInfo"},
++{"imxVx8lm+KM","sceFontGetHorizontalLayout"},
++{"isruqthpYcw","sceSharePlayInitialize"},
++{"j2AIqSqJP0w","sceKernelGetdents"},
++{"j3YMu1MVNNo","sceUserServiceInitialize"},
++{"j4ViWNHEgww","strlen"},
++{"jAO1IJKMhE4","_ZNSt12bad_weak_ptrD1Ev"},
++{"jayvY07C5dk","sceFiosStatSync"},
++{"jbz9I9vkqkk","vsprintf"},
++{"jf4TB2nUO40","sceHttpSetAuthInfoCallback"},
++{"jg33rEKLfVs","sceGnmIsUserPaEnabled"},
++{"jiItzS6+22g","sceGnmInsertSetMarker"},
++{"jjjRS7l1MPM","_FLog"},
++{"jpFjmgAC5AE","sceKernelDeleteEqueue"},
++{"jtkqXpAOY6w","sceGnmSetGsRingSizes"},
++{"jyi5p9XWUSs","sceNpWaitAsync"},
++{"k+AXqu2-eBc","getpagesize"},
++{"k04jLXu3+Ic","sceLibcMspaceMallocStatsFast"},
++{"k210oKgP80Y","sceNpWebApiGetHttpStatusCode"},
++{"k7F0FcDM-Xc","sceCompanionHttpdStart"},
++{"kA-TdiOCsaY","frexp"},
++{"kA88gbv71ao","sceNpPartyRegisterHandler"},
++{"kALvdgEv5ME","_Locksyslock"},
++{"kAenWy1Zw5o","sceFontRenderCharGlyphImageHorizontal"},
++{"kBwCPsYX-m4","sceKernelFstat"},
++{"kDZvoVssCgQ","strpbrk"},
++{"kDh-NfxgMtE","scePthreadCondSignal"},
++{"kHg45qPC6f0","strncat"},
++{"kJQJE0uKm5w","sceNpWebApiRegisterServicePushEventCallback"},
++{"kJlYH5uMAWI","sceNetResolverDestroy"},
++{"kOcnerypnQA","sceKernelGettimezone"},
++{"kOj1HiAGE54","sceNetListen"},
++{"kVbL4hL3K7w","sceNpWebApiSendRequest"},
++{"kbw4UHHSYy0","__pthread_cxa_finalize"},
++{"kiZSXIWd9vg","strcpy"},
++{"kn0yiYeExgA","ldexpf"},
++{"kvYEw2lBndk","sceGameLiveStreamingInitialize"},
++{"kxXCvcat1cM","_ZNSt8ios_base4InitD1Ev"},
++{"l4SLBpKUDK4","sceRudpBind"},
++{"lDqxaY1UbEo","sceMsgDialogInitialize"},
++{"lKEN2IebgJ0","longjmp"},
++{"lL+Z3zCKNTs","sceNpTssGetSmallStorage"},
++{"lLMT9vJAck0","clock_gettime"},
++{"lUk6wrGXyMw","recvfrom"},
++{"lX+4FNUklF0","__cxa_end_catch"},
++{"lbB+UlZqVG0","fread"},
++{"lbQKqsERhtE","sceDiscMapIsRequestOnHDD"},
++{"lhYCTQmBkds","sceNpPartyInitialize"},
++{"lliK9T6ylJg","sceNpTusAddAndGetVariableVUserAsync"},
++{"ln33zjBrfjk","sceGnmGetTheTessellationFactorRingBufferBaseAddress"},
++{"ltCfaGr2JGE","pthread_mutex_destroy"},
++{"m-I92Ab50W8","sceNpCommerceDialogTerminate"},
++{"m0uW+8pFyaw","scePngDecCreate"},
++{"m47juOmH0VE","sceAppContentGetAddcontInfo"},
++{"m5wN+SwZOR4","putchar"},
++{"mCQIhSmCP6o","sceRudpGetOption"},
++{"mDmgMOGVUqg","pthread_mutexattr_settype"},
++{"mL8NDH86iQI","sceKernelMapNamedFlexibleMemory"},
++{"mOnfZ5aNDQE","_Stollx"},
++{"mSQCxzWTwVI","sceHttpsDisableOption"},
++{"mXlxhmLNMPg","strtol"},
++{"mfHdJTIvhuo","sceLibcMspaceMallocStats"},
++{"mjjTXh+NHWY","sceNpUnregisterStateCallback"},
++{"mkx2fVhNMsg","pthread_cond_broadcast"},
++{"mmLexUbtnfY","sceHttpGetAutoRedirect"},
++{"mnufPlYbnN0","_FDtest"},
++{"mo0bFmWppIw","sigreturn"},
++{"mqQMh1zPPT8","fstat"},
++{"mqULNdimTn0","pthread_key_create"},
++{"mqdNorrB+gI","scePthreadRwlockWrlock"},
++{"mtqDK9zkoIE","sceNpLookupDeleteTitleCtx"},
++{"mz2iTY0MK4A","sceFontSupportExternalFonts"},
++{"n590hj5Oe-k","sceFontCreateLibraryWithEdition"},
++{"n7AepwR0s34","mktime"},
++{"n88vx3C5nW8","gettimeofday"},
++{"nF6bFRUBRAU","sceGnmDispatchInitDefaultHardwareState"},
++{"nKWi-N2HBV4","sceKernelPwrite"},
++{"nLM2i2+65hA","sceGnmUpdateGsShader"},
++{"nXpje5yNpaE","sceVoiceCreatePort"},
++{"naInUjYt3so","sceKernelRmdir"},
++{"noQgleu+KLE","sceNpWebApiDeleteRequest"},
++{"npLpPTaSuHg","fscanf"},
++{"nsYoNRywwNg","scePthreadAttrInit"},
++{"o3+RWnHViSg","sceAvPlayerGetVideoData"},
++{"oBr313PppNE","sendto"},
++{"oM+XCzVG3oM","sceFontSelectLibraryFt"},
++{"oV9GAdJ23Gw","sceVoiceConnectIPortToOPort"},
++{"oVkZ8W8-Q8A","strtok"},
++{"ob5xAW4ln-0","strchr"},
++{"obuxdTiwkF8","sceNetCtlGetInfo"},
++{"odjOGg8harg","sceFiosDHReadSync"},
++{"oe9tS0VztYk","_ZNSt13runtime_errorD2Ev"},
++{"oib76F-12fk","sceKernelLseek"},
++{"onNY9Byn-W8","scePthreadJoin"},
++{"or0e885BlXo","sceNpWebApiUtilityParseNpId"},
++{"ozMAr28BwSY","_ZSt14_Xout_of_rangePKc"},
++{"p-o74CnoNzY","sceNpGetNpId"},
++{"p5EcQeEeJAE","_sceKernelRtldSetApplicationHeapAPI"},
++{"p6LrHjIQMdk","_ZNSt8_LocinfoD1Ev"},
++{"p6lrRW8-MLY","sceLibcMspaceReallocalign"},
++{"pDFe-IgbTPg","_ZSt6_ThrowRKSt9exception"},
++{"pDuPEf3m4fI","sem_init"},
++{"pKwslsMUmSk","fmod"},
++{"pLr1fEQS1z8","sceNpBandwidthTestShutdown"},
++{"pO96TwzOm5E","sceKernelGetDirectMemorySize"},
++{"pQGpHYopAIY","sceNetNtohl"},
++{"pSpDCDyxkaY","_Stoullx"},
++{"pXvbDfchu6k","strncasecmp"},
++{"pZ9WXcClPO8","_ZTVN10__cxxabiv120__si_class_type_infoE"},
++{"pv9CI5VC+R0","sceVideoOutAdjustColor_"},
++{"q+9E0X3aWpU","_Stoull"},
++{"q0F6yS-rCms","strcspn"},
++{"q1cHNfGycLI","scePadRead"},
++{"q7U6tEAQf7c","sceNpTrophyCreateHandle"},
++{"qFg2SuyTJJY","sceHttpSetAuthEnabled"},
++{"qISjDHrxONc","sceHttpWaitRequest"},
++{"qK4o2656W4w","sceNpWebApiUnregisterPushEventCallback"},
++{"qYhnoevd9bI","_ZSt9terminatev"},
++{"qe7oZ+v4PWA","sceHttpDeleteRequest"},
++{"qgxDBjorUxs","sceHttpCreateConnectionWithURL"},
++{"qp-rTrq1klk","sceNpTusGetMultiSlotVariableVUserAsync"},
++{"qpGITzPE+Zc","sceGnmDebugHardwareStatus"},
++{"qqUVGDgQBm0","sceNpTrophyGetTrophyInfo"},
++{"r42bWcQbtZY","sceNpCommerceDialogGetResult"},
++{"r6MyYJkryz8","sceNpCheckPlus"},
++{"rIZnR6eSpvk","scePadResetOrientation"},
++{"rPo6tV8D9bM","sceSystemServiceGetStatus"},
++{"rQFVBXp-Cxg","fseek"},
++{"rTXw65xmLIA","sceKernelAllocateDirectMemory"},
++{"rVjRvHJ0X6c","sceKernelVirtualQuery"},
++{"rWUTcKdkUzQ","sceVideoOutGetEventData"},
++{"rZqWV3eXgOA","sceRudpRead"},
++{"rcQCUr0EaRU","_Getptoupper"},
++{"rcrVFJsQWRY","scePthreadGetaffinity"},
++{"rdgs5Z1MyFw","sceNpWebApiCreateRequest"},
++{"rvBSfTimejE","scePlayGoGetInstallSpeed"},
++{"rxi1nCOKWc8","sceUsbdInterruptTransfer"},
++{"s1--uE9mBFw","sceAudioOutClose"},
++{"s2-NPIvz+iA","sceHttpSetNonblock"},
++{"s4UEa5iBJdc","sceNpInGameMessageCreateHandle"},
++{"s62MgBhosjU","_Unwind_Backtrace"},
++{"s9e3+YpRnzw","sceSaveDataDialogInitialize"},
++{"sAZqO2+5Qqo","sceRudpGetSizeReadable"},
++{"sDuhHGNhHvE","sceFontGetKerning"},
++{"sETNbyWsEHs","_Unwind_GetIP"},
++{"sIFx734+xys","sceNpWebApiCreateServicePushEventFilter"},
++{"sIlRvQqsN2Y","pthread_rwlock_wrlock"},
++{"sJptZwvs1is","sceGameCustomDataDialogGetResult"},
++{"sRVb2Cf0GHg","sceNpTssCreateNpTitleCtx"},
++{"sUP1hBaouOw","_Getpctype"},
++{"smWEktiyyG0","scePthreadMutexattrDestroy"},
++{"sqWytnhYdEg","_ZNSt8ios_base4InitC1Ev"},
++{"szEVu+edXV4","sceRudpInitiate"},
++{"t3J5pXxhJlI","sceUsbdFillInterruptTransfer"},
++{"t7WE9mb1TB8","sceUsbdGetBusNumber"},
++{"t7b6dmpQNiI","sceNpTusPollAsync"},
++{"tIYf0W5VTi8","sceScreenShotDisable"},
++{"tIhsqj0qsFE","free"},
++{"tOrRi-v3AOM","sceNetNtohll"},
++{"tQIo+GIPklo","_ZSt14_Xlength_errorPKc"},
++{"tZY4+SZNFhA","msync"},
++{"taRWhTJFTgE","sceKernelGetdirentries"},
++{"tcVi5SivF7Q","sprintf"},
++{"tdQArULbNQk","sceNpSnsFacebookDialogInitialize"},
++{"teiItL2boFw","sceKernelReleaseFlexibleMemory"},
++{"tn3VlD0hG60","scePthreadMutexUnlock"},
++{"ts6GlZOKRrE","scePlayGoInitialize"},
++{"tsvEmnenz48","__cxa_atexit"},
++{"ttHNfU+qDBU","pthread_mutex_init"},
++{"tyHd3P7oDrU","_ZNKSt9exception8_DoraiseEv"},
++{"u9YKpRRHe-M","sceRazorCaptureImmediate"},
++{"uBPlr0lbuiI","sceNetCtlGetState"},
++{"uMei1W9uyNo","exit"},
++{"uNAUmANZMEw","sceJpegDecQueryMemorySize"},
++{"uWIYLFkkwqk","scePlayGoGetLocus"},
++{"ueega6v3GUw","sceRtcSetTick"},
++{"uj9Cz7Tk0cc","sceNpProfileDialogOpen"},
++{"uoUpLGNkygk","sceCommonDialogInitialize"},
++{"uodLYyUip20","fclose"},
++{"upoVrzMHFeE","scePthreadMutexTrylock"},
++{"uqcPJLWL08M","sceNpPollAsync"},
++{"uquVH4-Du78","sceVideoOutClose"},
++{"usKbuvy2hQg","__cxa_call_unexpected"},
++{"v6EZ-YWRdMs","scePlayGoGetEta"},
++{"v7S7LhP2OJc","wcstombs"},
++{"vDLMoJLde8I","scePadSetTiltCorrectionState"},
++{"vNe1w4diLCs","__tls_get_addr"},
++{"vPzJldDSxXc","sceRudpNetReceived"},
++{"vU9svJtEnWc","_ZSt4setwi"},
++{"vYWK2Pz8vGE","_ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi"},
++{"vZkmJmvqueY","_Lockfilelock"},
++{"vckdzbQ46SI","sceGnmSetLsShader"},
++{"viiwFMaNamA","strstr"},
++{"vkuuLfhnSZI","__cxa_throw"},
++{"vzHs3C8lWJk","sceFontCloseFont"},
++{"w13Ojm7ON9o","sceFiosFHOpenWithModeSync"},
++{"w21YgGGNtBk","sceNetEpollAbort"},
++{"w3BY+tAEiQY","sceVideoOutRegisterBuffers"},
++{"w4uMPmErD4I","sceNpTrophyGetGroupIcon"},
++{"wIJsiqY+BMk","sceRudpGetContextStatus"},
++{"wLaxchvEEnk","sceNpLookupDeleteRequest"},
++{"wLlFkwG9UcQ","time"},
++{"wTUwGfspKic","sceNpTrophyGetGroupInfo"},
++{"wYhXVfS2Et4","sceHttpDestroyEpoll"},
++{"weDug8QD-lE","atanf"},
++{"whrS4oksXc4","sceFontMemoryInit"},
++{"wiR+rIcbnlc","_ZSt4_Fpz"},
++{"wkwjz0Xdo2A","sceNpProfileDialogClose"},
++{"wtkt-teR1so","pthread_attr_init"},
++{"wuAQt-j+p4o","exp2f"},
++{"wvuUDv0jrMI","sceNetRecvmsg"},
++{"wzvqT4UqKX8","sceKernelLoadStartModule"},
++{"x1UB9bwDSOw","sceSystemServiceDisableMusicPlayer"},
++{"x1X76arYMxU","scePthreadAttrGet"},
++{"x1Y7yiYSk7c","sceNpWebApiCreateContext"},
++{"xEszJVGpybs","sprintf_s"},
++{"xReSebwKApA","sceFiosFHSeek"},
++{"xbxNatawohc","sceGnmSubmitAndFlipCommandBuffers"},
++{"xeTLfxVIQO4","sceRazorCaptureCommandBuffersOnlyImmediate"},
++{"xeYO4u7uyJ0","fopen"},
++{"xegFfZKBVlw","sceHttpSetSendTimeOut"},
++{"xgDjJKpcyHo","scePngEncEncode"},
++{"xk0AcarP3V4","scePadOpen"},
++{"xnd8BJzAxmk","sceAppContentGetAddcontInfoList"},
++{"xphrZusl78E","sceNetGetsockopt"},
++{"xtbb-2f703A","sceGameCustomDataDialogInitialize"},
++{"xweOi2QT-BE","sceCompanionHttpdUnregisterRequestCallback"},
++{"xzZiQgReRGE","labs"},
++{"y5Ta5JCzQHY","sceNpWebApiCreatePushEventFilter"},
++{"yEiJ-qqr6Cg","sceSaveDataDialogGetResult"},
++{"yFVnOdGxvZY","scePadSetVibration"},
++{"yKDy8S5yLA0","sceSaveDataTerminate"},
++{"yLE5H3058Ao","_ZTVNSt8ios_base7failureE"},
++{"yS8U2TGCe1A","nanosleep"},
++{"yigr4V0-HTM","sceHttpSetRecvTimeOut"},
++{"ytQULN-nhL4","pthread_rwlock_init"},
++{"yuO2H2Uvnos","sceHttpGetResponseContentLength"},
++{"yvZ73uQUqrk","sceGnmSubmitDone"},
++{"z+P+xCnWLBk","_ZdlPv"},
++{"zE+R6Rcx3W0","sceNpWebApiDeletePushEventFilter"},
++{"zE-wXIZjLoM","sceKernelDebugRaiseExceptionOnReleaseMode"},
++{"zFgFHId7vAE","sceNpSignalingGetPeerNetInfo"},
++{"zHchY8ft5pk","pthread_attr_destroy"},
++{"zNGh-zoQTD0","sceHttpRemoveRequestHeader"},
++{"zO9UL3qIINQ","sceRtcGetCurrentNetworkTick"},
++{"zS94yyJRSUs","_Getpwcstate"},
++{"zXCi78bYrEI","_Log"},
++{"zlfEH8FmyUA","_Stoul"},
++{"zr094EQ39Ww","__cxa_pure_virtual"},
++{"zwY0YV91TTI","sceGnmSubmitCommandBuffers"},
+diff --git a/src/runtime_dc.c b/src/runtime_dc.c
+new file mode 100644
+index 0000000..4ee4f87
+--- /dev/null
++++ b/src/runtime_dc.c
+@@ -0,0 +1,322 @@
++/* Driveclub (CUSA00003): system library functions the Bloodborne runtime never needed.
++ *
++ * Resolved last (after the shadPS4 HLE table), so nothing here shadows an existing
++ * implementation. Hardware and services a PC does not have (the USB wheel driver, Rudp,
++ * live streaming, the companion app, Facebook and other dialogs) report "nothing there"
++ * the way a PS4 without them would. Reference for behaviour: shadPS4 and
++ * BlackLineInteractive/Driveclub-Port (GPL-2.0-or-later). */
++#define _GNU_SOURCE
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <pthread.h>
++#include <time.h>
++#include "runtime.h"
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <unistd.h>
++#endif
++
++/* Stubs keep the guest signatures as documentation of the contract. */
++#pragma GCC diagnostic ignored "-Wunused-parameter"
++
++#define DC_ERROR_GENERIC ((int32_t)0x80020001)  /* SCE_KERNEL_ERROR_EPERM */
++#define DC_ERROR_NOENT ((int32_t)0x80020002)
++#define DC_ERROR_BUSY ((int32_t)0x80020010)
++#define POSIX_EINVAL 22
++#define POSIX_EBUSY 16
++#define POSIX_EAGAIN 35
++
++static int dc_trace = -1;
++static void trace(const char *what) {
++    if (dc_trace < 0) dc_trace = getenv("BB_DC_TRACE") && *getenv("BB_DC_TRACE") == '1';
++    if (dc_trace) printf("DC: %s\n", what);
++}
++
++/* --- Generic results -------------------------------------------------------------------- */
++static ABI int32_t ok(void) { return 0; }
++static ABI int32_t fail_generic(void) { return DC_ERROR_GENERIC; }
++static ABI int32_t one(void) { return 1; }
++/* Common dialogs: SCE_COMMON_DIALOG_STATUS_FINISHED, as if the player closed them. */
++static ABI int32_t dialog_finished(void) { return 3; }
++static ABI int32_t dialog_none(void) { return 0; }  /* SCE_COMMON_DIALOG_STATUS_NONE */
++static ABI int32_t dialog_result(int32_t *result) {
++    if (result) result[1] = 1;  /* { mode, result = canceled } */
++    return 0;
++}
++
++/* --- libkernel -------------------------------------------------------------------------- */
++static ABI int32_t kernel_sleep(uint32_t seconds) {
++#ifdef _WIN32
++    Sleep(seconds * 1000u);
++#else
++    sleep(seconds);
++#endif
++    return 0;
++}
++static ABI int64_t kernel_getdents(int32_t fd, char *buffer, uint64_t size) {
++    return runtime_file_getdents(fd, buffer, size, NULL);
++}
++/* Every module the game asks for is linked into the image at startup (link_modules.py)
++ * and already started, so loading only hands back a handle. */
++static ABI int32_t kernel_load_start_module(const char *path, uint64_t args, const void *argp,
++                                            uint32_t flags, const void *option, int32_t *result) {
++    if (result) *result = 0;
++    const char *base = path ? strrchr(path, '/') : NULL;
++    base = base ? base + 1 : path;
++    printf("DC: sceKernelLoadStartModule(%s): already linked\n", path ? path : "(null)");
++    uint32_t hash = 0x40;
++    for (const char *c = base ? base : ""; *c; ++c) hash = hash * 31 + (unsigned char)*c;
++    return (int32_t)(0x100 + (hash & 0xfff));
++}
++static ABI int32_t kernel_get_open_psid(uint8_t *id) {
++    if (id) for (int i = 0; i < 16; ++i) id[i] = (uint8_t)(0x5a ^ i * 17);
++    return 0;
++}
++
++/* --- POSIX semaphores and rwlocks (libScePosix) ----------------------------------------- */
++/* Guest sem_t and pthread_rwlock_t are pointer-sized handles. */
++typedef struct { pthread_mutex_t lock; pthread_cond_t cond; uint32_t count; } HostSem;
++static ABI int32_t posix_sem_init(HostSem **sem, int32_t shared, uint32_t value) {
++    if (!sem) return -1;
++    HostSem *s = calloc(1, sizeof(*s));
++    if (!s) return -1;
++    pthread_mutex_init(&s->lock, NULL);
++    pthread_cond_init(&s->cond, NULL);
++    s->count = value;
++    *sem = s;
++    return 0;
++}
++static ABI int32_t posix_sem_destroy(HostSem **sem) {
++    if (!sem || !*sem) return -1;
++    pthread_mutex_destroy(&(*sem)->lock);
++    pthread_cond_destroy(&(*sem)->cond);
++    free(*sem);
++    *sem = NULL;
++    return 0;
++}
++static ABI int32_t posix_sem_wait(HostSem **sem) {
++    if (!sem || !*sem) return -1;
++    HostSem *s = *sem;
++    pthread_mutex_lock(&s->lock);
++    while (!s->count) pthread_cond_wait(&s->cond, &s->lock);
++    --s->count;
++    pthread_mutex_unlock(&s->lock);
++    return 0;
++}
++static ABI int32_t posix_sem_trywait(HostSem **sem) {
++    if (!sem || !*sem) return -1;
++    HostSem *s = *sem;
++    pthread_mutex_lock(&s->lock);
++    int32_t r = s->count ? (--s->count, 0) : -1;
++    pthread_mutex_unlock(&s->lock);
++    if (r) *runtime_errno() = POSIX_EAGAIN;
++    return r;
++}
++static ABI int32_t posix_sem_post(HostSem **sem) {
++    if (!sem || !*sem) return -1;
++    HostSem *s = *sem;
++    pthread_mutex_lock(&s->lock);
++    ++s->count;
++    pthread_cond_signal(&s->cond);
++    pthread_mutex_unlock(&s->lock);
++    return 0;
++}
++static ABI int32_t posix_sem_getvalue(HostSem **sem, int32_t *value) {
++    if (!sem || !*sem || !value) return -1;
++    pthread_mutex_lock(&(*sem)->lock);
++    *value = (int32_t)(*sem)->count;
++    pthread_mutex_unlock(&(*sem)->lock);
++    return 0;
++}
++
++static pthread_mutex_t rwlock_init_lock = PTHREAD_MUTEX_INITIALIZER;
++/* Static initializers leave the guest handle NULL: create the host lock on first use. */
++static pthread_rwlock_t *rwlock(pthread_rwlock_t **handle) {
++    if (!handle) return NULL;
++    pthread_rwlock_t *l = __atomic_load_n(handle, __ATOMIC_ACQUIRE);
++    if (l) return l;
++    pthread_mutex_lock(&rwlock_init_lock);
++    if (!*handle) {
++        l = malloc(sizeof(*l));
++        if (l) pthread_rwlock_init(l, NULL);
++        __atomic_store_n(handle, l, __ATOMIC_RELEASE);
++    }
++    l = *handle;
++    pthread_mutex_unlock(&rwlock_init_lock);
++    return l;
++}
++static ABI int32_t posix_rwlock_init(pthread_rwlock_t **handle, const void *attr) {
++    if (!handle) return POSIX_EINVAL;
++    *handle = NULL;
++    return rwlock(handle) ? 0 : POSIX_EINVAL;
++}
++static ABI int32_t posix_rwlock_destroy(pthread_rwlock_t **handle) {
++    if (!handle || !*handle) return 0;
++    pthread_rwlock_destroy(*handle);
++    free(*handle);
++    *handle = NULL;
++    return 0;
++}
++static ABI int32_t posix_rwlock_rdlock(pthread_rwlock_t **h) { pthread_rwlock_t *l = rwlock(h); return l ? pthread_rwlock_rdlock(l) : POSIX_EINVAL; }
++static ABI int32_t posix_rwlock_wrlock(pthread_rwlock_t **h) { pthread_rwlock_t *l = rwlock(h); return l ? pthread_rwlock_wrlock(l) : POSIX_EINVAL; }
++static ABI int32_t posix_rwlock_tryrdlock(pthread_rwlock_t **h) { pthread_rwlock_t *l = rwlock(h); return l ? (pthread_rwlock_tryrdlock(l) ? POSIX_EBUSY : 0) : POSIX_EINVAL; }
++static ABI int32_t posix_rwlock_trywrlock(pthread_rwlock_t **h) { pthread_rwlock_t *l = rwlock(h); return l ? (pthread_rwlock_trywrlock(l) ? POSIX_EBUSY : 0) : POSIX_EINVAL; }
++static ABI int32_t posix_rwlock_unlock(pthread_rwlock_t **h) { pthread_rwlock_t *l = rwlock(h); return l ? pthread_rwlock_unlock(l) : POSIX_EINVAL; }
++
++/* pthread_detach: scePthreadDetach's contract with a POSIX error number. */
++static ABI int32_t posix_detach(void *thread) {
++    typedef int32_t (ABI *Detach)(void *);
++    static Detach detach;
++    if (!detach) detach = (Detach)runtime_resolve("4qGrR6eoP9Y#p#J", 0);
++    int32_t r = detach ? detach(thread) : 0;
++    return r ? r & 0xffff : 0;
++}
++
++/* --- USB (Logitech wheel driver logiWheel.prx): no devices ------------------------------- */
++static ABI int64_t usbd_get_device_list(void ***list) {
++    static void *empty[1];
++    if (list) *list = empty;
++    return 0;
++}
++static ABI int32_t usbd_no_device(void) { return (int32_t)0x80240004; } /* SCE_USBD_ERROR_NO_DEVICE */
++
++/* --- Rudp (online): initialise, but never connect ---------------------------------------- */
++static ABI int32_t rudp_context(void) { return 1; }
++static ABI int32_t rudp_would_block(void) { return (int32_t)0x80770012; } /* SCE_RUDP_ERROR_WOULDBLOCK */
++
++/* --- Live streaming / companion app / screenshots: off ----------------------------------- */
++static ABI int32_t streaming_status(uint32_t *status) {
++    if (status) memset(status, 0, 16);
++    return 0;
++}
++static ABI int32_t companion_no_event(void) { return (int32_t)0x80E40008; } /* NO_EVENT */
++
++/* --- Trophies ---------------------------------------------------------------------------- */
++static ABI int32_t trophy_unlock_state(int32_t context, int32_t handle, uint32_t *flags, uint32_t *count) {
++    if (flags) memset(flags, 0, 16);  /* SceNpTrophyFlagArray: 128 bits */
++    if (count) *count = 0;
++    return 0;
++}
++
++/* --- PlayGo: the whole game is installed ------------------------------------------------- */
++static ABI int32_t playgo_todo(int32_t handle, void *list, uint32_t count, uint32_t *entries) {
++    if (entries) *entries = 0;
++    return 0;
++}
++static ABI int32_t playgo_eta(int32_t handle, const uint16_t *ids, uint32_t count, int64_t *eta) {
++    if (eta) *eta = 0;
++    return 0;
++}
++static ABI int32_t playgo_speed(int32_t handle, int32_t *speed) {
++    if (speed) *speed = 2;  /* SCE_PLAYGO_INSTALL_SPEED_TRICKLE..FULL: full */
++    return 0;
++}
++
++/* --- AppContent: add-on info/mount live in runtime_content.c; plenty of download space ----------------------------- */
++static ABI int32_t download_space(int32_t format, uint64_t *kb) {
++    if (kb) *kb = 4ull << 20;  /* 4 GiB */
++    return 0;
++}
++
++/* --- Images: decoding is left to the game's fallbacks for now ---------------------------- */
++static ABI int32_t image_unsupported(void) { return (int32_t)0x80690001; }
++static ABI int32_t image_memory_size(void) { return 64 * 1024; }
++
++/* --- Misc services ----------------------------------------------------------------------- */
++static ABI int32_t safe_area(float *info) {
++    if (info) { info[0] = 1.0f; memset(info + 1, 0, 128 - sizeof(float)); }
++    return 0;
++}
++static ABI int32_t save_mount_info(const void *mount_point, uint64_t *info) {
++    if (info) { info[0] = 1u << 20; info[1] = 1u << 20; }  /* blocks, free blocks */
++    return 0;
++}
++static ABI int32_t audio_in_silent(void) { return 0; }
++static ABI int32_t rtc_parse_unsupported(void) { return (int32_t)0x80B50002; }
++
++static const RuntimeExport exports[] = {
++    {"sceKernelSleep", kernel_sleep}, {"sceKernelGetdents", kernel_getdents},
++    {"sceKernelLoadStartModule", kernel_load_start_module}, {"sceKernelStopUnloadModule", ok},
++    {"sceKernelSetPrtAperture", ok}, {"sceKernelSetVirtualRangeName", ok}, {"sceKernelFutimes", ok},
++    {"sceKernelGetOpenPsId", kernel_get_open_psid},
++
++    {"sem_init", posix_sem_init}, {"sem_destroy", posix_sem_destroy}, {"sem_wait", posix_sem_wait},
++    {"sem_trywait", posix_sem_trywait}, {"sem_post", posix_sem_post}, {"sem_getvalue", posix_sem_getvalue},
++    {"pthread_rwlock_init", posix_rwlock_init}, {"pthread_rwlock_destroy", posix_rwlock_destroy},
++    {"pthread_rwlock_rdlock", posix_rwlock_rdlock}, {"pthread_rwlock_wrlock", posix_rwlock_wrlock},
++    {"pthread_rwlock_tryrdlock", posix_rwlock_tryrdlock}, {"pthread_rwlock_trywrlock", posix_rwlock_trywrlock},
++    {"pthread_rwlock_unlock", posix_rwlock_unlock}, {"pthread_detach", posix_detach},
++
++    {"sceUsbdInit", ok}, {"sceUsbdExit", ok}, {"sceUsbdGetDeviceList", usbd_get_device_list},
++    {"sceUsbdFreeDeviceList", ok}, {"sceUsbdHandleEventsTimeout", ok}, {"sceUsbdCheckConnected", usbd_no_device},
++    {"sceUsbdOpen", usbd_no_device}, {"sceUsbdClose", ok}, {"sceUsbdGetDeviceDescriptor", usbd_no_device},
++    {"sceUsbdGetConfigDescriptor", usbd_no_device}, {"sceUsbdFreeConfigDescriptor", ok},
++    {"sceUsbdClaimInterface", usbd_no_device}, {"sceUsbdReleaseInterface", ok},
++    {"sceUsbdKernelDriverActive", ok}, {"sceUsbdAttachKernelDriver", ok}, {"sceUsbdSetConfiguration", usbd_no_device},
++    {"sceUsbdAllocTransfer", ok}, {"sceUsbdFreeTransfer", ok}, {"sceUsbdSubmitTransfer", usbd_no_device},
++    {"sceUsbdFillControlSetup", ok}, {"sceUsbdFillControlTransfer", ok}, {"sceUsbdFillInterruptTransfer", ok},
++    {"sceUsbdControlTransfer", usbd_no_device}, {"sceUsbdControlTransferGetData", ok},
++    {"sceUsbdGetBusNumber", ok}, {"sceUsbdGetDeviceAddress", ok},
++
++    {"sceRudpInit", ok}, {"sceRudpEnd", ok}, {"sceRudpCreateContext", rudp_context},
++    {"sceRudpTerminate", ok}, {"sceRudpBind", ok}, {"sceRudpInitiate", fail_generic},
++    {"sceRudpProcessEvents", ok}, {"sceRudpNetReceived", ok}, {"sceRudpSetEventHandler", ok},
++    {"sceRudpSetOption", ok}, {"sceRudpGetOption", ok}, {"sceRudpGetStatus", ok},
++    {"sceRudpRead", rudp_would_block}, {"sceRudpWrite", rudp_would_block}, {"sceRudpGetSizeWritable", ok},
++
++    {"sceGameLiveStreamingInitialize", ok}, {"sceGameLiveStreamingTerminate", ok},
++    {"sceGameLiveStreamingEnableLiveStreaming", ok}, {"sceGameLiveStreamingPermitLiveStreaming", ok},
++    {"sceGameLiveStreamingPermitServerSideRecording", ok}, {"sceGameLiveStreamingPostSocialMessage", ok},
++    {"sceGameLiveStreamingGetCurrentStatus", streaming_status}, {"sceGameLiveStreamingGetProgramInfo", fail_generic},
++    {"sceCompanionHttpdStart", ok}, {"sceCompanionHttpdStop", ok}, {"sceCompanionHttpdTerminate", ok},
++    {"sceCompanionHttpdInitialize", ok}, {"sceCompanionHttpdGetEvent", companion_no_event},
++    {"sceCompanionHttpdRegisterRequestCallback2", ok}, {"sceCompanionHttpdUnregisterRequestCallback", ok},
++    {"sceScreenShotEnable", ok}, {"sceScreenShotDisable", ok}, {"sceVideoRecordingSetInfo", ok},
++
++    {"sceNpTrophyDestroyContext", ok}, {"sceNpTrophyDestroyHandle", ok},
++    {"sceNpTrophyGetTrophyUnlockState", trophy_unlock_state},
++
++    {"scePlayGoClose", ok}, {"scePlayGoTerminate", ok}, {"scePlayGoPrefetch", ok},
++    {"scePlayGoGetToDoList", playgo_todo}, {"scePlayGoGetEta", playgo_eta},
++    {"scePlayGoGetInstallSpeed", playgo_speed},
++
++    {"sceAppContentAddcontMount", (void *)runtime_addcont_mount}, {"sceAppContentAddcontUnmount", ok},
++    {"sceAppContentGetAddcontInfo", (void *)runtime_addcont_info}, {"sceAppContentDownloadDataFormat", ok},
++    {"sceAppContentDownloadDataGetAvailableSpaceKb", download_space},
++
++    {"sceJpegDecCreate", image_unsupported}, {"sceJpegDecDelete", ok}, {"sceJpegDecDecode", image_unsupported},
++    {"sceJpegDecParseHeader", image_unsupported}, {"sceJpegDecQueryMemorySize", image_memory_size},
++    {"scePngDecCreate", image_unsupported}, {"scePngDecDelete", ok}, {"scePngDecDecode", image_unsupported},
++    {"scePngDecParseHeader", image_unsupported}, {"scePngDecQueryMemorySize", image_memory_size},
++    {"scePngEncCreate", image_unsupported}, {"scePngEncDelete", ok}, {"scePngEncEncode", image_unsupported},
++    {"scePngEncQueryMemorySize", image_memory_size},
++
++    {"sceGameCustomDataDialogInitialize", ok}, {"sceGameCustomDataDialogTerminate", ok},
++    {"sceGameCustomDataDialogOpen", ok}, {"sceGameCustomDataDialogClose", ok},
++    {"sceGameCustomDataDialogUpdateStatus", dialog_finished}, {"sceGameCustomDataDialogGetResult", dialog_result},
++    {"sceNpSnsFacebookDialogInitialize", ok}, {"sceNpSnsFacebookDialogTerminate", ok},
++    {"sceNpSnsFacebookDialogOpen", ok}, {"sceNpSnsFacebookDialogClose", ok},
++    {"sceNpSnsFacebookDialogUpdateStatus", dialog_finished}, {"sceNpSnsFacebookDialogGetResult", dialog_result},
++    {"sceErrorDialogInitialize", ok}, {"sceErrorDialogTerminate", ok}, {"sceErrorDialogOpen", ok},
++    {"sceErrorDialogClose", ok}, {"sceErrorDialogUpdateStatus", dialog_finished},
++    {"sceMsgDialogClose", ok}, {"sceMsgDialogGetResult", dialog_result},
++    {"sceSaveDataDialogClose", ok}, {"sceSaveDataDialogGetResult", dialog_result},
++    {"sceSaveDataDialogIsReadyToDisplay", one}, {"sceSaveDataDialogProgressBarSetValue", ok},
++    {"sceNpCommerceDialogGetResult", dialog_result}, {"sceNpCommerceDialogGetStatus", dialog_none},
++    {"sceNpProfileDialogClose", ok}, {"sceCommonDialogIsUsed", ok},
++
++    {"sceSystemServiceGetDisplaySafeAreaInfo", safe_area},
++    {"sceSaveDataGetMountInfo", save_mount_info},
++    {"sceAudioInGetSilentState", audio_in_silent},
++    {"sceRtcParseRFC3339", rtc_parse_unsupported},
++};
++
++uintptr_t runtime_dc_resolve(const char *name) {
++    uintptr_t found = runtime_font_resolve(name);
++    if (!found) found = RUNTIME_LOOKUP(exports, name);
++    if (found) trace(runtime_symbol(name));
++    return found;
++}
+diff --git a/src/runtime_font.c b/src/runtime_font.c
+new file mode 100644
+index 0000000..c43a216
+--- /dev/null
++++ b/src/runtime_font.c
+@@ -0,0 +1,313 @@
++/* libSceFont on FreeType (Driveclub).
++ *
++ * The game opens its own TrueType/OpenType fonts from memory, sets a pixel scale and
++ * rasterizes glyphs one at a time into an 8-bit render surface (its glyph cache), each at a
++ * pen position on the baseline. FreeType rasterizes; this file maps the API onto it. Structure
++ * layouts and placement follow BlackLineInteractive/Driveclub-Port's CoreText version
++ * (GPL-2.0-or-later). The PS4 system font set has no files here: a Windows font stands in. */
++#define _GNU_SOURCE
++#include <math.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ft2build.h>
++#include FT_FREETYPE_H
++#include "runtime.h"
++
++#define FONT_ERROR_INVALID_PARAMETER ((int32_t)0x80460002)
++#define FONT_ERROR_NO_SUPPORT_GLYPH ((int32_t)0x80460010)
++#define FONT_ERROR_NO_SUPPORT_FONTSET ((int32_t)0x80460019)
++
++typedef struct {
++    float width, height;
++    struct { float bearing_x, bearing_y, advance; } horizontal, vertical;
++} GlyphMetrics;
++_Static_assert(sizeof(GlyphMetrics) == 32, "SceFontGlyphMetrics");
++
++typedef struct { float baseline_offset, line_advance, decoration_extent; } HorizontalLayout;
++typedef struct { float offset_x, offset_y, position_x, position_y; } Kerning;
++
++typedef struct {
++    uint8_t *buffer;
++    int32_t width_byte;
++    int8_t pixel_size_byte;
++    uint8_t pad0, style_flag, pad2;
++    int32_t width, height;
++    uint32_t sc_x0, sc_y0, sc_x1, sc_y1;
++    uint64_t reserved[11];
++} RenderSurface;
++_Static_assert(sizeof(RenderSurface) == 128, "SceFontRenderSurface");
++
++typedef struct {
++    const void *stage;
++    struct { uint8_t *address; uint32_t width_byte; uint8_t pixel_size_byte, pixel_format; uint16_t pad; } surface_image;
++    struct { uint32_t x, y, w, h; } update_rect;
++    struct { float bearing_x, bearing_y, advance, stride; uint32_t width, height; } image_metrics;
++} RenderOutput;
++_Static_assert(sizeof(RenderOutput) == 64, "SceFontRenderOutput");
++
++typedef struct {
++    FT_Face face;
++    void *data;  /* FreeType reads the font from here for as long as the face lives */
++    float scale_w, scale_h, sized_w, sized_h;
++} Font;
++
++static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++static FT_Library library;
++static _Alignas(64) uint8_t guest_library[256], guest_renderer[256];
++static unsigned fonts_opened, glyphs_rendered;
++
++static int ensure_library(void) {
++    return library || !FT_Init_FreeType(&library);
++}
++
++static void apply_scale(Font *f) {
++    if (f->sized_w == f->scale_w && f->sized_h == f->scale_h) return;
++    FT_Set_Char_Size(f->face, (FT_F26Dot6)lroundf(f->scale_w * 64.0f), (FT_F26Dot6)lroundf(f->scale_h * 64.0f), 72, 72);
++    f->sized_w = f->scale_w;
++    f->sized_h = f->scale_h;
++}
++
++/* Loads `code` at the current scale with an optional fractional pen offset (pixels, y down). */
++static int load_glyph(Font *f, uint32_t code, float fx, float fy, int render) {
++    FT_UInt index = FT_Get_Char_Index(f->face, code);
++    if (!index) return 0;
++    apply_scale(f);
++    FT_Vector delta = {(FT_Pos)lroundf(fx * 64.0f), (FT_Pos)lroundf(-fy * 64.0f)};
++    FT_Set_Transform(f->face, NULL, render ? &delta : NULL);
++    if (FT_Load_Glyph(f->face, index, FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP)) return 0;
++    if (render && FT_Render_Glyph(f->face->glyph, FT_RENDER_MODE_NORMAL)) return 0;
++    return 1;
++}
++
++/* Metrics in pixels; y up from the baseline, as the API reports them. */
++static void metrics(const Font *f, GlyphMetrics *m) {
++    const FT_Glyph_Metrics *g = &f->face->glyph->metrics;
++    memset(m, 0, sizeof(*m));
++    m->width = g->width / 64.0f;
++    m->height = g->height / 64.0f;
++    m->horizontal.bearing_x = g->horiBearingX / 64.0f;
++    m->horizontal.bearing_y = g->horiBearingY / 64.0f;
++    m->horizontal.advance = g->horiAdvance / 64.0f;
++    m->vertical.bearing_x = g->vertBearingX / 64.0f;
++    m->vertical.bearing_y = g->vertBearingY / 64.0f;
++    m->vertical.advance = g->vertAdvance / 64.0f;
++}
++
++static Font *open_font(const void *data, size_t size, const char *what) {
++    if (!ensure_library()) return NULL;
++    Font *f = calloc(1, sizeof(*f));
++    if (!f || !(f->data = malloc(size))) { free(f); return NULL; }
++    memcpy(f->data, data, size);
++    if (FT_New_Memory_Face(library, f->data, (FT_Long)size, 0, &f->face)) {
++        free(f->data);
++        free(f);
++        return NULL;
++    }
++    f->scale_w = f->scale_h = 16.0f;
++    ++fonts_opened;
++    printf("Font: opened %s %s (%zu bytes)\n", what, f->face->family_name ? f->face->family_name : "?", size);
++    return f;
++}
++
++static ABI int32_t font_ok(void) { return 0; }
++
++static ABI int32_t create_library(const void *mem, const void *params, uint64_t edition, void **out) {
++    (void)mem, (void)params, (void)edition;
++    if (!out) return FONT_ERROR_INVALID_PARAMETER;
++    *out = guest_library;
++    return 0;
++}
++static ABI int32_t create_renderer(const void *mem, const void *params, uint64_t edition, void **out) {
++    (void)mem, (void)params, (void)edition;
++    if (!out) return FONT_ERROR_INVALID_PARAMETER;
++    *out = guest_renderer;
++    return 0;
++}
++static ABI int32_t destroy_handle(void **handle) {
++    if (handle) *handle = NULL;
++    return 0;
++}
++
++static ABI int32_t open_font_memory(void *lib, const void *data, uint32_t size, const void *params, Font **out) {
++    (void)lib, (void)params;
++    if (!data || !size || !out) return FONT_ERROR_INVALID_PARAMETER;
++    pthread_mutex_lock(&lock);
++    Font *f = open_font(data, size, "game font");
++    pthread_mutex_unlock(&lock);
++    if (!f) {
++        printf("Font: cannot open a %u-byte font\n", size);
++        return FONT_ERROR_INVALID_PARAMETER;
++    }
++    *out = f;
++    return 0;
++}
++
++/* System font sets: the closest Windows font. */
++static ABI int32_t open_font_set(void *lib, uint32_t type, uint32_t mode, const void *params, Font **out) {
++    (void)lib, (void)mode, (void)params;
++    if (!out) return FONT_ERROR_INVALID_PARAMETER;
++    static const char *const candidates[] = {"C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\arial.ttf"};
++    for (size_t i = 0; i < sizeof(candidates) / sizeof(*candidates); ++i) {
++        FILE *file = fopen(candidates[i], "rb");
++        if (!file) continue;
++        fseek(file, 0, SEEK_END);
++        long size = ftell(file);
++        fseek(file, 0, SEEK_SET);
++        void *data = size > 0 ? malloc((size_t)size) : NULL;
++        size_t read = data ? fread(data, 1, (size_t)size, file) : 0;
++        fclose(file);
++        if (read == (size_t)size && data) {
++            pthread_mutex_lock(&lock);
++            Font *f = open_font(data, read, "system font set");
++            pthread_mutex_unlock(&lock);
++            free(data);
++            if (f) {
++                printf("Font: system font set 0x%x -> %s\n", type, candidates[i]);
++                *out = f;
++                return 0;
++            }
++        } else {
++            free(data);
++        }
++    }
++    return FONT_ERROR_NO_SUPPORT_FONTSET;
++}
++
++static ABI int32_t close_font(Font *f) {
++    pthread_mutex_lock(&lock);
++    if (f) {
++        FT_Done_Face(f->face);
++        free(f->data);
++        free(f);
++    }
++    pthread_mutex_unlock(&lock);
++    return 0;
++}
++
++static ABI int32_t set_scale_pixel(Font *f, float w, float h) {
++    if (!f || w <= 0.0f || h <= 0.0f) return FONT_ERROR_INVALID_PARAMETER;
++    pthread_mutex_lock(&lock);
++    f->scale_w = w;
++    f->scale_h = h;
++    pthread_mutex_unlock(&lock);
++    return 0;
++}
++
++static ABI int32_t horizontal_layout(Font *f, HorizontalLayout *layout) {
++    if (!f || !layout) return FONT_ERROR_INVALID_PARAMETER;
++    pthread_mutex_lock(&lock);
++    apply_scale(f);
++    const FT_Size_Metrics *s = &f->face->size->metrics;
++    layout->baseline_offset = s->ascender / 64.0f;
++    layout->line_advance = s->height / 64.0f;
++    layout->decoration_extent = FT_MulFix(f->face->underline_thickness, s->y_scale) / 64.0f;
++    pthread_mutex_unlock(&lock);
++    return 0;
++}
++
++static ABI int32_t glyph_metrics(Font *f, uint32_t code, GlyphMetrics *m) {
++    if (!f || !m) return FONT_ERROR_INVALID_PARAMETER;
++    pthread_mutex_lock(&lock);
++    int found = load_glyph(f, code, 0, 0, 0);
++    if (found) metrics(f, m); else memset(m, 0, sizeof(*m));
++    pthread_mutex_unlock(&lock);
++    return found ? 0 : FONT_ERROR_NO_SUPPORT_GLYPH;
++}
++
++static ABI int32_t kerning(Font *f, uint32_t pre, uint32_t code, Kerning *k) {
++    (void)f, (void)pre, (void)code;
++    if (k) memset(k, 0, sizeof(*k));
++    return 0;
++}
++
++static ABI void render_surface_init(RenderSurface *s, void *buffer, int32_t width_byte, int32_t pixel_size,
++                                    int32_t width, int32_t height) {
++    if (!s) return;
++    memset(s, 0, sizeof(*s));
++    s->buffer = buffer;
++    s->width_byte = width_byte;
++    s->pixel_size_byte = (int8_t)pixel_size;
++    s->width = width > 0 ? width : 0;
++    s->height = height > 0 ? height : 0;
++    s->sc_x1 = (uint32_t)s->width;
++    s->sc_y1 = (uint32_t)s->height;
++}
++
++static int32_t max_i(int32_t a, int32_t b) { return a > b ? a : b; }
++static int32_t min_i(int32_t a, int32_t b) { return a < b ? a : b; }
++
++/* Rasterizes `code` with its pen position at (x, y) (y down, on the baseline) into the
++ * surface, as coverage. */
++static ABI int32_t render_glyph(Font *f, uint32_t code, RenderSurface *s, float x, float y, GlyphMetrics *m,
++                                RenderOutput *out) {
++    if (!f || !s || !m || !out) return FONT_ERROR_INVALID_PARAMETER;
++    pthread_mutex_lock(&lock);
++    const float fx = x - floorf(x), fy = y - floorf(y);
++    if (!load_glyph(f, code, 0, 0, 0)) {
++        memset(m, 0, sizeof(*m));
++        memset(out, 0, sizeof(*out));
++        pthread_mutex_unlock(&lock);
++        return FONT_ERROR_NO_SUPPORT_GLYPH;
++    }
++    metrics(f, m);
++    load_glyph(f, code, fx, fy, 1);
++    const FT_GlyphSlot slot = f->face->glyph;
++    const FT_Bitmap *bitmap = &slot->bitmap;
++    const int32_t left = slot->bitmap_left, top = slot->bitmap_top;
++    const int32_t gw = (int32_t)bitmap->width, gh = (int32_t)bitmap->rows;
++    const int32_t right = left + gw;
++    const int32_t dest_x = (int32_t)floorf(x) + left, dest_y = (int32_t)floorf(y) - top;
++    const int32_t bpp = s->pixel_size_byte > 0 ? s->pixel_size_byte : 1;
++    int32_t ux0 = dest_x, uy0 = dest_y, uw = 0, uh = 0;
++    if (gw > 0 && gh > 0 && s->buffer && bitmap->buffer) {
++        const int32_t x0 = max_i(dest_x, (int32_t)s->sc_x0), x1 = min_i(dest_x + gw, (int32_t)s->sc_x1);
++        const int32_t y0 = max_i(dest_y, (int32_t)s->sc_y0), y1 = min_i(dest_y + gh, (int32_t)s->sc_y1);
++        if (x1 > x0 && y1 > y0) {
++            for (int32_t row = y0; row < y1; ++row) {
++                const uint8_t *src = bitmap->buffer + (ptrdiff_t)(row - dest_y) * bitmap->pitch;
++                uint8_t *dst = s->buffer + (size_t)row * (size_t)s->width_byte;
++                for (int32_t col = x0; col < x1; ++col)
++                    memset(dst + (size_t)col * (size_t)bpp, src[col - dest_x], (size_t)bpp);
++            }
++            ux0 = x0, uy0 = y0, uw = x1 - x0, uh = y1 - y0;
++        }
++    }
++    ++glyphs_rendered;
++    memset(out, 0, sizeof(*out));
++    out->update_rect.x = (uint32_t)max_i(ux0, 0);
++    out->update_rect.y = (uint32_t)max_i(uy0, 0);
++    out->update_rect.w = (uint32_t)uw;
++    out->update_rect.h = (uint32_t)uh;
++    out->surface_image.address = s->buffer ? s->buffer + (size_t)out->update_rect.y * (size_t)s->width_byte +
++                                             (size_t)out->update_rect.x * (size_t)bpp : NULL;
++    out->surface_image.width_byte = (uint32_t)s->width_byte;
++    out->surface_image.pixel_size_byte = (uint8_t)bpp;
++    const float advance_end = ceilf(x + m->horizontal.advance);
++    out->image_metrics.bearing_x = (float)((int32_t)floorf(x) + left) - x;
++    out->image_metrics.bearing_y = (float)top + floorf(y) - y;
++    out->image_metrics.advance = advance_end - x;
++    out->image_metrics.stride = fmaxf(advance_end, floorf(x) + (float)right) - x;
++    out->image_metrics.width = (uint32_t)gw;
++    out->image_metrics.height = (uint32_t)gh;
++    pthread_mutex_unlock(&lock);
++    return 0;
++}
++
++static const RuntimeExport exports[] = {
++    {"sceFontMemoryInit", font_ok}, {"sceFontCreateLibraryWithEdition", create_library},
++    {"sceFontCreateRendererWithEdition", create_renderer}, {"sceFontDestroyLibrary", destroy_handle},
++    {"sceFontDestroyRenderer", destroy_handle}, {"sceFontAttachDeviceCacheBuffer", font_ok},
++    {"sceFontSupportExternalFonts", font_ok}, {"sceFontSupportSystemFonts", font_ok},
++    {"sceFontSelectLibraryFt", font_ok}, {"sceFontSelectRendererFt", font_ok},
++    {"sceFontOpenFontMemory", open_font_memory}, {"sceFontOpenFontSet", open_font_set},
++    {"sceFontCloseFont", close_font}, {"sceFontBindRenderer", font_ok}, {"sceFontUnbindRenderer", font_ok},
++    {"sceFontSetScalePixel", set_scale_pixel}, {"sceFontSetupRenderScalePixel", set_scale_pixel},
++    {"sceFontGetHorizontalLayout", horizontal_layout}, {"sceFontGetCharGlyphMetrics", glyph_metrics},
++    {"sceFontGetKerning", kerning}, {"sceFontRenderSurfaceInit", render_surface_init},
++    {"sceFontRenderCharGlyphImage", render_glyph}, {"sceFontRenderCharGlyphImageHorizontal", render_glyph},
++};
++
++uintptr_t runtime_font_resolve(const char *name) { return RUNTIME_LOOKUP(exports, name); }
