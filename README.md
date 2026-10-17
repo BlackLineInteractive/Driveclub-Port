@@ -16,6 +16,12 @@ A native port of **Driveclub** (PS4, CUSA00003) to **macOS** and **Windows**.
 
 The sections below describe the macOS backend; the Windows backend (DCport) runs on a native PS4 runtime based on [Supermedo/bloodborne_pc](https://github.com/Supermedo/bloodborne_pc) and is documented in [`windows/README.md`](windows/README.md).
 
+**Windows (DCport):**
+
+![DCport launcher on Windows](windows/media/launcher.png)
+![DRIVECLUB BIKES on Windows, FSR 4](windows/media/ingame-bike.png)
+![Event preview on Windows, FSR 4](windows/media/ingame-track.png)
+
 This is not a general-purpose emulator. PS4 code is x86-64, so on Intel Macs it executes directly without CPU recompilation. We only replace what is console-specific: Sony system libraries (HLE) and the AMD Liverpool GPU (GCN) - with a custom Metal renderer tailored specifically for this single game.
 
 ## Architecture
