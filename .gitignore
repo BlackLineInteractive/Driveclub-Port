@@ -104,7 +104,7 @@ tools/config.ini
 # 5. Emulator Dumps, Caches & Submodules
 # ------------------------------------------------------------------------------
 /shadps4/
-/third_party/
+# third_party/shadps4 is the vendored Vulkan renderer (tracked)
 /emulator/
 
 # Shader dumps and pipeline caches

@@ -1,0 +1,5 @@
+# Default: macOS backend and shared repository files
+*            @BlackLineInteractive
+
+# Windows backend (DCport)
+/windows/    @qnfn

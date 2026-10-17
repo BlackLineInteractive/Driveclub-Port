@@ -2,10 +2,18 @@ cmake_minimum_required(VERSION 3.24)
 
 project(DriveclubNative LANGUAGES C CXX OBJC OBJCXX)
 
+# Backends
+#   macOS:          this tree, Metal renderer (src/gpu/metal), always built.
+#                   Optional second renderer: Vulkan (src/gpu/vulkan, shadPS4's
+#                   video_core on our command processor), DC_RENDERER=vulkan.
+#   Windows/Linux:  the DCport backend in windows/ (its own native runtime and
+#                   launcher, Vulkan); see windows/README.md. This tree's core
+#                   (src/core: loader, memory, signals, TLS) is macOS-only, so
+#                   it does not configure there.
 if (NOT APPLE)
-    # The renderer side is ready (DC_ENABLE_VULKAN), but the loader, memory
-    # manager, signals and TLS in src/core are still macOS/Mach-O specific.
-    message(FATAL_ERROR "Driveclub Native: the core (src/core) only runs on macOS for now")
+    message(FATAL_ERROR
+        "Driveclub Native: this tree (src/) builds the macOS backend only.\n"
+        "For Windows/Linux use the DCport backend: see windows/README.md.")
 endif()
 
 set(CMAKE_CXX_STANDARD 23)
@@ -22,7 +30,9 @@ set(CMAKE_OSX_ARCHITECTURES x86_64)
 
 find_package(SDL3 REQUIRED CONFIG)
 
-add_executable(driveclub
+# Platform core, HLE and the GPU front end (PM4, tiling, GCN decode) shared by
+# every renderer.
+set(DC_CORE_SOURCES
     src/main.mm
     src/common/log.h
     src/common/sha1.h
@@ -55,17 +65,6 @@ add_executable(driveclub
     src/gpu/shader/gcn_decode.cpp
     src/gpu/shader/program.h
     src/gpu/shader/program.cpp
-    src/gpu/shader/msl.h
-    src/gpu/shader/msl.cpp
-    src/gpu/shader/msl_prelude.h
-    src/gpu/metal/mtl_device.h
-    src/gpu/metal/mtl_device.mm
-    src/gpu/metal/mtl_presenter.h
-    src/gpu/metal/mtl_presenter.mm
-    src/gpu/metal/mtl_formats.h
-    src/gpu/metal/mtl_renderer.h
-    src/gpu/metal/mtl_compiler.mm
-    src/gpu/metal/mtl_renderer.mm
     src/hle/hle.cpp
     src/hle/hle.h
     src/hle/kernel/kernel.cpp
@@ -110,6 +109,23 @@ add_executable(driveclub
     src/hle/nid_db.inc
 )
 
+# Metal renderer (macOS): GCN -> MSL translation and the Metal backend.
+set(DC_METAL_SOURCES
+    src/gpu/shader/msl.h
+    src/gpu/shader/msl.cpp
+    src/gpu/shader/msl_prelude.h
+    src/gpu/metal/mtl_device.h
+    src/gpu/metal/mtl_device.mm
+    src/gpu/metal/mtl_presenter.h
+    src/gpu/metal/mtl_presenter.mm
+    src/gpu/metal/mtl_formats.h
+    src/gpu/metal/mtl_renderer.h
+    src/gpu/metal/mtl_compiler.mm
+    src/gpu/metal/mtl_renderer.mm
+)
+
+add_executable(driveclub ${DC_CORE_SOURCES} ${DC_METAL_SOURCES})
+
 target_include_directories(driveclub PRIVATE src)
 
 target_compile_options(driveclub PRIVATE
@@ -130,8 +146,9 @@ target_link_options(driveclub PRIVATE
     -Wl,-segaddr,GUEST_USER,0x1000000000
 )
 
-# Vulkan renderer (shadPS4's, third_party/shadps4): the Windows/Linux backend,
-# selectable on macOS too through MoltenVK with DC_RENDERER=vulkan.
+# Vulkan renderer (shadPS4's, third_party/shadps4) on our command processor,
+# selectable with DC_RENDERER=vulkan. Needs sparse buffers, which MoltenVK on
+# Intel Macs lacks; it is here for when src/core is ported off macOS.
 find_package(Vulkan QUIET)
 option(DC_ENABLE_VULKAN "Build the Vulkan renderer (shadPS4)" ${Vulkan_FOUND})
 if (DC_ENABLE_VULKAN)

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # macOS backend: src/ (Metal). Guest code runs natively, so the host must be x86_64.
+  macos:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: brew install cmake ninja sdl3
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DDC_ENABLE_VULKAN=OFF
+      - name: Build
+        run: cmake --build build && cmake --build build --target gcn_dis
+
+  # Windows backend: windows/ (DCport launcher and prepare tool).
+  windows-launcher:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows/launcher
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Dependencies
+        run: python -m pip install pillow pytest
+      - name: Tests
+        run: python -m pytest

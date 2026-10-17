@@ -1,7 +1,5 @@
 # Driveclub Native
 
-[![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/blacklineinteractive)
-[![Patreon](https://img.shields.io/badge/Patreon-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/BlacklineInteractive)
 [![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtube.com/@blacklineinteractive)
 
 ![LOGO](media/logo.png)
@@ -10,7 +8,7 @@
 A native port of **Driveclub** (PS4, CUSA00003) to **macOS** and **Windows**.
 
 | Platform | Game version | Renderer | Where | Maintainer |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | macOS (Intel) | v1.05 | Metal 3 | this repository's `src/` | [BlackLineInteractive](https://github.com/BlackLineInteractive) |
 | Windows 10/11 | v1.28 | Vulkan (shadPS4's renderer), FSR 3.1 / FSR 4 | [`windows/`](windows/README.md) — ready-to-play builds on the [Windows releases](https://github.com/qnfn/Driveclub-Port/releases) | [qnfn](https://github.com/qnfn) |
 
@@ -24,6 +22,16 @@ The sections below describe the macOS backend; the Windows backend (DCport) runs
 
 This is not a general-purpose emulator. PS4 code is x86-64, so on Intel Macs it executes directly without CPU recompilation. We only replace what is console-specific: Sony system libraries (HLE) and the AMD Liverpool GPU (GCN) - with a custom Metal renderer tailored specifically for this single game.
 
+## Repository layout
+
+| Path | Backend | Platform | What it is |
+| --- | --- | --- | --- |
+| `src/` | Metal (`src/gpu/metal`) | macOS | Our native runtime: ELF loader, HLE libraries, PM4 command processor, GCN → MSL |
+| `src/gpu/vulkan`, `third_party/shadps4` | Vulkan (experimental) | macOS today, Windows/Linux once `src/core` is ported | shadPS4's renderer on our command processor, `DC_RENDERER=vulkan` |
+| `windows/` | Vulkan (DCport) | Windows | Separate native runtime (bloodborne_pc + `runtime/driveclub-runtime.patch`), launcher, community patches |
+
+`src/` and `windows/` are independent: each has its own runtime and build, and changes to one do not affect the other. Fixes found on one side are worth checking on the other (both translate the same GCN/PM4 stream).
+
 ## Architecture
 
 ```
@@ -36,7 +44,7 @@ Sony HLE libraries ── libkernel, libc, Pad, AudioOut, VideoOut, Network/PSN 
 GPU frontend ── PM4 packet parsing, register state, GCN shaders -> IR
    │  src/gpu/renderer.h  (shared interface)
    ├──► Metal 3 (macOS)  - src/gpu/metal, IR -> MSL directly
-   └──► Vulkan (Windows/Linux) - src/gpu/vulkan: shadPS4's renderer (third_party/shadps4)
+   └──► Vulkan (experimental) - src/gpu/vulkan: shadPS4's renderer (third_party/shadps4)
 ```
 
 Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the command buffer itself and passes only the finished buffer to the driver (`sceGnmDraw*` are not imported). Therefore, the GPU layer operates at the PM4 + GCN shader level.
@@ -125,9 +133,3 @@ This project is licensed under the **GNU General Public License v2.0 or later (G
 - [shadPS4](https://github.com/shadps4-emu/shadPS4) - PS4 emulator, the primary source of knowledge on ELF loading, HLE libraries, PM4, and GCN shader recompilation. Its Vulkan renderer and shader recompiler are the Vulkan backend here (`third_party/shadps4`, GPL-2.0-or-later; see its README for the local changes).
 - [OpenGNM](https://ps4-opengnm.github.io/opengnm/) - documentation on PS4 Gnm and GCN shaders.
 - Windows backend: deadinside28 and Supermedo (native PS4 runtime), FireBurn (FSR-Vulkan, FSR 4 assets), akitaonrails and the patch authors; see [`windows/README.md`](windows/README.md).
-
-## Community & Support
-
-- **Ko-fi**: [ko-fi.com/blacklineinteractive](https://ko-fi.com/blacklineinteractive)
-- **Patreon**: [patreon.com/BlacklineInteractive](https://www.patreon.com/BlacklineInteractive)
-- **YouTube**: [youtube.com/@blacklineinteractive](https://youtube.com/@blacklineinteractive)
