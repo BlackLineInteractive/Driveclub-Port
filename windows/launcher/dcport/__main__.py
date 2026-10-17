@@ -19,6 +19,26 @@ def main(argv: list[str]) -> int:
 
     _taskbar_identity()  # before any window, in both modes
     paths = AppPaths.current()
+    if "--setup-fsr411" in argv:
+        # DriveClub.exe --setup-fsr411 <amd_fidelityfx_upscaler_dx12.dll>: SETUP's button without
+        # the window; progress and the result in fsr411-setup.log next to the launcher.
+        from pathlib import Path
+        from dcport import fsr411
+        dll = argv[argv.index("--setup-fsr411") + 1:][:1]
+        with open(paths.root / "fsr411-setup.log", "w", encoding="utf-8") as log:
+            def report(text: str) -> None:
+                log.write(text + "\n")
+                log.flush()
+            if not dll:
+                report("usage: DriveClub.exe --setup-fsr411 <amd_fidelityfx_upscaler_dx12.dll>")
+                return 2
+            try:
+                fsr411.build(paths, Path(dll[0]), report)
+            except fsr411.SetupError as e:
+                report(f"FAILED: {e}")
+                return 1
+            report("OK")
+        return 0
     if "--play" in argv:
         from dcport import play
         extra = list(argv[argv.index("--play") + 1:])

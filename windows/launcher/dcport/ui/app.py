@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
 
-from dcport import profiles, sysinfo
+from dcport import patches, profiles, sysinfo
 from dcport.game import art_path, game_info, has_eboot, ready_checks
 from dcport.ini import read_ini, update_ini
 from dcport.paths import AppPaths
@@ -25,12 +25,13 @@ from dcport.ui import theme
 from dcport.ui.controls import ControlsPage
 from dcport.ui.garage import GaragePage
 from dcport.ui.log import LogPage
+from dcport.ui.patches import PatchesPage
 from dcport.ui.race import RacePage
 from dcport.ui.setup import SetupPage
 
-TABS = ("race", "setup", "controls", "garage", "log")
-PAGES = {"race": RacePage, "setup": SetupPage, "controls": ControlsPage, "garage": GaragePage,
-         "log": LogPage}
+TABS = ("race", "setup", "patches", "controls", "garage", "log")
+PAGES = {"race": RacePage, "setup": SetupPage, "patches": PatchesPage, "controls": ControlsPage,
+         "garage": GaragePage, "log": LogPage}
 
 _GPU_CACHE: dict[str, "str | None"] = {}
 _WINDOW_POS = re.compile(r"[+-]-?\d+[+-]-?\d+")
@@ -600,6 +601,9 @@ class App(tk.Tk):
 
     def _start_game(self, gd: Path) -> None:
         s = self.settings
+        error = patches.build_for_session(self.paths, gd, s)
+        if error:
+            self.pages["race"].show_message(error)
         cmd = game_command(self.paths, gd, s.fps)
         env = game_env(self.paths, s, self.fsr, dict(os.environ))
         self._set_phase("running")
