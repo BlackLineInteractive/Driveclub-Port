@@ -41,7 +41,7 @@ Requirements: Windows 10/11 64-bit, a CPU with AVX, a Vulkan 1.3 GPU.
 
 ## Windows port credits
 
-DCport is built on other people's work: the native PS4 runtime by deadinside28 and Supermedo, and shadPS4's renderer. The Driveclub support, the launcher and the tools are new.
+DCport is built on other people's work: the native PS4 runtime by deadinside28 and Supermedo, and shadPS4's renderer. The Driveclub support, the fixes that make it playable (graphics glitches, lighting, frame rate, fonts, crashes), the launcher and the tools are new.
 
 - **[BlackLineInteractive](https://github.com/BlackLineInteractive/Driveclub-Port):** the original Driveclub Native project and the macOS backend; reference for Driveclub's system library behaviour.
 - **Native PS4 runtime:** deadinside28 ([bloodborne_pc](https://github.com/deadinside28/bloodborne_pc)) and the Windows port by Supermedo ([bloodborne_pc](https://github.com/Supermedo/bloodborne_pc)).
