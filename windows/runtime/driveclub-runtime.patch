@@ -1500,7 +1500,7 @@ index 7eaf065..1866655 100644
      vk::UniqueCommandPool command_pool;
      std::vector<Frame> present_frames;
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
-index c941f6b..a0a6292 100644
+index c941f6b..1b5853e 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
 @@ -3,8 +3,11 @@
@@ -1567,7 +1567,169 @@ index c941f6b..a0a6292 100644
      // bbport: scene color: a full-size RGBA16F target drawn with the scene depth.
      if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth() &&
          cb_descs[0].first && std::popcount(key.mrt_mask) <= 2) {
-@@ -440,6 +472,10 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
+@@ -408,6 +440,161 @@ bool Rasterizer::OnStageA() const {
+ namespace {
+ /// Stage A: cycles waited per drain site (BB_FRAME_STATS), keyed by function name and line.
+ std::unordered_map<const char*, std::unordered_map<u32, u64>> drain_sites;
++
++using Mat4 = std::array<std::array<double, 4>, 4>;
++
++Mat4 Load4(const float* f) {
++    Mat4 m{};
++    for (int i = 0; i < 16; ++i) m[i / 4][i % 4] = f[i];
++    return m;
++}
++
++void Store4(float* f, const Mat4& m) {
++    for (int i = 0; i < 16; ++i) f[i] = float(m[i / 4][i % 4]);
++}
++
++Mat4 Mul4(const Mat4& a, const Mat4& b) {
++    Mat4 r{};
++    for (int i = 0; i < 4; ++i)
++        for (int j = 0; j < 4; ++j)
++            for (int k = 0; k < 4; ++k) r[i][j] += a[i][k] * b[k][j];
++    return r;
++}
++
++bool Inverse4(const Mat4& m, Mat4& out) {
++    std::array<std::array<double, 8>, 4> a{};
++    for (int i = 0; i < 4; ++i) {
++        for (int j = 0; j < 4; ++j) a[i][j] = m[i][j];
++        a[i][4 + i] = 1.0;
++    }
++    for (int c = 0; c < 4; ++c) {
++        int p = c;
++        for (int r = c + 1; r < 4; ++r) {
++            if (std::abs(a[r][c]) > std::abs(a[p][c])) p = r;
++        }
++        if (std::abs(a[p][c]) < 1e-12) return false;
++        std::swap(a[c], a[p]);
++        const double pivot = a[c][c];
++        for (double& x : a[c]) x /= pivot;
++        for (int r = 0; r < 4; ++r) {
++            if (r == c) continue;
++            const double f = a[r][c];
++            for (int j = 0; j < 8; ++j) a[r][j] -= f * a[c][j];
++        }
++    }
++    for (int i = 0; i < 4; ++i)
++        for (int j = 0; j < 4; ++j) out[i][j] = a[i][4 + j];
++    return true;
++}
++
++/// Driveclub: the TAA resolve's motion blur covers the movement since the previous frame, so at
++/// 120 FPS it is a quarter of the game's 30 FPS look. k = the game's frame rate / 30 (measured
++/// between resolves) times dcport.ini motion_blur, so 1 looks like 30 FPS at any rate.
++/// Research only (BB_DC_BLUR_AUTO=1, or BB_DC_BLUR_SCALE=<k> for a fixed k): with the object
++/// transforms stretched the whole picture smears over time, even at k = 0, as if the game read
++/// them back for later frames; off by default (k = 1, nothing written).
++double DcBlurScale() {
++    static const double fixed_k = [] {
++        const char* env = std::getenv("BB_DC_BLUR_SCALE");
++        return env ? std::atof(env) : -1.0;
++    }();
++    static const bool automatic = std::getenv("BB_DC_BLUR_AUTO") != nullptr;
++    if (fixed_k < 0.0 && !automatic) {
++        return 1.0;
++    }
++    // Seconds per game frame, smoothed; a second resolve within 2 ms is the same frame.
++    static auto last = std::chrono::steady_clock::now();
++    static double frame_s = 1.0 / 30.0;
++    const auto now = std::chrono::steady_clock::now();
++    const double dt = std::chrono::duration<double>(now - last).count();
++    if (dt > 0.002) {
++        last = now;
++        if (dt < 0.25) {
++            frame_s += (dt - frame_s) * 0.1;
++        }
++    }
++    return fixed_k >= 0.0 ? fixed_k
++                          : std::clamp((1.0 / 30.0) / frame_s, 1.0, 8.0) *
++                                double(BbSettings::Get().motion_blur.load());
++}
++
++/// The resolve's object transforms, 48 dwords per object (the world, the cars): dwords 0..15 the
++/// object's movement since the previous frame (row vectors, near the identity), 16..31 its
++/// product with a fixed matrix Q (dc_motion.comp reads these rows) and 32..47 the inverse
++/// movement's. The movement is stretched by k and both products rebuilt from Q. An object the
++/// game did not rewrite since the last call keeps what was written then (not stretched twice).
++void DcScaleObjectMotion(float* objects, u32 count, double k) {
++    // Per buffer address: the game cycles through several copies of this buffer.
++    static std::unordered_map<const float*, std::vector<float>> written_by_buffer;
++    auto& written = written_by_buffer[objects];
++    if (written.size() < size_t(count) * 48) {
++        written.assign(size_t(count) * 48, std::nanf(""));
++    }
++    for (u32 o = 0; o < count; ++o) {
++        float* t = objects + o * 48;
++        float* w = written.data() + o * 48;
++        if (std::memcmp(t, w, 48 * 4) == 0) {
++            continue;
++        }
++        const Mat4 move = Load4(t);
++        // A camera cut or a teleport (large movement in one frame) is not stretched.
++        double change = 0.0;
++        for (int i = 0; i < 3; ++i)
++            for (int j = 0; j < 3; ++j) change = std::max(change, std::abs(move[i][j] - (i == j)));
++        if (change > 0.1 || std::abs(move[0][3]) + std::abs(move[1][3]) + std::abs(move[2][3]) > 1e-4 ||
++            std::abs(move[3][3] - 1.0) > 1e-4) {
++            continue;
++        }
++        Mat4 move_inv;
++        if (!Inverse4(move, move_inv)) {
++            continue;
++        }
++        const Mat4 q = Mul4(move_inv, Load4(t + 16));
++        Mat4 stretched{};
++        for (int i = 0; i < 4; ++i)
++            for (int j = 0; j < 4; ++j) {
++                const double id = i == j ? 1.0 : 0.0;
++                stretched[i][j] = id + k * (move[i][j] - id);
++            }
++        Mat4 stretched_inv;
++        if (!Inverse4(stretched, stretched_inv)) {
++            continue;
++        }
++        Store4(t, stretched);
++        Store4(t + 16, Mul4(stretched, q));
++        Store4(t + 32, Mul4(stretched_inv, q));
++        std::memcpy(w, t, 48 * 4);
++    }
++}
++
++/// Research (BB_DC_BLUR_CAMERA=1): the frame constants' camera movement stretched by k instead.
++/// Frame constants 0..15 are that movement (view now -> view before, row vectors), 16..31 its
++/// product with a fixed matrix Q and 48..63 the inverse movement's.
++void DcScaleCameraMotion(float* f0, double k) {
++    static const bool on = std::getenv("BB_DC_BLUR_CAMERA") != nullptr;
++    if (!on || std::abs(k - 1.0) < 0.05) {
++        return;
++    }
++    const Mat4 move = Load4(f0);
++    Mat4 move_inv, q;
++    if (!Inverse4(move, move_inv)) {
++        return;
++    }
++    q = Mul4(move_inv, Load4(f0 + 16));
++    Mat4 stretched{};
++    for (int i = 0; i < 4; ++i)
++        for (int j = 0; j < 4; ++j) {
++            const double id = i == j ? 1.0 : 0.0;
++            stretched[i][j] = id + k * (move[i][j] - id);
++        }
++    Mat4 stretched_inv;
++    if (!Inverse4(stretched, stretched_inv)) {
++        return;
++    }
++    Store4(f0, stretched);
++    Store4(f0 + 16, Mul4(stretched, q));
++    Store4(f0 + 48, Mul4(stretched_inv, q));
++}
+ } // namespace
+ 
+ void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
+@@ -440,6 +627,10 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
      return tid == liverpool->GetGpuCommandProcessorThreadId();
  }
  
@@ -1578,7 +1740,7 @@ index c941f6b..a0a6292 100644
  void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
      if (!draw_pipe || !size) {
          return;
-@@ -960,6 +996,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
+@@ -960,6 +1151,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
      // target is that frame.
      if (camera_motion->Enabled() && regs.color_buffers[0] &&
          FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
@@ -1588,7 +1750,7 @@ index c941f6b..a0a6292 100644
          scene_started = false;
          camera_motion->OnDisplayPass(cb_descs[0].first);
          if (upscaler->OnFrameStart()) {
-@@ -1108,7 +1147,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
+@@ -1108,7 +1302,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
      // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
      // full-screen quad leaves an edge column unwritten).
      draw_jitter = {};
@@ -1599,7 +1761,7 @@ index c941f6b..a0a6292 100644
          (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
          draw_jitter = upscaler->Jitter();
      }
-@@ -1240,7 +1281,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
+@@ -1240,7 +1436,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
      push_data.yoffset *= target_scale[1];
      pipeline->BindResources(set_writes, push_data);
      draw_jitter = {};
@@ -1610,7 +1772,7 @@ index c941f6b..a0a6292 100644
          draw_jitter = upscaler->Jitter();
      }
      UpdateDynamicState(pipeline, is_indexed);
-@@ -1315,6 +1358,114 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
+@@ -1315,6 +1513,150 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
      if (upscaler->Enabled()) {
          upscaler->OnDispatch(cs.pgm_hash);
      }
@@ -1622,7 +1784,21 @@ index c941f6b..a0a6292 100644
 +        cs.buffers.size() >= 2) {
 +        static std::unordered_map<u64, int> dumps;
 +        const int dumped = dumps[cs.pgm_hash]++;
-+        if (dumped < 3) {
++        // BB_DC_TAA_DUMP=<n>: every n-th resolve in full (all constant buffers), else the first 3.
++        static const int every = std::atoi(std::getenv("BB_DC_TAA_DUMP"));
++        if (every > 0 && dumped % every == 0) {
++            std::string line = fmt::format("DC TAA FULL {:08x} #{}", cs.pgm_hash, dumped);
++            for (size_t bi = 0; bi < cs.buffers.size(); ++bi) {
++                const auto sharp = cs.buffers[bi].GetSharp(cs);
++                if (!sharp.base_address || sharp.GetSize() > 1024) {
++                    continue;
++                }
++                const auto* f = reinterpret_cast<const float*>(sharp.base_address);
++                line += fmt::format(" | b{}:", bi);
++                for (u32 i = 0; i < sharp.GetSize() / 4; ++i) line += fmt::format(" {:.6g}", f[i]);
++            }
++            std::printf("%s\n", line.c_str());
++        } else if (every <= 0 && dumped < 3) {
 +            const auto b0 = cs.buffers[0].GetSharp(cs);
 +            const auto b1 = cs.buffers[1].GetSharp(cs);
 +            const auto* f0 = reinterpret_cast<const float*>(b0.base_address);
@@ -1636,8 +1812,7 @@ index c941f6b..a0a6292 100644
 +            std::printf("%s\n", line.c_str());
 +        }
 +    }
-+    // Driveclub: motion blur off in the TAA resolve itself (its strength, frame constant 96, is
-+    // 0 in scenes without blur), so the resolve and the upscaler keep running.
++    // Driveclub: camera motion blur scaled to the frame rate (DcScaleCameraMotion).
 +    // BB_DC_TAA_ZERO=<i>,<j>...: frame constants zeroed as well (finding others, e.g. DOF).
 +    if (TemporalUpscaler::IsDcTaa(cs.pgm_hash) && !cs.buffers.empty()) {
 +        static const std::vector<int> zero_extra = [] {
@@ -1656,12 +1831,10 @@ index c941f6b..a0a6292 100644
 +        const auto b0 = cs.buffers[0].GetSharp(cs);
 +        if (b0.base_address && b0.GetSize() >= 104 * 4) {
 +            auto* f0 = reinterpret_cast<float*>(b0.base_address);
-+            if (!BbSettings::Get().motion_blur) {
-+                f0[96] = 0.0f;
-+            }
 +            for (const int i : zero_extra) {
 +                f0[i] = 0.0f;
 +            }
++            DcScaleCameraMotion(f0, DcBlurScale());
 +        }
 +    }
 +    // BB_FG_STATS=1: how often the TAA resolve runs and reaches the upscaler.
@@ -1720,6 +1893,31 @@ index c941f6b..a0a6292 100644
 +                                static_cast<unsigned long long>(cs.pgm_hash));
 +                }
 +            }
++        }
++    }
++    // Driveclub: motion blur scaled to the frame rate, after the upscaler took its motion from
++    // the same transforms (its copy is already recorded).
++    if (TemporalUpscaler::IsDcTaa(cs.pgm_hash) && cs.buffers.size() >= 3) {
++        const auto b0 = cs.buffers[0].GetSharp(cs);
++        const auto b2 = cs.buffers[2].GetSharp(cs);
++        const double k = DcBlurScale();
++        static const bool blur_debug = std::getenv("BB_DC_BLUR_DEBUG") != nullptr;
++        static int blur_calls = 0;
++        if (blur_debug && b0.base_address && b2.base_address && blur_calls++ % 60 == 0) {
++            const auto* f = reinterpret_cast<const float*>(b0.base_address);
++            const auto* o = reinterpret_cast<const float*>(b2.base_address);
++            std::string line = fmt::format("DC BLUR k={:.3f} size={} | f0 32..47:", k, b2.GetSize());
++            for (int i = 32; i < 48; ++i) line += fmt::format(" {:.6g}", f[i]);
++            for (int obj = 0; obj < 3; ++obj) {
++                line += fmt::format(" | obj{} 0..47:", obj);
++                for (int i = 0; i < 48; ++i) line += fmt::format(" {:.6g}", o[obj * 48 + i]);
++            }
++            std::printf("%s\n", line.c_str());
++        }
++        if (b0.base_address && b0.GetSize() >= 104 * 4 && b2.base_address &&
++            std::abs(k - 1.0) >= 0.05) {
++            DcScaleObjectMotion(reinterpret_cast<float*>(b2.base_address),
++                                u32(b2.GetSize() / (48 * 4)), k);
 +        }
 +    }
      if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
@@ -2862,7 +3060,7 @@ index 494d151..85c8231 100644
      g_window_thread = std::thread([title, width, height] {
          Common::SetCurrentThreadName("bb:window");
 diff --git a/gpu/shim/bbport_overlay.cpp b/gpu/shim/bbport_overlay.cpp
-index c6f7c9a..7133dea 100644
+index c6f7c9a..9d48f3b 100644
 --- a/gpu/shim/bbport_overlay.cpp
 +++ b/gpu/shim/bbport_overlay.cpp
 @@ -7,10 +7,12 @@
@@ -2977,7 +3175,7 @@ index c6f7c9a..7133dea 100644
  
      bool restart = s.object_motion != s.startup_object_motion ||
                     s.model_lod != s.startup_model_lod ||
-@@ -371,8 +389,18 @@ void Menu() {
+@@ -371,6 +389,15 @@ void Menu() {
          }
      }
  
@@ -2992,11 +3190,8 @@ index c6f7c9a..7133dea 100644
 +    } // !no_upscaler
      ImGui::SeparatorText("Other");
      Checkbox("Show FPS counter", s.show_fps);
-+    Checkbox("Motion blur", s.motion_blur);
  
-     ImGui::Spacing();
-     if (ImGui::Button("Close")) {
-@@ -397,7 +425,7 @@ void Menu() {
+@@ -397,7 +424,7 @@ void Menu() {
          quit_armed = false;
      }
      ImGui::SameLine();
@@ -3005,7 +3200,7 @@ index c6f7c9a..7133dea 100644
      ImGui::End();
      if (!keep_open) {
          SetOpen(false);
-@@ -440,14 +468,39 @@ void FpsCounter() {
+@@ -440,14 +467,39 @@ void FpsCounter() {
                       ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                       ImGuiWindowFlags_NoFocusOnAppearing);
      const auto& s = BbSettings::Get();
@@ -3053,7 +3248,7 @@ index c6f7c9a..7133dea 100644
      ImGui::End();
  }
  
-@@ -464,14 +517,54 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count)
+@@ -464,14 +516,54 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count)
      io.IniFilename = nullptr; // window positions are not kept
      io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
      io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
@@ -3110,7 +3305,7 @@ index c6f7c9a..7133dea 100644
  
      ImFontConfig font_config;
      font_config.FontDataOwnedByAtlas = false;
-@@ -633,7 +726,7 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
+@@ -633,7 +725,7 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
      text_entry_text = text;
  }
  
@@ -3119,7 +3314,7 @@ index c6f7c9a..7133dea 100644
      // Present interval for the FPS readout (measured also while nothing is drawn).
      const auto now = std::chrono::steady_clock::now();
      const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
-@@ -641,6 +734,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+@@ -641,6 +733,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
      if (ms > 0.0f && ms < 1000.0f) {
          frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
      }
@@ -3153,7 +3348,7 @@ index acc89b0..7f8ede9 100644
  /// The menu is open or a text entry is shown: the game's input is held neutral.
  bool CapturesInput();
 diff --git a/gpu/shim/bbport_settings.cpp b/gpu/shim/bbport_settings.cpp
-index 7743165..c6318c2 100644
+index 7743165..54a74c7 100644
 --- a/gpu/shim/bbport_settings.cpp
 +++ b/gpu/shim/bbport_settings.cpp
 @@ -14,7 +14,7 @@ namespace {
@@ -3172,7 +3367,7 @@ index 7743165..c6318c2 100644
 +    } else if (key == "frame_gen") {
 +        v.frame_gen = i != 0;
 +    } else if (key == "motion_blur") {
-+        v.motion_blur = i != 0;
++        v.motion_blur = Clamp(f, 0.0f, 2.0f); // older files: 1 (on) or 0 (off)
      } else if (key == "fsr4_auto_exposure") {
          v.fsr4_auto_exposure = i != 0;
      } else if (key == "fsr4_invert_jitter") {
@@ -3223,13 +3418,13 @@ index 7743165..c6318c2 100644
                   "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                   "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
 -                 "debug_view=%d\nshow_fps=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
-+                 "debug_view=%d\nshow_fps=%d\nframe_gen=%d\nmotion_blur=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
++                 "debug_view=%d\nshow_fps=%d\nframe_gen=%d\nmotion_blur=%.2f\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
                   UpscalerName(v.upscaler), v.preset.load(), int(v.sharpen.load()),
                   v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),
                   int(v.object_motion.load()),
                   v.reactive_scale.load(), v.reactive_threshold.load(), v.reactive_max.load(),
 -                 v.debug_view.load(), int(v.show_fps.load()),
-+                 v.debug_view.load(), int(v.show_fps.load()), int(v.frame_gen.load()), int(v.motion_blur.load()),
++                 v.debug_view.load(), int(v.show_fps.load()), int(v.frame_gen.load()), double(v.motion_blur.load()),
                   int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()));
      // Read by patches.py at start.
      for (int e = 0; e < EffectCount; ++e) {
@@ -3242,7 +3437,7 @@ index 7743165..c6318c2 100644
  }
  
 diff --git a/gpu/shim/bbport_settings.h b/gpu/shim/bbport_settings.h
-index 254cfcb..ca9474c 100644
+index 254cfcb..11f0b65 100644
 --- a/gpu/shim/bbport_settings.h
 +++ b/gpu/shim/bbport_settings.h
 @@ -74,6 +74,11 @@ struct Values {
@@ -3251,9 +3446,9 @@ index 254cfcb..ca9474c 100644
      std::atomic<bool> show_fps{false};
 +    /// Driveclub: FSR 3 frame generation, one generated frame before each real one (needs FSR).
 +    std::atomic<bool> frame_gen{false};
-+    /// Driveclub: the TAA resolve's motion blur (off: its strength constant set to 0, so the
-+    /// resolve, its anti-aliasing and the upscaler keep running).
-+    std::atomic<bool> motion_blur{true};
++    /// Driveclub research (BB_DC_BLUR_AUTO=1, not in the menu): motion blur strength, 1 = the
++    /// game's 30 FPS look at any frame rate, 0 = none, up to 2 (vk_rasterizer.cpp DcBlurScale).
++    std::atomic<float> motion_blur{1.0f};
      // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
      std::atomic<bool> fsr4_auto_exposure{true};
      std::atomic<bool> fsr4_invert_jitter{false};

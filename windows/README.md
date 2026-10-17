@@ -28,6 +28,11 @@ Nothing of AMD's is in the download or in this repository: every player builds i
 
 Also new: **FSR in every race** (0.2.0's FSR ran in menus only), **FSR 3 frame generation** with a HUD-less copy of each frame, a **PATCHES** tab, window size and render resolution settings.
 
+## 0.3.3 hotfix
+
+- SETUP > Threading now shows the choice you click (it saved it, but kept showing Auto).
+- The in-game menu's Motion blur checkbox is gone: it did not change the blur. To turn motion blur off, use PATCHES > "No motion blur or depth of field". The game's blur covers the movement between two frames, so it looks weaker above 30 FPS; 30 FPS shows the original look.
+
 ## 0.3.2 hotfix
 
 - **Crash at 4K / under memory pressure fixed** (seen on an RTX 3080 10 GB within a minute: "FreeDeferred on an allocation that is not held"): two threads used the same staging-buffer list without a lock.

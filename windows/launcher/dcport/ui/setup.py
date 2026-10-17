@@ -532,6 +532,7 @@ class SetupPage(tk.Frame):
 
     def set_threading(self, value: str) -> None:
         self._show_status(self.app.update_game_ini({"threaded_recording": value}) or "")
+        self.threading_choice.set(threading_value(self.app.game_ini()))
 
     def set_frame_gen(self, on: bool) -> None:
         self._show_status(self.app.update_game_ini({"frame_gen": "1" if on else "0"}) or "")
