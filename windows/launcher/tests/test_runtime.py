@@ -86,3 +86,12 @@ def test_frame_gen_halves_the_game_frame_rate(tmp_path):
     assert e["BB_FPS_LIMIT"] == "120"
     paths.ini.write_text("frame_gen=0\n", encoding="utf-8")
     assert game_env(paths, LauncherSettings(fps=120), fsr=True, base={})["BB_FPS_LIMIT"] == "120"
+
+
+def test_threaded_recording_setting(tmp_path):
+    paths = AppPaths.for_root(tmp_path)
+    paths.ini.parent.mkdir(parents=True, exist_ok=True)
+    for value, expected in (("0", "0"), ("1", "1"), ("auto", None), ("", None)):
+        paths.ini.write_text(f"threaded_recording={value}" + chr(10), encoding="utf-8")
+        e = game_env(paths, LauncherSettings(), fsr=True, base={"BB_THREADED_RECORDING": "1"})
+        assert e.get("BB_THREADED_RECORDING") == expected

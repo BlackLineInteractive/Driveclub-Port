@@ -29,12 +29,16 @@ def fps_note(fps: int) -> str:
     return ""
 
 
+def _ini_value(paths: AppPaths, key: str, default: str) -> str:
+    try:
+        return read_ini(paths.ini).get(key, default).strip()
+    except OSError:
+        return default
+
+
 def frame_gen_on(paths: AppPaths) -> bool:
     """dcport.ini's frame_gen (the SETUP page or the game's menu writes it)."""
-    try:
-        return read_ini(paths.ini).get("frame_gen", "0").strip() == "1"
-    except OSError:
-        return False
+    return _ini_value(paths, "frame_gen", "0") == "1"
 
 
 def game_command(paths: AppPaths, game_dir: Path, fps: int,
@@ -63,6 +67,12 @@ def game_env(paths: AppPaths, s: LauncherSettings, fsr: bool,
         "BB_WINDOW_SIZE": "{}x{}".format(*window_size(s.window_size)),
         "BB_DMEM_MB": str(dmem_mb(s)),
     })
+    # dcport.ini threaded_recording=0/1 (SETUP > Threading); Auto (anything else) lets the
+    # runtime decide: off on AMD RX 6000 and older, on elsewhere.
+    env.pop("BB_THREADED_RECORDING", None)
+    threading = _ini_value(paths, "threaded_recording", "auto")
+    if threading in ("0", "1"):
+        env["BB_THREADED_RECORDING"] = threading
     if s.fps == 30:
         env["BB_VBLANK_HZ"] = "60"
         env["BB_FPS_LIMIT"] = "0"

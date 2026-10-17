@@ -84,12 +84,12 @@ def ready_checks(game_dir: Path, paths: AppPaths, gpu: "str | None",
     info = game_info(game_dir)
     if not has_eboot(game_dir):
         game = Check("Choose the DRIVECLUB folder", "bad")
-    elif info and info.title_id == "CUSA00003" and info.app_ver == "01.28":
-        game = Check("DRIVECLUB 1.28", "ok")
+    elif info and info.app_ver == "01.28":  # any region; prepare/dc_patches.py checks the same
+        game = Check(f"DRIVECLUB {info.title_id} v01.28", "ok")
     else:
         tid = info.title_id if info else "unknown"
         ver = info.app_ver if info else "unknown"
-        game = Check(f"Game {tid} v{ver}: patches need 1.28", "warn")
+        game = Check(f"Game {tid} v{ver}: patches need v01.28", "warn")
     saves = Check("Saves found", "ok") if _has_saves(paths) else Check("No saves yet", "warn")
     graphics = Check(gpu, "ok") if gpu else Check("Graphics card: checking…", "warn")
     files = (Check("Game files prepared", "ok") if prepared

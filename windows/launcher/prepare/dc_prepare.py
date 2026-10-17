@@ -37,7 +37,7 @@ def main():
     data.mkdir(parents=True, exist_ok=True)
     for name in ('eboot.bin', 'sce_sys/param.sfo', 'sce_module/libc.prx', 'sce_module/libSceFios2.prx'):
         if not (game / name).is_file():
-            print(f'Missing {name} in {game}: choose the DRIVECLUB folder (CUSA00003)')
+            print(f'Missing {name} in {game}: choose the DRIVECLUB folder')
             return 1
     prepare.prepare(game, data)
     link_modules.link(game, data, MODULES)

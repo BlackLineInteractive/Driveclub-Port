@@ -370,7 +370,7 @@ def test_run_task_reports_on_the_ui_thread(tmp_path):
 
 
 def test_version_and_bundled_resources(monkeypatch, tmp_path):
-    assert dcport.__version__ == "0.3.0"
+    assert dcport.__version__ == "0.3.3"
     assert theme.default_controls() == DEFAULT_INPUT.resolve()
     assert theme.assets_dir() == DEFAULT_INPUT.resolve().parent / "assets"
     monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
@@ -1060,5 +1060,19 @@ def test_startup_recovery_locks_saves_and_reports_on_garage(tmp_path):
         pump(app, lambda: not app.recovering)
         assert (paths.user / "savedata" / "f").read_bytes() == b"1"
         assert "Moved your saves back" in app.pages["garage"].status_text()
+    finally:
+        app.destroy()
+
+
+def test_setup_threading_switch_shows_the_choice(tmp_path):
+    paths, _ = configured_port(tmp_path, prepared=True)
+    app = App(paths, fsr=False)
+    try:
+        app.show("setup"); page = app.pages["setup"]
+        assert page.threading_choice.value == "auto"
+        for value in ("1", "0", "auto"):
+            page.set_threading(value)
+            assert page.threading_choice.value == value
+            assert read_ini(paths.ini)["threaded_recording"] == value
     finally:
         app.destroy()
