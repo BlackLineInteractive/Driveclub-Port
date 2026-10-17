@@ -23,11 +23,69 @@ index d35e804..2589ec6 100644
      # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
      # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
      target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
+diff --git a/gpu/bbnet/vendor/shadps4/core/libraries/np/np_party.cpp b/gpu/bbnet/vendor/shadps4/core/libraries/np/np_party.cpp
+index 0fcf416..78758a4 100644
+--- a/gpu/bbnet/vendor/shadps4/core/libraries/np/np_party.cpp
++++ b/gpu/bbnet/vendor/shadps4/core/libraries/np/np_party.cpp
+@@ -10,7 +10,12 @@
+ namespace Libraries::Np::NpParty {
+ 
+ s32 PS4_SYSV_ABI sceNpPartyCheckCallback() {
+-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
++    // Polled every frame; log once so it doesn't flood the log.
++    static bool logged = false;
++    if (!logged) {
++        logged = true;
++        LOG_ERROR(Lib_NpParty, "(STUBBED) called");
++    }
+     return ORBIS_OK;
+ }
+ 
 diff --git a/gpu/shadps4/core/libraries/videoout/driver.cpp b/gpu/shadps4/core/libraries/videoout/driver.cpp
-index 35b0f1b..b3efa63 100644
+index 35b0f1b..c871364 100644
 --- a/gpu/shadps4/core/libraries/videoout/driver.cpp
 +++ b/gpu/shadps4/core/libraries/videoout/driver.cpp
-@@ -454,6 +454,26 @@ void VideoOutDriver::Flip(const Request& req) {
+@@ -300,6 +300,39 @@ void VideoOutDriver::Flip(const Request& req) {
+ 
+     // bbport: BB_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
+     static const bool frame_stats = EmulatorSettingsImpl::Flag("BB_FRAME_STATS", false);
++    if (!frame_stats) {
++        // A stutter line in every log (cheap counters only): a flip at least 50 ms and three
++        // times the usual frame apart, with what the GPU thread did meanwhile.
++        using Clock = std::chrono::steady_clock;
++        static Clock::time_point last = Clock::now();
++        static double usual_ms = 16.7;
++        static u64 last_compiles, last_compile_ns, last_images, last_upload;
++        static u32 printed;
++        const auto now = Clock::now();
++        const double frame_ms = std::chrono::duration<double, std::milli>(now - last).count();
++        last = now;
++        const u64 compiles = Vulkan::g_bb_compiles.load(std::memory_order_relaxed);
++        const u64 compile_ns = Vulkan::g_bb_compile_ns.load(std::memory_order_relaxed);
++        const u64 images = BbStats::images_registered.load(std::memory_order_relaxed);
++        const u64 upload = BbStats::image_upload_bytes.load(std::memory_order_relaxed) +
++                           BbStats::buffer_upload_bytes.load(std::memory_order_relaxed);
++        if (frame_ms >= 50.0 && frame_ms >= 3.0 * usual_ms && printed < 200) {
++            ++printed;
++            std::printf("Hitch: %.0f ms frame (usual %.1f ms): %llu shader compiles (%.0f ms), "
++                        "%llu new images, %.1f MB uploaded\n",
++                        frame_ms, usual_ms,
++                        static_cast<unsigned long long>(compiles - last_compiles),
++                        (compile_ns - last_compile_ns) / 1e6,
++                        static_cast<unsigned long long>(images - last_images),
++                        (upload - last_upload) / 1e6);
++        } else if (frame_ms < 250.0) {
++            usual_ms += (frame_ms - usual_ms) * 0.05;
++        }
++        last_compiles = compiles;
++        last_compile_ns = compile_ns;
++        last_images = images;
++        last_upload = upload;
++    }
+     if (frame_stats) {
+         using Clock = std::chrono::steady_clock;
+         static Clock::time_point window_start = Clock::now(), last = window_start;
+@@ -454,6 +487,26 @@ void VideoOutDriver::Flip(const Request& req) {
                          BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                          frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                          frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
@@ -370,8 +428,687 @@ index 8c9d802..b087210 100644
  add_host_shader(ms_image_blit.frag ms_image_blit_frag)
  add_host_shader(ms_image_blit.frag ms_image_blit_msaa_frag SRC_MSAA=1)
  add_host_shader(fault_buffer_process.comp fault_buffer_process_comp)
+diff --git a/gpu/shadps4/video_core/host_shaders/dc_merge.comp b/gpu/shadps4/video_core/host_shaders/dc_merge.comp
+new file mode 100644
+index 0000000..0fbf48a
+--- /dev/null
++++ b/gpu/shadps4/video_core/host_shaders/dc_merge.comp
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Driveclub: the upscaled scene back into the game's R11G11B10 scene color, stored as the
++// color block would (negatives and NaN as 0, overflow as the largest finite value).
++#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++
++layout(local_size_x = 8, local_size_y = 8) in;
++
++layout(binding = 0) uniform texture2D upscaled;
++layout(binding = 1) uniform writeonly image2D scene_img;
++layout(binding = 2) uniform texture2D motion_tex; // pixels, previous - current
++
++layout(push_constant) uniform Constants {
++    uvec2 size;
++    uint mode; // 0 upscaled scene, 1 motion vectors (BB_DC_DEBUG_MOTION=1)
++};
++
++void main() {
++    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
++    if (any(greaterThanEqual(uvec2(pixel), size))) {
++        return;
++    }
++    vec3 color = texelFetch(upscaled, pixel, 0).rgb;
++    if (mode == 1u) {
++        // Motion: red right, green down, blue its length; 0.5 is still (16 px full scale).
++        const vec2 m = texelFetch(motion_tex, pixel, 0).xy;
++        color = vec3(0.5 + m / 32.0, length(m) / 16.0) * 0.5;
++    }
++    const vec3 stored = mix(vec3(0.0), min(color, vec3(65024.0)), greaterThan(color, vec3(0.0)));
++    imageStore(scene_img, pixel, vec4(stored, 1.0));
++}
+diff --git a/gpu/shadps4/video_core/host_shaders/dc_motion.comp b/gpu/shadps4/video_core/host_shaders/dc_motion.comp
+new file mode 100644
+index 0000000..f6e37c5
+--- /dev/null
++++ b/gpu/shadps4/video_core/host_shaders/dc_motion.comp
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Driveclub: motion vectors for the temporal upscaler, by the reprojection of the game's own TAA
++// resolve (compute shader 0x403f86d4): the view position from the depth and the frame's view
++// ray, through the current -> previous transform of the pixel's object (the world or a car),
++// projected with the previous frame's camera. Pixels, previous - current, like camera_motion.
++#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++
++layout(local_size_x = 8, local_size_y = 8) in;
++
++// The TAA resolve's buffers: frame constants, camera constants, and the object transforms
++// (48 dwords per object; rows 16, 20, 24, 28 map view x, y, z and 1 to the previous clip).
++layout(binding = 0, std430) readonly buffer Frame { uint frame_data[]; };
++layout(binding = 1, std430) readonly buffer Camera { uint camera_data[]; };
++layout(binding = 2, std430) readonly buffer Objects { uint object_data[]; };
++layout(binding = 3) uniform texture2D gbuffer_tex; // RGBA8; alpha * 255, low 6 bits: object
++layout(binding = 4) uniform texture2D depth_tex;   // D32, reversed (1 = near)
++layout(binding = 5, rg16f) uniform writeonly image2D motion_img;
++// The depth as it is now, for frame generation at the flip (the game may reuse its target).
++layout(binding = 6, r32f) uniform writeonly image2D depth_copy_img;
++
++layout(push_constant) uniform Constants {
++    vec2 size;      // pixels
++    vec2 jitter;    // this frame's viewport shift in pixels (x right, y down)
++    uvec4 offsets;  // dwords from each binding's (aligned) start to the game's buffer
++};
++
++float F(uint v) {
++    return uintBitsToFloat(v);
++}
++
++float Fr(uint i) { return F(frame_data[offsets.x + i]); }
++float Ca(uint i) { return F(camera_data[offsets.y + i]); }
++
++vec4 Row(uint base) {
++    base += offsets.z;
++    return vec4(F(object_data[base]), F(object_data[base + 1u]), F(object_data[base + 2u]),
++                F(object_data[base + 3u]));
++}
++
++void main() {
++    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
++    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
++        return;
++    }
++    // Depth was rasterised through a shifted viewport: the unjittered position, and no jitter
++    // in the motion vectors.
++    const vec2 uv = (vec2(pixel) + 0.5) / size - jitter / size;
++    const float depth = texelFetch(depth_tex, pixel, 0).r;
++    imageStore(depth_copy_img, pixel, vec4(depth));
++    const uint object = uint(texelFetch(gbuffer_tex, pixel, 0).a * 255.0 + 0.5) & 63u;
++
++    const float ray_x = (Fr(76u) * uv.x + Fr(78u)) * Fr(94u) + Fr(92u);
++    const float ray_y = (Fr(77u) * uv.y + Fr(79u)) * Fr(95u) + Fr(93u);
++    const float z = 1.0 / -(Ca(118u) * depth + Ca(119u));
++    const float view_x = z * ray_x;
++    const float view_y = z * ray_y;
++
++    const uint base = object * 48u;
++    const vec4 col_x = Row(base + 16u), col_y = Row(base + 20u), col_z = Row(base + 24u),
++               col_w = Row(base + 28u);
++    const vec4 prev_clip = view_x * col_x + view_y * col_y - z * col_z + col_w;
++    const vec2 prev_uv =
++        vec2(Ca(100u), Ca(101u)) * prev_clip.xy / prev_clip.w + vec2(Ca(102u), Ca(103u));
++    imageStore(motion_img, pixel, vec4((prev_uv - uv) * size, 0.0, 0.0));
++}
+diff --git a/gpu/shadps4/video_core/host_shaders/ms_depth_to_color.frag b/gpu/shadps4/video_core/host_shaders/ms_depth_to_color.frag
+new file mode 100644
+index 0000000..941eb89
+--- /dev/null
++++ b/gpu/shadps4/video_core/host_shaders/ms_depth_to_color.frag
+@@ -0,0 +1,25 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#version 450 core
++#extension GL_EXT_samplerless_texture_functions : require
++
++// Resolves a multi-sample depth image into a single-sample color image.
++// Source is bound with aspect=Depth; destination is any Rxf color format
++// whose R channel will receive the depth value. G/B left at 0, A at 1 so
++// a shader that reads this as a sampler2D and swizzles to .rrrr or .r
++// sees the expected depth value either way.
++//
++// Sample 0 is representative — averaging all samples would be wrong for
++// depth-based effects that want a specific visibility decision rather than
++// an intermediate value.
++
++layout (binding = 0, set = 0) uniform texture2DMS depth_ms;
++
++layout (location = 0) out vec4 out_color;
++
++void main()
++{
++    const float d = texelFetch(depth_ms, ivec2(gl_FragCoord.xy), 0).r;
++    out_color = vec4(d, 0.0, 0.0, 1.0);
++}
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_frame_generation.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_frame_generation.cpp
+new file mode 100644
+index 0000000..d2f202a
+--- /dev/null
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_frame_generation.cpp
+@@ -0,0 +1,469 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include "video_core/renderer_vulkan/vk_frame_generation.h"
++
++#include <cstdio>
++#include <cstdlib>
++
++#include "bbport_settings.h"
++#include "ffx_vk_portable.h"
++#include "video_core/renderer_vulkan/vk_instance.h"
++#include "video_core/renderer_vulkan/vk_presenter.h"
++
++namespace Vulkan {
++namespace {
++
++constexpr vk::Format SourceFormat = vk::Format::eR8G8B8A8Unorm;
++
++FfxVkPortableImage Describe(vk::Image image, vk::Format format, u32 width, u32 height,
++                            vk::ImageUsageFlags usage, FfxVkPortableResourceState state) {
++    FfxVkPortableImage out{};
++    out.structSize = sizeof(out);
++    out.image = image;
++    out.format = static_cast<VkFormat>(format);
++    out.extent = {width, height};
++    out.mipCount = 1;
++    out.arrayLayers = 1;
++    out.usage = static_cast<VkImageUsageFlags>(usage);
++    out.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
++    out.state = state;
++    return out;
++}
++
++FfxVkPortableImage None() {
++    FfxVkPortableImage out{};
++    out.structSize = sizeof(out);
++    return out;
++}
++
++void PrintIssues(const char* what, u64 issues) {
++    std::printf("Frame generation: %s invalid:", what);
++    for (u32 bit = 0; bit < 64; ++bit) {
++        if (issues & (1ull << bit)) {
++            std::printf(" %s", ffxVkPortableValidationIssueName(1ull << bit));
++        }
++    }
++    std::printf("\n");
++}
++
++vk::Image CreateImage(const Instance& instance, u32 w, u32 h, vk::ImageUsageFlags usage,
++                      VmaAllocation& allocation, vk::Format format = SourceFormat) {
++    const VkImageCreateInfo info = static_cast<VkImageCreateInfo>(vk::ImageCreateInfo{
++        .imageType = vk::ImageType::e2D,
++        .format = format,
++        .extent = {w, h, 1},
++        .mipLevels = 1,
++        .arrayLayers = 1,
++        .samples = vk::SampleCountFlagBits::e1,
++        .tiling = vk::ImageTiling::eOptimal,
++        .usage = usage,
++        .initialLayout = vk::ImageLayout::eUndefined,
++    });
++    const VmaAllocationCreateInfo alloc{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
++    VkImage image{};
++    if (vmaCreateImage(instance.GetAllocator(), &info, &alloc, &image, &allocation, nullptr) !=
++        VK_SUCCESS) {
++        allocation = {};
++        return {};
++    }
++    return vk::Image{image};
++}
++
++bool settings_on() {
++    const auto& s = BbSettings::Get();
++    return s.frame_gen && s.upscaler != BbSettings::UpscalerOff;
++}
++
++void Barrier(vk::CommandBuffer cmdbuf, vk::Image image, vk::ImageLayout from, vk::ImageLayout to,
++             vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
++             vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
++    const vk::ImageMemoryBarrier2 barrier{
++        .srcStageMask = src_stage,
++        .srcAccessMask = src_access,
++        .dstStageMask = dst_stage,
++        .dstAccessMask = dst_access,
++        .oldLayout = from,
++        .newLayout = to,
++        .image = image,
++        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
++    };
++    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
++}
++
++} // namespace
++
++FrameGenerator::FrameGenerator(const Instance& instance_) : instance{instance_} {}
++
++FrameGenerator::~FrameGenerator() {
++    DestroyContext();
++}
++
++void FrameGenerator::DestroyContext() {
++    if (context || color_image) {
++        (void)instance.GetDevice().waitIdle();
++    }
++    if (context) {
++        ffxVkPortableFrameGenerationContextDestroy(context);
++        context = nullptr;
++    }
++    if (color_image) {
++        vmaDestroyImage(instance.GetAllocator(), VkImage(color_image), color_allocation);
++        color_image = vk::Image{};
++        color_allocation = {};
++    }
++    if (hudless_image) {
++        vmaDestroyImage(instance.GetAllocator(), VkImage(hudless_image), hudless_allocation);
++        hudless_image = vk::Image{};
++        hudless_allocation = {};
++    }
++    if (small_depth) {
++        vmaDestroyImage(instance.GetAllocator(), VkImage(small_depth), small_depth_allocation);
++        small_depth = vk::Image{};
++        small_depth_allocation = {};
++    }
++    if (small_motion) {
++        vmaDestroyImage(instance.GetAllocator(), VkImage(small_motion), small_motion_allocation);
++        small_motion = vk::Image{};
++        small_motion_allocation = {};
++    }
++    render_w = render_h = display_w = display_h = 0;
++    have_previous = false;
++}
++
++void FrameGenerator::DestroyGenerated(const Instance& instance, Frame& frame) {
++    if (frame.gen_image) {
++        vmaDestroyImage(instance.GetAllocator(), VkImage(frame.gen_image), frame.gen_allocation);
++        frame.gen_image = vk::Image{};
++        frame.gen_allocation = {};
++    }
++    frame.gen_width = frame.gen_height = 0;
++    frame.has_generated = false;
++}
++
++bool FrameGenerator::EnsureContext(u32 rw, u32 rh, u32 dw, u32 dh) {
++    if (context && rw == render_w && rh == render_h && dw == display_w && dh == display_h) {
++        return true;
++    }
++    DestroyContext();
++
++    FfxVkPortableDeviceInfo device_info{};
++    device_info.structSize = sizeof(device_info);
++    device_info.instance = instance.GetInstance();
++    device_info.physicalDevice = instance.GetPhysicalDevice();
++    device_info.device = instance.GetDevice();
++    device_info.getDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
++    device_info.queue = instance.GetGraphicsQueue();
++    device_info.queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex();
++    device_info.shaderFloat16Enabled = instance.IsShaderFloat16Enabled();
++    device_info.subgroupSizeControlEnabled = instance.IsSubgroupSizeControlEnabled();
++    device_info.synchronization2Enabled = VK_TRUE;
++    device_info.shaderStorageImageWriteWithoutFormatEnabled = VK_TRUE;
++
++    FfxVkPortableFrameGenerationCreateInfo create{};
++    create.structSize = sizeof(create);
++    // Driveclub's depth is reversed and infinite; its motion vectors are unjittered.
++    create.flags = FFX_VK_PORTABLE_CONTEXT_DEPTH_INVERTED | FFX_VK_PORTABLE_CONTEXT_DEPTH_INFINITE;
++    create.maxRenderSize = {rw, rh};
++    create.displaySize = {dw, dh};
++    create.interpolationSourceFormat = static_cast<VkFormat>(SourceFormat);
++    create.outputFormat = static_cast<VkFormat>(SourceFormat);
++    if (const u64 issues = ffxVkPortableValidateFrameGenerationCreateInfo(&create)) {
++        PrintIssues("create info", issues);
++        return false;
++    }
++    if (ffxVkPortableFrameGenerationContextCreate(&device_info, &create, &context) !=
++        FFX_VK_PORTABLE_OK) {
++        std::printf("Frame generation: context creation failed\n");
++        context = nullptr;
++        return false;
++    }
++    color_image = CreateImage(instance, dw, dh,
++                              vk::ImageUsageFlagBits::eTransferDst |
++                                  vk::ImageUsageFlagBits::eTransferSrc |
++                                  vk::ImageUsageFlagBits::eSampled |
++                                  vk::ImageUsageFlagBits::eStorage,
++                              color_allocation);
++    hudless_image = CreateImage(instance, dw, dh,
++                                vk::ImageUsageFlagBits::eTransferDst |
++                                    vk::ImageUsageFlagBits::eTransferSrc |
++                                    vk::ImageUsageFlagBits::eSampled |
++                                    vk::ImageUsageFlagBits::eStorage,
++                                hudless_allocation);
++    const vk::ImageUsageFlags small_usage = vk::ImageUsageFlagBits::eTransferDst |
++                                            vk::ImageUsageFlagBits::eSampled |
++                                            vk::ImageUsageFlagBits::eStorage;
++    small_depth = CreateImage(instance, dw, dh, small_usage, small_depth_allocation,
++                              vk::Format::eR32Sfloat);
++    small_motion = CreateImage(instance, dw, dh, small_usage, small_motion_allocation,
++                               vk::Format::eR16G16Sfloat);
++    if (!color_image || !hudless_image || !small_depth || !small_motion) {
++        std::printf("Frame generation: no memory for its source image\n");
++        DestroyContext();
++        return false;
++    }
++    render_w = rw;
++    render_h = rh;
++    display_w = dw;
++    display_h = dh;
++    std::printf("Frame generation: FSR 3 frame interpolation, render %ux%u, display %ux%u\n", rw,
++                rh, dw, dh);
++    return true;
++}
++
++bool FrameGenerator::EnsureGenerated(Frame& frame) {
++    if (frame.gen_image && frame.gen_width == frame.width && frame.gen_height == frame.height) {
++        return true;
++    }
++    DestroyGenerated(instance, frame);
++    frame.gen_image = CreateImage(instance, frame.width, frame.height,
++                                  vk::ImageUsageFlagBits::eStorage |
++                                      vk::ImageUsageFlagBits::eSampled |
++                                      vk::ImageUsageFlagBits::eTransferSrc,
++                                  frame.gen_allocation);
++    if (!frame.gen_image) {
++        return false;
++    }
++    frame.gen_width = frame.width;
++    frame.gen_height = frame.height;
++    return true;
++}
++
++bool FrameGenerator::Record(vk::CommandBuffer cmdbuf, Frame& frame,
++                            const TemporalUpscaler::FrameGenInputs* inputs) {
++    frame.has_generated = false;
++    // BB_FG_STATS=1: every 300 flips, what frame generation did with them.
++    static const bool stats = std::getenv("BB_FG_STATS") != nullptr;
++    static u32 flips, no_scene, resets, made;
++    if (stats && ++flips == 300) {
++        std::printf("Frame generation: of 300 flips %u generated, %u without a scene, %u resets\n",
++                    made, no_scene, resets);
++        flips = no_scene = resets = made = 0;
++    }
++    if (stats && settings_on()) {
++        no_scene += inputs == nullptr;
++        resets += inputs && inputs->reset;
++    }
++    const auto& settings = BbSettings::Get();
++    if (!settings.frame_gen || settings.upscaler == BbSettings::UpscalerOff || failed ||
++        frame.is_hdr) {
++        have_previous = false;
++        return false;
++    }
++    // Menus and loading screens: no scene, nothing to interpolate (the next scene starts anew).
++    if (!inputs) {
++        have_previous = false;
++        return false;
++    }
++    // A render size above the window's (supersampling) is fine: the interpolation runs at the
++    // window's size with the scene's depth and motion at render size. BB_FG_NO_SUPERSAMPLE=1
++    // turns that off.
++    static const bool no_supersample = std::getenv("BB_FG_NO_SUPERSAMPLE") != nullptr;
++    if (no_supersample && (inputs->width > frame.width || inputs->height > frame.height)) {
++        static bool printed;
++        if (!printed) {
++            printed = true;
++            std::printf("Frame generation: off while the render size (%ux%u) is above the "
++                        "window's (%ux%u)\n",
++                        inputs->width, inputs->height, frame.width, frame.height);
++        }
++        have_previous = false;
++        return false;
++    }
++    // Rendering above the window's size: depth and motion are scaled down to it first.
++    const bool shrink = inputs->width > frame.width || inputs->height > frame.height;
++    const u32 rw = shrink ? frame.width : inputs->width;
++    const u32 rh = shrink ? frame.height : inputs->height;
++    if (!EnsureContext(rw, rh, frame.width, frame.height) || !EnsureGenerated(frame)) {
++        failed = true;
++        return false;
++    }
++    const u32 w = frame.width, h = frame.height;
++    const auto all = vk::PipelineStageFlagBits2::eAllCommands;
++    vk::Image depth = inputs->depth, motion = inputs->motion;
++    if (shrink) {
++        const vk::ImageBlit scale{
++            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
++                                     vk::Offset3D{s32(inputs->width), s32(inputs->height), 1}},
++            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++            .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(rw), s32(rh), 1}},
++        };
++        for (const auto& [src, dst] : {std::pair{inputs->depth, small_depth},
++                                       std::pair{inputs->motion, small_motion}}) {
++            Barrier(cmdbuf, src, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, all,
++                    vk::AccessFlagBits2::eMemoryWrite, vk::PipelineStageFlagBits2::eTransfer,
++                    vk::AccessFlagBits2::eTransferRead);
++            Barrier(cmdbuf, dst, vk::ImageLayout::eUndefined,
++                    vk::ImageLayout::eTransferDstOptimal, all, vk::AccessFlagBits2::eNone,
++                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
++            // Nearest: depth and motion are not blended across edges.
++            cmdbuf.blitImage(src, vk::ImageLayout::eGeneral, dst,
++                             vk::ImageLayout::eTransferDstOptimal, scale, vk::Filter::eNearest);
++            Barrier(cmdbuf, dst, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eGeneral,
++                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
++                    vk::PipelineStageFlagBits2::eComputeShader,
++                    vk::AccessFlagBits2::eShaderRead);
++        }
++        depth = small_depth;
++        motion = small_motion;
++    }
++    const auto transfer = vk::PipelineStageFlagBits2::eTransfer;
++    const auto compute = vk::PipelineStageFlagBits2::eComputeShader;
++
++    // The finished frame (the swapchain's format) as the interpolation's RGBA8 source.
++    Barrier(cmdbuf, frame.image, vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal,
++            all, vk::AccessFlagBits2::eMemoryWrite, transfer, vk::AccessFlagBits2::eTransferRead);
++    Barrier(cmdbuf, color_image, vk::ImageLayout::eUndefined,
++            vk::ImageLayout::eTransferDstOptimal, all, vk::AccessFlagBits2::eNone, transfer,
++            vk::AccessFlagBits2::eTransferWrite);
++    const vk::ImageBlit blit{
++        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++        .srcOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(w), s32(h), 1}},
++        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++        .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(w), s32(h), 1}},
++    };
++    cmdbuf.blitImage(frame.image, vk::ImageLayout::eTransferSrcOptimal, color_image,
++                     vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
++    Barrier(cmdbuf, frame.image, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eGeneral,
++            transfer, vk::AccessFlagBits2::eTransferRead, all, vk::AccessFlagBits2::eMemoryRead);
++    Barrier(cmdbuf, color_image, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eGeneral,
++            transfer, vk::AccessFlagBits2::eTransferWrite, compute,
++            vk::AccessFlagBits2::eShaderRead);
++    Barrier(cmdbuf, frame.gen_image, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral, all,
++            vk::AccessFlagBits2::eNone, compute,
++            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
++    // The frame before its HUD (the display buffer, kept by the upscaler, Transfer source):
++    // the interpolation then leaves the HUD where it is.
++    const bool hudless = inputs->hudless != vk::Image{};
++    if (hudless) {
++        Barrier(cmdbuf, hudless_image, vk::ImageLayout::eUndefined,
++                vk::ImageLayout::eTransferDstOptimal, all, vk::AccessFlagBits2::eNone, transfer,
++                vk::AccessFlagBits2::eTransferWrite);
++        const vk::ImageBlit scale{
++            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
++                                     vk::Offset3D{s32(inputs->hudless_width),
++                                                  s32(inputs->hudless_height), 1}},
++            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++            .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(w), s32(h), 1}},
++        };
++        cmdbuf.blitImage(inputs->hudless, vk::ImageLayout::eTransferSrcOptimal, hudless_image,
++                         vk::ImageLayout::eTransferDstOptimal, scale, vk::Filter::eLinear);
++        Barrier(cmdbuf, hudless_image, vk::ImageLayout::eTransferDstOptimal,
++                vk::ImageLayout::eGeneral, transfer, vk::AccessFlagBits2::eTransferWrite, compute,
++                vk::AccessFlagBits2::eShaderRead);
++    }
++
++    // The upscaler's reset flag is raised on most frames (its frame start runs again on every
++    // HUD draw); the history here restarts only after frames without a scene.
++    const bool reset = !have_previous;
++    // The interpolation copies its source into its history (transfer source).
++    const vk::ImageUsageFlags source_usage = vk::ImageUsageFlagBits::eTransferDst |
++                                             vk::ImageUsageFlagBits::eTransferSrc |
++                                             vk::ImageUsageFlagBits::eSampled |
++                                             vk::ImageUsageFlagBits::eStorage;
++    const FfxVkPortableImage source =
++        Describe(color_image, SourceFormat, w, h, source_usage,
++                 FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
++    const FfxVkPortableImage hudless_source =
++        hudless ? Describe(hudless_image, SourceFormat, w, h, source_usage,
++                           FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ)
++                : None();
++    // Optical flow and the interpolation see the HUD-less frame when there is one.
++    const FfxVkPortableImage& interpolation_source = hudless ? hudless_source : source;
++
++    FfxVkPortableFrameGenerationPrepareInfo prepare{};
++    prepare.structSize = sizeof(prepare);
++    prepare.commandBuffer = cmdbuf;
++    prepare.depth = Describe(depth, vk::Format::eR32Sfloat, rw, rh,
++                             vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
++                             FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
++    prepare.motionVectors =
++        Describe(motion, vk::Format::eR16G16Sfloat, rw, rh,
++                 vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
++                 FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
++    prepare.renderSize = {rw, rh};
++    prepare.jitterOffset = {0.0f, 0.0f};
++    // Pixels at render size, as the upscaler takes them; scaled with the images.
++    prepare.motionVectorScale = {float(rw) / float(inputs->width), float(rh) / float(inputs->height)};
++    prepare.frameTimeMilliseconds = inputs->frame_ms;
++    prepare.cameraNear = inputs->near_plane;
++    prepare.cameraFar = 1.0e6f;
++    prepare.cameraVerticalFovRadians = inputs->vertical_fov;
++    prepare.viewSpaceToMeters = 1.0f;
++    prepare.minLuminance = 0.0f;
++    prepare.maxLuminance = 1.0f;
++    prepare.transferFunction = FFX_VK_PORTABLE_TRANSFER_FUNCTION_SRGB;
++    prepare.cameraUp = {0.0f, 1.0f, 0.0f};
++    prepare.cameraRight = {1.0f, 0.0f, 0.0f};
++    prepare.cameraForward = {0.0f, 0.0f, 1.0f};
++    prepare.reset = reset ? VK_TRUE : VK_FALSE;
++    prepare.frameId = frame_id;
++
++    FfxVkPortableFrameGenerationDispatchInfo dispatch{};
++    dispatch.structSize = sizeof(dispatch);
++    dispatch.commandBuffer = cmdbuf;
++    dispatch.currentColor = source;
++    dispatch.hudlessColor = hudless_source;
++    dispatch.distortionField = None();
++    dispatch.output = Describe(frame.gen_image, SourceFormat, w, h,
++                               vk::ImageUsageFlagBits::eStorage |
++                                   vk::ImageUsageFlagBits::eSampled |
++                                   vk::ImageUsageFlagBits::eTransferSrc,
++                               FFX_VK_PORTABLE_RESOURCE_STATE_UNORDERED_ACCESS);
++    dispatch.displaySize = {w, h};
++    dispatch.interpolationRect = {0, 0, w, h};
++    dispatch.frameTimeMilliseconds = inputs->frame_ms;
++    dispatch.cameraNear = inputs->near_plane;
++    dispatch.cameraFar = 1.0e6f;
++    dispatch.cameraVerticalFovRadians = inputs->vertical_fov;
++    dispatch.viewSpaceToMeters = 1.0f;
++    dispatch.minLuminance = 0.0f;
++    dispatch.maxLuminance = 1.0f;
++    dispatch.transferFunction = FFX_VK_PORTABLE_TRANSFER_FUNCTION_SRGB;
++    dispatch.reset = reset ? VK_TRUE : VK_FALSE;
++    dispatch.frameId = frame_id;
++
++    FfxVkPortableFrameGenerationCreateInfo create{};
++    create.structSize = sizeof(create);
++    create.flags = FFX_VK_PORTABLE_CONTEXT_DEPTH_INVERTED | FFX_VK_PORTABLE_CONTEXT_DEPTH_INFINITE;
++    create.maxRenderSize = {render_w, render_h};
++    create.displaySize = {display_w, display_h};
++    create.interpolationSourceFormat = static_cast<VkFormat>(SourceFormat);
++    create.outputFormat = static_cast<VkFormat>(SourceFormat);
++    if (const u64 issues = ffxVkPortableValidateFrameGenerationPrepareInfo(&create, &prepare)) {
++        PrintIssues("prepare", issues);
++        failed = true;
++        return false;
++    }
++    if (const u64 issues = ffxVkPortableValidateFrameGenerationDispatchInfo(&create, &dispatch)) {
++        PrintIssues("dispatch", issues);
++        failed = true;
++        return false;
++    }
++    // Switching between frames with and without a HUD-less image changes what the history
++    // holds: start it again.
++    if (hudless != had_hudless) {
++        prepare.reset = dispatch.reset = VK_TRUE;
++        had_hudless = hudless;
++    }
++    if (ffxVkPortableFrameGenerationContextPrepare(context, &prepare, &interpolation_source) !=
++            FFX_VK_PORTABLE_OK ||
++        ffxVkPortableFrameGenerationContextRecordDispatch(context, &dispatch) !=
++            FFX_VK_PORTABLE_OK) {
++        std::printf("Frame generation: recording failed; off for this session\n");
++        failed = true;
++        return false;
++    }
++    ++frame_id;
++    // The presenter blits the generated frame (General) on its own queue submission.
++    Barrier(cmdbuf, frame.gen_image, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, all,
++            vk::AccessFlagBits2::eMemoryWrite, all, vk::AccessFlagBits2::eMemoryRead);
++    // The first frame of a scene only starts the history: nothing between it and the last.
++    const bool generated = have_previous;
++    have_previous = true;
++    frame.has_generated = generated;
++    made += generated;
++    return generated;
++}
++
++} // namespace Vulkan
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_frame_generation.h b/gpu/shadps4/video_core/renderer_vulkan/vk_frame_generation.h
+new file mode 100644
+index 0000000..897a5f6
+--- /dev/null
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_frame_generation.h
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++
++#include "video_core/renderer_vulkan/vk_common.h"
++#include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
++
++#include <vk_mem_alloc.h>
++
++struct FfxVkPortableFrameGenerationContext;
++
++namespace Vulkan {
++
++class Instance;
++struct Frame;
++
++/// bbport (Driveclub): FSR 3 frame generation (FidelityFX frame interpolation and optical flow,
++/// FSR-Vulkan). At each flip the finished frame and the scene's depth and motion vectors give a
++/// frame halfway between the previous flip and this one, which the presenter shows first.
++/// Without a HUD-less image the interpolation sees the HUD as part of the scene.
++class FrameGenerator {
++public:
++    explicit FrameGenerator(const Instance& instance);
++    ~FrameGenerator();
++    FrameGenerator(const FrameGenerator&) = delete;
++    FrameGenerator& operator=(const FrameGenerator&) = delete;
++
++    /// Draw thread, after the frame image is final (General layout): records the interpolation
++    /// into cmdbuf and leaves it in frame's generated image. False when nothing was generated
++    /// (setting off, no scene this frame, the first frame after a pause, or an error).
++    bool Record(vk::CommandBuffer cmdbuf, Frame& frame,
++                const TemporalUpscaler::FrameGenInputs* inputs);
++
++    /// The frame's generated image, made at its size (draw thread; frames are recreated there).
++    static void DestroyGenerated(const Instance& instance, Frame& frame);
++
++private:
++    bool EnsureContext(u32 render_w, u32 render_h, u32 display_w, u32 display_h);
++    bool EnsureGenerated(Frame& frame);
++    void DestroyContext();
++
++    const Instance& instance;
++    FfxVkPortableFrameGenerationContext* context = nullptr;
++    u32 render_w = 0, render_h = 0, display_w = 0, display_h = 0;
++    VmaAllocation color_allocation{};
++    vk::Image color_image{}; ///< the frame as RGBA8, the interpolation's source
++    VmaAllocation hudless_allocation{};
++    vk::Image hudless_image{}; ///< the frame before its HUD, RGBA8 at the frame's size
++    // Rendering above the window's size: the depth and motion scaled to it (the interpolation
++    // takes no render size above its output).
++    VmaAllocation small_depth_allocation{}, small_motion_allocation{};
++    vk::Image small_depth{}, small_motion{};
++    bool failed = false;
++    bool have_previous = false;
++    bool had_hudless = false;
++    u64 frame_id = 0;
++};
++
++} // namespace Vulkan
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
-index 2c70bba..e19da7e 100644
+index 2c70bba..f434b0f 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
 @@ -190,6 +190,9 @@ struct Fsr4Upscaler::Impl {
@@ -384,11 +1121,33 @@ index 2c70bba..e19da7e 100644
          // Any preset's render size fits: the context is not recreated for a size change.
          desc.maxRenderSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
          desc.maxUpscaleSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
+@@ -383,6 +386,10 @@ Fsr4Upscaler::Fsr4Upscaler(const Instance& instance, Scheduler& scheduler)
+ 
+ Fsr4Upscaler::~Fsr4Upscaler() = default;
+ 
++void Fsr4Upscaler::ReleaseWhileRecording() {
++    impl->Destroy(true);
++}
++
+ bool Fsr4Upscaler::Record(const Frame& frame) {
+     return impl->Record(frame);
+ }
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.h b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.h
-index 506cc51..dfc61bf 100644
+index 506cc51..6fd582b 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.h
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.h
-@@ -41,6 +41,10 @@ public:
+@@ -24,6 +24,10 @@ public:
+     Fsr4Upscaler(const Instance& instance, Scheduler& scheduler);
+     ~Fsr4Upscaler();
+ 
++    /// Frees the provider while a frame's command buffer is being recorded (waits for the
++    /// submitted work only; a Finish() there would submit the open command buffer).
++    void ReleaseWhileRecording();
++
+     /// An image in layout General, written/read by compute shaders.
+     struct Image {
+         vk::Image image;
+@@ -41,6 +45,10 @@ public:
          bool sharpen, reset, auto_exposure;
      };
  
@@ -399,11 +1158,306 @@ index 506cc51..dfc61bf 100644
      /// Records FSR 4 into `frame.cmdbuf`; the output stays in General. False when FSR 4
      /// cannot run (Problem() says why; missing assets or device features are permanent).
      bool Record(const Frame& frame);
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
+index fad0a85..38a6e6f 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
+@@ -293,9 +293,14 @@ public:
+                features.shaderStorageImageExtendedFormats;
+     }
+ 
+-    /// bbport: FSR 4.1.1 (INT8 model passes and VK_VALVE_shader_mixed_float_dot_product).
++    /// bbport: FSR 4.1.1 (INT8 model passes). Assets built with the mixed float dot product
++    /// need VK_VALVE_shader_mixed_float_dot_product (Mesa); portable ones (FSR411_PORTABLE=1,
++    /// e.g. for Windows drivers) do not, and fail their pipeline creation otherwise.
+     bool IsFsr411Supported() const {
+-        return IsFsr4Int8Supported() && mixed_float_dot_product;
++        return IsFsr4Int8Supported();
++    }
++    bool HasMixedFloatDotProduct() const {
++        return mixed_float_dot_product;
+     }
+ 
+     /// VK_KHR_shader_clock is supported.
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp
+index 77df0d0..b69b534 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp
+@@ -14,6 +14,7 @@
+ #include "video_core/renderer_vulkan/vk_platform.h"
+ #include "bbport_overlay.h"
+ #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
++#include "video_core/renderer_vulkan/vk_frame_generation.h"
+ #include "video_core/renderer_vulkan/vk_presenter.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
+ #include "video_core/texture_cache/image.h"
+@@ -35,6 +36,7 @@
+ #include <span>
+ #include <sstream>
+ #include <system_error>
++#include <thread>
+ #include <vector>
+ #include <vk_mem_alloc.h>
+ #ifdef MemoryBarrier
+@@ -156,7 +158,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
+     fsr_pass.Create(device, instance.GetAllocator(), num_images);
+     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+     BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
+-
++    frame_generator = std::make_unique<FrameGenerator>(instance);
+ }
+ 
+ Presenter::~Presenter() {
+@@ -169,7 +171,9 @@ Presenter::~Presenter() {
+     Check(flip_scheduler.CommandBuffer().reset());
+ 
+     const vk::Device device = instance.GetDevice();
++    frame_generator.reset();
+     for (auto& frame : present_frames) {
++        FrameGenerator::DestroyGenerated(instance, frame);
+         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
+         device.destroyImageView(frame.image_view);
+         device.destroyFence(frame.present_done);
+@@ -466,6 +470,22 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
+         ++frame_dump_index;
+     }
+ 
++    // bbport: frame generation, from this frame's scene depth and motion (Driveclub's FSR).
++    {
++        TemporalUpscaler::FrameGenInputs fg{};
++        auto& upscaler = rasterizer->GetUpscaler();
++        const bool scene = upscaler.TakeFrameGenInputs(fg);
++        static const bool fg_stats = std::getenv("BB_FG_STATS") != nullptr;
++        static u32 fg_flips;
++        if (fg_stats && ++fg_flips == 300) {
++            std::printf("Frame generation: scene inputs made in the last 300 flips: %u, %.1f "
++                        "display buffer draws per flip\n",
++                        upscaler.fg_handed.exchange(0), upscaler.display_draws.exchange(0) / 300.0);
++            fg_flips = 0;
++        }
++        frame_generator->Record(cmdbuf, *frame, scene ? &fg : nullptr);
++    }
++
+     // Flush frame creation commands.
+     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
+     frame->ready_tick = draw_scheduler.CurrentTick();
+@@ -497,6 +517,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
+ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
+     // Request a free presentation frame.
+     Frame* frame = GetRenderFrame();
++    frame->has_generated = false;
+ 
+     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
+     scheduler.EndRendering();
+@@ -585,6 +606,61 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+         return;
+     }
+ 
++    // bbport: frame generation's frame first, then the real one; with V-Sync (FIFO) they show a
++    // refresh apart.
++    static const bool fg_stats = std::getenv("BB_FG_STATS") != nullptr;
++    using Clock = std::chrono::steady_clock;
++    const auto t0 = Clock::now();
++    const bool generated = frame->has_generated && !is_reusing_frame && frame->gen_image;
++    if (generated) {
++        PresentImage(frame, frame->gen_image, false);
++        // Even spacing: the real frame half a game frame after the generated one (the game's
++        // frame interval, averaged over the frames generated for).
++        static Clock::time_point last_flip{};
++        static double interval_ms = 16.7;
++        const double since = std::chrono::duration<double, std::milli>(t0 - last_flip).count();
++        last_flip = t0;
++        if (since > 4.0 && since < 50.0) {
++            interval_ms += (since - interval_ms) * 0.1;
++        }
++        const auto target = t0 + std::chrono::microseconds(s64(interval_ms * 500.0));
++        if (Clock::now() < target) {
++            std::this_thread::sleep_until(target);
++        }
++    }
++    const auto t1 = Clock::now();
++    const bool shown = PresentImage(frame, frame->image, true);
++    if (fg_stats) {
++        // Time in the swap thread per flip: the generated frame's present, the real one's, and
++        // the gap since the previous flip's presents ended (time waiting for the game).
++        static Clock::time_point last_end = Clock::now();
++        static double gen_ms, real_ms, idle_ms;
++        static u32 count;
++        const auto t2 = Clock::now();
++        gen_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
++        real_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
++        idle_ms += std::chrono::duration<double, std::milli>(t0 - last_end).count();
++        last_end = t2;
++        if (++count == 300) {
++            std::printf("Presenter: per flip %.2f ms generated present, %.2f ms real present, "
++                        "%.2f ms waiting for the next flip\n",
++                        gen_ms / count, real_ms / count, idle_ms / count);
++            gen_ms = real_ms = idle_ms = 0;
++            count = 0;
++        }
++    }
++    if (!shown) {
++        free_frame();
++        return;
++    }
++
++    free_frame();
++    if (!is_reusing_frame && is_game_frame) {
++        DebugState.IncFlipFrameNum();
++    }
++}
++
++bool Presenter::PresentImage(Frame* frame, vk::Image src, bool last) {
+     // Recreate the swapchain if the window was resized.
+     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
+         swapchain.Recreate(window.GetWidth(), window.GetHeight());
+@@ -595,17 +671,19 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+         if (!swapchain.AcquireNextImage()) {
+             // User resizes the window too fast and GPU can't keep up. Skip this frame.
+             LOG_WARNING(Render_Vulkan, "Skipping frame!");
+-            free_frame();
+-            return;
++            return false;
+         }
+     }
+ 
+     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
+     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
+     // the frame's present fence and future GetRenderFrame() call will hang waiting for this frame.
+-    const auto reset_result = instance.GetDevice().resetFences(frame->present_done);
+-    ASSERT_MSG(reset_result == vk::Result::eSuccess,
+-               "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
++    if (last) {
++        const auto reset_result = instance.GetDevice().resetFences(frame->present_done);
++        ASSERT_MSG(reset_result == vk::Result::eSuccess,
++                   "Unexpected error resetting present done fence: {}",
++                   vk::to_string(reset_result));
++    }
+ 
+     // bbport: the game frame is blitted (letterboxed) straight into the swapchain image.
+     const vk::Image swapchain_image = swapchain.Image();
+@@ -646,7 +724,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+                 .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+-                .image = frame->image,
++                .image = src,
+                 .subresourceRange = color_range,
+             },
+         };
+@@ -661,7 +739,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+         };
+         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+                                vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
+-        cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
++        cmdbuf.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
+                          vk::ImageLayout::eTransferDstOptimal,
+                          MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
+                          vk::Filter::eLinear);
+@@ -688,7 +766,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+                 .newLayout = vk::ImageLayout::eGeneral,
+                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+-                .image = frame->image,
++                .image = src,
+                 .subresourceRange = color_range,
+             },
+         };
+@@ -696,7 +774,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+                                vk::PipelineStageFlagBits::eAllCommands,
+                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barriers);
+         if (overlay) {
+-            BbOverlay::Render(cmdbuf, swapchain.ImageView(), extent);
++            BbOverlay::Render(cmdbuf, swapchain.ImageView(), extent, !last);
+             const vk::ImageMemoryBarrier to_present{
+                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                 .dstAccessMask = vk::AccessFlagBits::eNone,
+@@ -722,7 +800,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+     info.AddWait(swapchain.GetImageAcquiredSemaphore());
+     info.AddWait(frame->ready_semaphore, frame->ready_tick);
+     info.AddSignal(swapchain.GetPresentReadySemaphore());
+-    info.AddSignal(frame->present_done);
++    if (last) {
++        info.AddSignal(frame->present_done);
++    }
+     scheduler.Flush(info);
+ 
+     // Present to swapchain.
+@@ -732,11 +812,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+             swapchain.Recreate(window.GetWidth(), window.GetHeight());
+         }
+     }
+-
+-    free_frame();
+-    if (!is_reusing_frame && is_game_frame) {
+-        DebugState.IncFlipFrameNum();
+-    }
++    return true;
+ }
+ 
+ Frame* Presenter::GetRenderFrame() {
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.h b/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.h
+index 7eaf065..1866655 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.h
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.h
+@@ -37,7 +37,11 @@ struct Frame {
+     u64 ready_tick;
+     bool is_hdr{false};
+     u8 id{};
+-
++    // bbport: frame generation's frame, shown before this one (vk_frame_generation).
++    VmaAllocation gen_allocation{};
++    vk::Image gen_image{};
++    u32 gen_width{}, gen_height{};
++    bool has_generated{false};
+ };
+ 
+ enum SchedulerType {
+@@ -47,6 +51,7 @@ enum SchedulerType {
+ };
+ 
+ class Rasterizer;
++class FrameGenerator;
+ 
+ class Presenter {
+ public:
+@@ -108,6 +113,11 @@ private:
+ 
+     void SetExpectedGameSize(s32 width, s32 height);
+ 
++    /// Blits src (General, the frame's size) into the next swapchain image with the overlay and
++    /// presents it; the frame's fence is signalled by the last image of a frame. False when no
++    /// swapchain image could be acquired.
++    bool PresentImage(Frame* frame, vk::Image src, bool last);
++
+ private:
+     float expected_ratio{1920.0 / 1080.0f};
+     u32 expected_frame_width{1920};
+@@ -127,6 +137,7 @@ private:
+     Swapchain swapchain;
+     Runtime runtime;
+     std::unique_ptr<Rasterizer> rasterizer;
++    std::unique_ptr<FrameGenerator> frame_generator;
+     VideoCore::TextureCache& texture_cache;
+     vk::UniqueCommandPool command_pool;
+     std::vector<Frame> present_frames;
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
-index c941f6b..06470f0 100644
+index c941f6b..c4a52ca 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
-@@ -20,6 +20,7 @@
+@@ -3,8 +3,11 @@
+ 
+ #include <xxhash.h>
+ #include <mutex>
++#include <unordered_map>
++#include <unordered_set>
+ #include <set>
+ #include "video_core/renderer_vulkan/ui_composition.h"
++#include "bbport_settings.h"
+ #include "bbport_toggles.h"
+ #include "video_core/renderer_vulkan/vk_frame_capture.h"
+ #include "common/debug.h"
+@@ -20,6 +23,7 @@
  #include "video_core/renderer_vulkan/vk_instance.h"
  #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
  #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -411,18 +1465,19 @@ index c941f6b..06470f0 100644
  #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
  #include "bbport_threads.h"
  #include "video_core/renderer_vulkan/vk_runtime.h"
-@@ -273,6 +274,25 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+@@ -273,6 +277,26 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
      if (upscaler->Enabled() && cb_descs[0].first) {
          upscaler->OnColorTarget(cb_descs[0].first);
      }
-+    // Driveclub: the main view's G-buffer (3+ targets, D32S8 at 1920x1080; target 2 holds the
-+    // object IDs) and its scene color, the last R11G11B10 target drawn with that depth before
-+    // the TAA resolve.
++    // Driveclub: the main view's G-buffer (3+ targets, D32S8 at the render resolution, 1920x1080
++    // unless a resolution patch changes it; target 2 holds the object IDs) and its scene color,
++    // the last R11G11B10 target drawn with that depth before the TAA resolve. Smaller G-buffers
++    // (the mirror) are skipped by OnDcGBuffer, which keeps the largest of the frame.
 +    if (upscaler->Enabled() && upscaler->DcMode() && db_desc.first) {
 +        const auto& depth = texture_cache.GetImage(db_desc.first);
 +        if (std::popcount(key.mrt_mask) >= 3 && cb_descs[2].first &&
 +            depth.info.pixel_format == vk::Format::eD32SfloatS8Uint &&
-+            depth.info.size.width == 1920 && depth.info.size.height == 1080) {
++            depth.info.size.width >= 1280 && depth.info.size.height >= 720) {
 +            upscaler->OnDcGBuffer(db_desc.first, cb_descs[2].first);
 +        } else if (db_desc.first == upscaler->DcDepth() && cb_descs[0].first &&
 +                   std::popcount(key.mrt_mask) <= 2) {
@@ -437,7 +1492,7 @@ index c941f6b..06470f0 100644
      // bbport: scene color: a full-size RGBA16F target drawn with the scene depth.
      if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth() &&
          cb_descs[0].first && std::popcount(key.mrt_mask) <= 2) {
-@@ -440,6 +460,10 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
+@@ -440,6 +464,10 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
      return tid == liverpool->GetGpuCommandProcessorThreadId();
  }
  
@@ -448,7 +1503,17 @@ index c941f6b..06470f0 100644
  void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
      if (!draw_pipe || !size) {
          return;
-@@ -1108,7 +1132,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
+@@ -960,6 +988,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
+     // target is that frame.
+     if (camera_motion->Enabled() && regs.color_buffers[0] &&
+         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
++        if (upscaler->DcMode()) {
++            upscaler->OnDcDisplayDraw(cb_descs[0].first);
++        }
+         scene_started = false;
+         camera_motion->OnDisplayPass(cb_descs[0].first);
+         if (upscaler->OnFrameStart()) {
+@@ -1108,7 +1139,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
      // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
      // full-screen quad leaves an edge column unwritten).
      draw_jitter = {};
@@ -459,7 +1524,7 @@ index c941f6b..06470f0 100644
          (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
          draw_jitter = upscaler->Jitter();
      }
-@@ -1240,7 +1266,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
+@@ -1240,7 +1273,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
      push_data.yoffset *= target_scale[1];
      pipeline->BindResources(set_writes, push_data);
      draw_jitter = {};
@@ -470,29 +1535,86 @@ index c941f6b..06470f0 100644
          draw_jitter = upscaler->Jitter();
      }
      UpdateDynamicState(pipeline, is_indexed);
-@@ -1315,6 +1343,50 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
+@@ -1315,6 +1350,114 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
      if (upscaler->Enabled()) {
          upscaler->OnDispatch(cs.pgm_hash);
      }
 +    // Driveclub research: the TAA resolve's constants, to find the camera jitter.
 +    static const bool taa_dump = std::getenv("BB_DC_TAA_DUMP") != nullptr;
-+    if (taa_dump && cs.pgm_hash == 0x403f86d4ULL && cs.buffers.size() >= 2) {
-+        static int dumped = 0;
-+        if (dumped++ < 16) {
++    if (taa_dump &&
++        (cs.pgm_hash == 0x403f86d4ULL || cs.pgm_hash == 0x430587e6ULL ||
++         cs.pgm_hash == 0xfdd72cf1ULL) &&
++        cs.buffers.size() >= 2) {
++        static std::unordered_map<u64, int> dumps;
++        const int dumped = dumps[cs.pgm_hash]++;
++        if (dumped < 3) {
 +            const auto b0 = cs.buffers[0].GetSharp(cs);
 +            const auto b1 = cs.buffers[1].GetSharp(cs);
 +            const auto* f0 = reinterpret_cast<const float*>(b0.base_address);
 +            const auto* f1 = reinterpret_cast<const float*>(b1.base_address);
-+            std::string line = fmt::format("DC TAA #{} b0@{:#x}[{}] 64..99:", dumped, b0.base_address,
-+                                           b0.GetSize());
++            std::string line = fmt::format("DC TAA {:08x} #{} buffers", cs.pgm_hash, dumped);
++            for (const auto& b : cs.buffers) line += fmt::format(" {}", b.GetSharp(cs).GetSize());
++            line += fmt::format(" | b0@{:#x}[{}] 64..99:", b0.base_address, b0.GetSize());
 +            for (int i = 64; i < 100; ++i) line += fmt::format(" {}={:.6g}", i, f0[i]);
 +            line += fmt::format(" | b1@{:#x}[{}] 96..119:", b1.base_address, b1.GetSize());
 +            for (int i = 96; i < 120; ++i) line += fmt::format(" {}={:.6g}", i, f1[i]);
 +            std::printf("%s\n", line.c_str());
 +        }
 +    }
++    // Driveclub: motion blur off in the TAA resolve itself (its strength, frame constant 96, is
++    // 0 in scenes without blur), so the resolve and the upscaler keep running.
++    // BB_DC_TAA_ZERO=<i>,<j>...: frame constants zeroed as well (finding others, e.g. DOF).
++    if (TemporalUpscaler::IsDcTaa(cs.pgm_hash) && !cs.buffers.empty()) {
++        static const std::vector<int> zero_extra = [] {
++            std::vector<int> list;
++            if (const char* env = std::getenv("BB_DC_TAA_ZERO")) {
++                for (const char* p = env; *p;) {
++                    char* end = nullptr;
++                    const long i = std::strtol(p, &end, 10);
++                    if (end == p) break;
++                    if (i >= 0 && i < 104) list.push_back(int(i));
++                    p = *end ? end + 1 : end;
++                }
++            }
++            return list;
++        }();
++        const auto b0 = cs.buffers[0].GetSharp(cs);
++        if (b0.base_address && b0.GetSize() >= 104 * 4) {
++            auto* f0 = reinterpret_cast<float*>(b0.base_address);
++            if (!BbSettings::Get().motion_blur) {
++                f0[96] = 0.0f;
++            }
++            for (const int i : zero_extra) {
++                f0[i] = 0.0f;
++            }
++        }
++    }
++    // BB_FG_STATS=1: how often the TAA resolve runs and reaches the upscaler.
++    static const bool dc_stats = std::getenv("BB_FG_STATS") != nullptr;
++    if (dc_stats) {
++        // Each compute shader once: hash, buffers, images and grid, to find the resolve's
++        // variants (they share its three constant buffers and run once per frame full-screen).
++        static std::unordered_set<u64> seen;
++        if (seen.insert(cs.pgm_hash).second) {
++            std::printf("DC compute %016llx: %zu buffers, %zu images, %ux%ux%u groups\n",
++                        static_cast<unsigned long long>(cs.pgm_hash), cs.buffers.size(),
++                        cs.images.size(), cs_program.dim_x, cs_program.dim_y,
++                        cs_program.dim_z);
++        }
++        static u32 dispatches, resolves, enabled, buffers;
++        resolves += TemporalUpscaler::IsDcTaa(cs.pgm_hash);
++        enabled += TemporalUpscaler::IsDcTaa(cs.pgm_hash) && upscaler->Enabled() &&
++                   upscaler->DcMode();
++        buffers += TemporalUpscaler::IsDcTaa(cs.pgm_hash) && cs.buffers.size() >= 3;
++        if (++dispatches == 20000) {
++            std::printf("Upscaler (Driveclub): of 20000 dispatches %u TAA resolves, %u with the "
++                        "upscaler on, %u with its buffers\n",
++                        resolves, enabled, buffers);
++            dispatches = resolves = enabled = buffers = 0;
++        }
++    }
 +    // Driveclub: Native AA before the TAA resolve, which then passes the scene through.
-+    if (upscaler->Enabled() && upscaler->DcMode() && cs.pgm_hash == TemporalUpscaler::DcTaaHash &&
++    if (upscaler->Enabled() && upscaler->DcMode() && TemporalUpscaler::IsDcTaa(cs.pgm_hash) &&
 +        cs.buffers.size() >= 3) {
 +        TemporalUpscaler::DcInputs inputs{};
 +        bool ok = true;
@@ -515,6 +1637,13 @@ index c941f6b..06470f0 100644
 +            inputs.tan_half_fov_y = frame[93];
 +            if (upscaler->RunDriveclub(inputs)) {
 +                frame[98] = 0.0f; // the resolve's history weight: the upscaled scene passes through
++                BbStats::dc_upscaled_frames.fetch_add(1, std::memory_order_relaxed);
++                // Each variant of the resolve once in the log, when the upscaler first runs on it.
++                static std::unordered_set<u64> announced;
++                if (announced.insert(cs.pgm_hash).second) {
++                    std::printf("Upscaler (Driveclub): running in place of the TAA resolve %08llx\n",
++                                static_cast<unsigned long long>(cs.pgm_hash));
++                }
 +            }
 +        }
 +    }
@@ -584,7 +1713,7 @@ index df4887d..34e428d 100644
  }
  
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp
-index 3cf4558..3abac16 100644
+index 3cf4558..61ba5bb 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp
 @@ -6,6 +6,7 @@
@@ -628,7 +1757,33 @@ index 3cf4558..3abac16 100644
      if (applied_preset != preset || settings.upscaler == BbSettings::UpscalerOff) failed = false;
      const bool active = Active();
      const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(1u << 25);
-@@ -360,6 +371,9 @@ bool TemporalUpscaler::OnFrameStart() {
+@@ -311,7 +322,11 @@ bool TemporalUpscaler::OnFrameStart() {
+                          jitter_on != last_jitter || applied_upscaler != upscaler;
+     if (applied_upscaler != upscaler) {
+         // A failed provider keeps a fatal flag internally; a user retry gets a fresh context.
+-        scheduler.Finish();
++        // This runs while the frame is recorded (a display pass): no Finish() here, which
++        // would submit the open command buffer. The old provider is freed once the GPU is
++        // past this point (its work may be in the open command buffer).
++        scheduler.DeferOperation(
++            [old = std::move(fsr4)]() mutable { old->ReleaseWhileRecording(); });
+         fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
+         if (BbSettings::IsFsr4(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
+     }
+@@ -342,6 +357,12 @@ bool TemporalUpscaler::OnFrameStart() {
+     done_this_frame = false;
+     ldr_target = {};
+     scene_color = {};
++    // Driveclub: found again by this frame's G-buffer and scene draws. Kept from an earlier
++    // frame they can name images the texture cache has deleted since (the end of an event
++    // frees the race targets), and the upscaler then reads a destroyed image.
++    dc_depth = {};
++    dc_object_ids = {};
++    dc_color = {};
+     snapshot_taken = false;
+     opaque_valid = false;
+     mask_ready = false;
+@@ -360,6 +381,9 @@ bool TemporalUpscaler::OnFrameStart() {
  }
  
  void TemporalUpscaler::OnDispatch(u64 cs_hash) {
@@ -638,7 +1793,7 @@ index 3cf4558..3abac16 100644
      if (cs_hash != trigger_hash || done_this_frame || failed || Scaled()) {
          return;
      }
-@@ -413,9 +427,12 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
+@@ -413,9 +437,12 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
      FfxVkPortableUpscaleCreateInfo create_info{};
      create_info.structSize = sizeof(create_info);
      // Native AA runs on the HDR scene color; scaled presets on the game's tonemapped frame.
@@ -654,7 +1809,46 @@ index 3cf4558..3abac16 100644
      create_info.maxRenderSize = {w, h};
      create_info.maxOutputSize = {ow, oh};
      // FSR 4 has its own model context (vk_fsr4); the images below are shared.
-@@ -1987,9 +2004,9 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image
+@@ -444,7 +471,9 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
+         .arrayLayers = 1,
+         .samples = vk::SampleCountFlagBits::e1,
+         .tiling = vk::ImageTiling::eOptimal,
+-        .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
++        // Transfer source: frame generation scales it to the window's size.
++        .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
++                 vk::ImageUsageFlagBits::eTransferSrc,
+         .initialLayout = vk::ImageLayout::eUndefined,
+     });
+     output_image = VideoCore::UniqueImage(device, allocator);
+@@ -472,6 +501,27 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
+         .format = vk::Format::eR16G16Sfloat,
+         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+     }));
++    fg_ready = false;
++    depth_copy_view.reset();
++    depth_copy_image = VideoCore::UniqueImage(device, allocator);
++    depth_copy_image.Create(vk::ImageCreateInfo{
++        .imageType = vk::ImageType::e2D,
++        .format = vk::Format::eR32Sfloat,
++        .extent = {w, h, 1},
++        .mipLevels = 1,
++        .arrayLayers = 1,
++        .samples = vk::SampleCountFlagBits::e1,
++        .tiling = vk::ImageTiling::eOptimal,
++        .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
++                 vk::ImageUsageFlagBits::eTransferSrc,
++        .initialLayout = vk::ImageLayout::eUndefined,
++    });
++    depth_copy_view = Check(device.createImageViewUnique({
++        .image = vk::Image(depth_copy_image),
++        .viewType = vk::ImageViewType::e2D,
++        .format = vk::Format::eR32Sfloat,
++        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
++    }));
+     const auto make_image = [&](VideoCore::UniqueImage& image, vk::UniqueImageView& view,
+                                 vk::Format format, vk::ImageUsageFlags usage, u32 iw = 0,
+                                 u32 ih = 0, vk::ImageAspectFlags aspect =
+@@ -1987,9 +2037,9 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image
          .preset = applied_preset,
          .jitter = {sign * jitter[0], sign * jitter[1]},
          .frame_ms = frame_ms,
@@ -667,19 +1861,110 @@ index 3cf4558..3abac16 100644
          .sharpness = std::min(settings.sharpness.load(), 1.0f),
          .sharpen = settings.sharpen,
          .reset = reset,
-@@ -2063,4 +2080,326 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
+@@ -2063,4 +2113,462 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
      return ok;
  }
  
 +// ---- Driveclub -----------------------------------------------------------------------------
 +
 +void TemporalUpscaler::OnDcGBuffer(VideoCore::ImageId depth, VideoCore::ImageId object_ids) {
++    // The main view is the largest G-buffer of the frame (dc_depth is cleared at frame start).
++    if (dc_depth && dc_depth != depth) {
++        const auto& kept = texture_cache.GetImage(dc_depth).info.size;
++        const auto& seen = texture_cache.GetImage(depth).info.size;
++        if (u64(seen.width) * seen.height < u64(kept.width) * kept.height) {
++            return;
++        }
++    }
 +    dc_depth = depth;
 +    dc_object_ids = object_ids;
 +}
 +
 +void TemporalUpscaler::OnDcSceneColor(VideoCore::ImageId color) {
 +    dc_color = color;
++}
++
++void TemporalUpscaler::OnDcDisplayDraw(VideoCore::ImageId display) {
++    ++display_draws;
++    // Only frames with a scene still waiting for the flip, and only while generating frames.
++    if (!dc_mode || !fg_ready || !display || !BbSettings::Get().frame_gen) {
++        return;
++    }
++    if (++fg_display_draws != 2) {
++        return; // the first draw copies the finished frame; the second is the HUD's first
++    }
++    auto& image = texture_cache.GetImage(display);
++    vk::Format raw{};
++    switch (image.info.pixel_format) {
++    case vk::Format::eB8G8R8A8Unorm:
++    case vk::Format::eB8G8R8A8Srgb:
++        raw = vk::Format::eB8G8R8A8Unorm;
++        break;
++    case vk::Format::eR8G8B8A8Unorm:
++    case vk::Format::eR8G8B8A8Srgb:
++        raw = vk::Format::eR8G8B8A8Unorm;
++        break;
++    default:
++        return; // 10-bit or HDR buffers: the HUD stays in the interpolated frames
++    }
++    const u32 w = image.info.size.width, h = image.info.size.height;
++    if (!hudless_image || hudless_format != raw || hudless_width != w || hudless_height != h) {
++        // The previous copy may still be read: freed once the GPU is past this point (no wait
++        // here, on the recording thread).
++        if (hudless_image) {
++            scheduler.DeferOperation([old = std::move(hudless_image)]() mutable {});
++        }
++        hudless_image = VideoCore::UniqueImage(instance.GetDevice(), instance.GetAllocator());
++        hudless_image.Create(vk::ImageCreateInfo{
++            .imageType = vk::ImageType::e2D,
++            .format = raw,
++            .extent = {w, h, 1},
++            .mipLevels = 1,
++            .arrayLayers = 1,
++            .samples = vk::SampleCountFlagBits::e1,
++            .tiling = vk::ImageTiling::eOptimal,
++            .usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc,
++            .initialLayout = vk::ImageLayout::eUndefined,
++        });
++        hudless_format = raw;
++        hudless_width = w;
++        hudless_height = h;
++    }
++    scheduler.EndRendering();
++    runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
++                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
++    runtime.FlushBarriers();
++    const auto cmdbuf = scheduler.CommandBuffer();
++    const auto layout = [&](vk::ImageLayout from, vk::ImageLayout to, vk::AccessFlags2 src,
++                            vk::AccessFlags2 dst) {
++        const vk::ImageMemoryBarrier2 barrier{
++            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++            .srcAccessMask = src,
++            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++            .dstAccessMask = dst,
++            .oldLayout = from,
++            .newLayout = to,
++            .image = vk::Image(hudless_image),
++            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
++        };
++        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
++    };
++    layout(vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
++           vk::AccessFlagBits2::eNone, vk::AccessFlagBits2::eTransferWrite);
++    // A raw copy: the sRGB buffer's bytes as they are, like the presented frame's.
++    const vk::ImageCopy copy{
++        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++        .extent = {w, h, 1},
++    };
++    cmdbuf.copyImage(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
++                     vk::Image(hudless_image), vk::ImageLayout::eTransferDstOptimal, copy);
++    layout(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal,
++           vk::AccessFlagBits2::eTransferWrite, vk::AccessFlagBits2::eTransferRead);
++    fg_inputs.hudless = vk::Image(hudless_image);
++    fg_inputs.hudless_format = raw;
++    fg_inputs.hudless_width = w;
++    fg_inputs.hudless_height = h;
 +}
 +
 +void TemporalUpscaler::CreateDcPipelines() {
@@ -726,6 +2011,7 @@ index 3cf4558..3abac16 100644
 +        vk::DescriptorType::eStorageBuffer, vk::DescriptorType::eStorageBuffer,
 +        vk::DescriptorType::eStorageBuffer, vk::DescriptorType::eSampledImage,
 +        vk::DescriptorType::eSampledImage,  vk::DescriptorType::eStorageImage,
++        vk::DescriptorType::eStorageImage,
 +    };
 +    make(motion_types, dc_motion_desc_layout, dc_motion_pipeline_layout, 8 * sizeof(u32),
 +         DC_MOTION_COMP, dc_motion_pipeline);
@@ -739,13 +2025,39 @@ index 3cf4558..3abac16 100644
 +}
 +
 +bool TemporalUpscaler::RunDriveclub(const DcInputs& inputs) {
++    // BB_FG_STATS=1: why the resolve was not replaced, every 300 resolves.
++    static const bool stats = std::getenv("BB_FG_STATS") != nullptr;
++    static u32 calls, already, inactive, no_depth, no_ids, no_color;
++    if (stats && ++calls == 300) {
++        std::printf("Upscaler (Driveclub): of 300 resolves: %u after another this frame, %u "
++                    "inactive, missing depth %u, object ids %u, scene color %u\n",
++                    already, inactive, no_depth, no_ids, no_color);
++        calls = already = inactive = no_depth = no_ids = no_color = 0;
++    }
 +    if (!dc_mode || done_this_frame) {
++        already += dc_mode;
 +        return false;
 +    }
 +    done_this_frame = true;
 +    const int provider = BbSettings::Get().upscaler.load();
 +    if (failed || !Active() || provider == BbSettings::UpscalerTaa ||
 +        provider == BbSettings::UpscalerDlss || !dc_depth || !dc_object_ids || !dc_color) {
++        inactive += failed || !Active();
++        no_depth += !dc_depth;
++        no_ids += !dc_object_ids;
++        no_color += !dc_color;
++        // Once per session in every log: why the game's own TAA stayed.
++        static bool told_inactive, told_targets;
++        if ((failed || !Active()) && !told_inactive && provider != BbSettings::UpscalerOff) {
++            told_inactive = true;
++            std::printf("Upscaler (Driveclub): not running (%s)\n",
++                        failed ? "it failed earlier" : "upscaler not active");
++        } else if (!(failed || !Active()) && !told_targets) {
++            told_targets = true;
++            std::printf("Upscaler (Driveclub): skipped a resolve: scene targets not found "
++                        "(depth %d, object ids %d, scene color %d)\n",
++                        bool(dc_depth), bool(dc_object_ids), bool(dc_color));
++        }
 +        reset = true;
 +        return false;
 +    }
@@ -815,6 +2127,9 @@ index 3cf4558..3abac16 100644
 +                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
 +    own_barrier(vk::Image(output_image), vk::ImageLayout::eUndefined, all,
 +                vk::AccessFlagBits2::eNone, vk::ImageLayout::eGeneral, all, rw);
++    own_barrier(vk::Image(depth_copy_image), vk::ImageLayout::eUndefined, all,
++                vk::AccessFlagBits2::eNone, vk::ImageLayout::eGeneral,
++                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
 +
 +    // Motion vectors from the resolve's reprojection (dc_motion.comp).
 +    {
@@ -830,7 +2145,9 @@ index 3cf4558..3abac16 100644
 +                                                 .imageLayout = vk::ImageLayout::eGeneral};
 +        const vk::DescriptorImageInfo motion_info{.imageView = *motion_view,
 +                                                  .imageLayout = vk::ImageLayout::eGeneral};
-+        std::array<vk::WriteDescriptorSet, 6> writes{};
++        const vk::DescriptorImageInfo depth_copy_info{.imageView = *depth_copy_view,
++                                                      .imageLayout = vk::ImageLayout::eGeneral};
++        std::array<vk::WriteDescriptorSet, 7> writes{};
 +        for (u32 i = 0; i < 3; ++i) {
 +            writes[i] = {.dstBinding = i,
 +                         .descriptorCount = 1,
@@ -849,6 +2166,10 @@ index 3cf4558..3abac16 100644
 +                     .descriptorCount = 1,
 +                     .descriptorType = vk::DescriptorType::eStorageImage,
 +                     .pImageInfo = &motion_info};
++        writes[6] = {.dstBinding = 6,
++                     .descriptorCount = 1,
++                     .descriptorType = vk::DescriptorType::eStorageImage,
++                     .pImageInfo = &depth_copy_info};
 +        struct {
 +            float size[2], jitter[2];
 +            u32 offsets[4];
@@ -865,6 +2186,9 @@ index 3cf4558..3abac16 100644
 +    own_barrier(vk::Image(motion_image), vk::ImageLayout::eGeneral,
 +                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
 +                vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
++    own_barrier(vk::Image(depth_copy_image), vk::ImageLayout::eGeneral,
++                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
++                vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
 +
 +    const auto now = std::chrono::steady_clock::now();
 +    float frame_ms = std::chrono::duration<float, std::milli>(now - last_frame).count();
@@ -872,6 +2196,12 @@ index 3cf4558..3abac16 100644
 +        frame_ms = 16.6f;
 +    }
 +    last_frame = now;
++    // For the presenter's frame generation at this frame's flip.
++    fg_inputs = {vk::Image(depth_copy_image), vk::Image(motion_image), w, h, dc_near,
++                 dc_vertical_fov, frame_ms, reset};
++    fg_ready = true;
++    fg_display_draws = 0;
++    ++fg_handed;
 +
 +    bool dispatched = false;
 +    if (UseFsr4()) {
@@ -995,10 +2325,10 @@ index 3cf4558..3abac16 100644
 +
  } // namespace Vulkan
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.h b/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.h
-index 4067dfb..7192960 100644
+index 4067dfb..def3bc7 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.h
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.h
-@@ -63,6 +63,34 @@ public:
+@@ -63,6 +63,68 @@ public:
      /// Before a compute dispatch: the post-processing combine shader triggers the upscale.
      void OnDispatch(u64 cs_hash);
  
@@ -1013,8 +2343,13 @@ index 4067dfb..7192960 100644
 +    [[nodiscard]] VideoCore::ImageId DcDepth() const noexcept {
 +        return dc_depth;
 +    }
-+    /// The TAA resolve shader (compute 0x403f86d4).
++    /// The TAA resolve shader (compute 0x403f86d4: menus, garage, some events). Its variants
++    /// for other scenes (0x430587e6 in races, 0xfdd72cf1) bind the same constant buffers with
++    /// the same layout and differ only in their images.
 +    static constexpr u64 DcTaaHash = 0x403f86d4;
++    static constexpr bool IsDcTaa(u64 hash) {
++        return hash == DcTaaHash || hash == 0x430587e6 || hash == 0xfdd72cf1;
++    }
 +    void OnDcGBuffer(VideoCore::ImageId depth, VideoCore::ImageId object_ids);
 +    void OnDcSceneColor(VideoCore::ImageId color);
 +    struct DcBuffer {
@@ -1030,10 +2365,39 @@ index 4067dfb..7192960 100644
 +    /// caller then makes the resolve pass the scene through).
 +    bool RunDriveclub(const DcInputs& inputs);
 +
++    /// Frame generation's inputs from this frame's RunDriveclub: the depth (R32F copy, reversed
++    /// infinite) and motion vectors (pixels, previous - current) at render size. Valid until
++    /// the next RunDriveclub; Take clears them so a frame without a scene generates nothing.
++    struct FrameGenInputs {
++        vk::Image depth, motion;
++        u32 width, height;
++        float near_plane, vertical_fov, frame_ms;
++        bool reset;
++        /// The display buffer before the HUD's first draw (raw copy, UNORM of the buffer's
++        /// byte order), or null when no HUD was drawn over the scene.
++        vk::Image hudless;
++        vk::Format hudless_format;
++        u32 hudless_width, hudless_height;
++    };
++    /// Before each draw into a display buffer: the first one copies the finished frame there,
++    /// the next ones are the HUD; before the first HUD draw the buffer is kept for frame
++    /// generation (HUD-less frame).
++    void OnDcDisplayDraw(VideoCore::ImageId display);
++    std::atomic<u32> fg_handed{0};     ///< inputs made (BB_FG_STATS)
++    std::atomic<u32> display_draws{0}; ///< draws into the display buffer (BB_FG_STATS)
++    [[nodiscard]] bool TakeFrameGenInputs(FrameGenInputs& out) {
++        if (!fg_ready) {
++            return false;
++        }
++        fg_ready = false;
++        out = fg_inputs;
++        return true;
++    }
++
      /// Start of a frame in the command stream (display pass).
      bool OnFrameStart();
      bool RasterScaling() const;
-@@ -194,6 +222,14 @@ private:
+@@ -194,6 +256,14 @@ private:
      bool enabled = false;
      bool failed = false;
      u64 trigger_hash = 0x9a9cf8a9;
@@ -1048,6 +2412,21 @@ index 4067dfb..7192960 100644
      VideoCore::ImageId scene_color{};
      bool done_this_frame = false;
      u32 preset_file_frames = 0; ///< BB_PRESET_FILE polling
+@@ -255,6 +325,14 @@ private:
+     VideoCore::UniqueImage motion_image;
+     VideoCore::UniqueImage output_image;
+     vk::UniqueImageView motion_view;
++    VideoCore::UniqueImage depth_copy_image; ///< Driveclub: R32F depth for frame generation
++    vk::UniqueImageView depth_copy_view;
++    FrameGenInputs fg_inputs{};
++    bool fg_ready = false;
++    u32 fg_display_draws = 0;       ///< draws into the display buffer since the scene resolve
++    VideoCore::UniqueImage hudless_image; ///< frame generation's HUD-less copy
++    vk::Format hudless_format{};
++    u32 hudless_width = 0, hudless_height = 0;
+     vk::UniqueImageView output_view;
+     VideoCore::UniqueImage opaque_image;   ///< scene color before the blended draws
+     VideoCore::UniqueImage reactive_image; ///< R8 reactive mask
 diff --git a/gpu/shadps4/video_core/texture_cache/blit_helper.cpp b/gpu/shadps4/video_core/texture_cache/blit_helper.cpp
 index 03427b7..c2be51e 100644
 --- a/gpu/shadps4/video_core/texture_cache/blit_helper.cpp
@@ -1343,10 +2722,10 @@ index 494d151..85c8231 100644
      g_window_thread = std::thread([title, width, height] {
          Common::SetCurrentThreadName("bb:window");
 diff --git a/gpu/shim/bbport_overlay.cpp b/gpu/shim/bbport_overlay.cpp
-index c6f7c9a..4459551 100644
+index c6f7c9a..0323c0c 100644
 --- a/gpu/shim/bbport_overlay.cpp
 +++ b/gpu/shim/bbport_overlay.cpp
-@@ -7,6 +7,7 @@
+@@ -7,10 +7,12 @@
  #include <cmath>
  #include <cstdio>
  #include <cstdlib>
@@ -1354,7 +2733,26 @@ index c6f7c9a..4459551 100644
  #include <mutex>
  
  #include <SDL3/SDL.h>
-@@ -168,7 +169,7 @@ void Menu() {
+ #include "bbport_settings.h"
++#include "bbport_toggles.h"
+ #include "imgui.h"
+ #include "imgui_impl_vulkan.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+@@ -59,6 +61,13 @@ float base_scale = 1.0f;
+ 
+ // Present rate for the FPS counter.
+ std::chrono::steady_clock::time_point last_present{};
++std::chrono::steady_clock::time_point last_real_present{}, last_generated{};
++float base_ms_avg = 0.0f;
++
++/// Frame generation presented a frame within the last second.
++bool Generating() {
++    return std::chrono::steady_clock::now() - last_generated < std::chrono::seconds(1);
++}
+ float frame_ms_avg = 0.0f;
+ 
+ void SetOpen(bool value) {
+@@ -168,7 +177,7 @@ void Menu() {
          ImVec2(0.0f, 0.0f),
          ImVec2(FLT_MAX, std::max(viewport->WorkSize.y - 60.0f * base_scale, 200.0f * base_scale)));
      bool keep_open = true;
@@ -1363,7 +2761,7 @@ index c6f7c9a..4459551 100644
                        ImGuiWindowFlags_NoCollapse)) {
          ImGui::End();
          return;
-@@ -176,6 +177,12 @@ void Menu() {
+@@ -176,6 +185,12 @@ void Menu() {
      ImGui::Text("%.0f FPS  (%.1f ms)", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
                  frame_ms_avg);
  
@@ -1376,7 +2774,16 @@ index c6f7c9a..4459551 100644
      ImGui::SeparatorText("Temporal upscaling");
      static const char* upscalers[] = {"Off", "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
                                       "TAA (native anti-aliasing)", "DLSS (NVIDIA RTX)"};
-@@ -225,6 +232,10 @@ void Menu() {
+@@ -217,7 +232,7 @@ void Menu() {
+     }
+     if (BbSettings::IsFsr4(s.upscaler)) {
+         if (s.upscaler == BbSettings::UpscalerFsr411) {
+-            Hint("FSR 4.1.1 INT8: AMD 4.1.1 DLL model reproduced in Vulkan. One model covers Native through Performance, with another for Ultra Performance. Assets: tools/fsr4cap/build_assets.sh (requires the DLL and Proton).");
++            Hint("FSR 4.1.1 INT8: AMD 4.1.1 DLL model reproduced in Vulkan. One model covers Native through Performance, with another for Ultra Performance. Set it up once in the launcher (SETUP, Set up FSR 4.1.1) from your own amd_fidelityfx_upscaler_dx12.dll.");
+         } else {
+             Hint("FSR 4 INT8 uses the v07 model from the AMD FidelityFX SDK. Higher quality than FSR 3.1, with more GPU work. Changing presets rebuilds the model and may pause briefly. Assets: tools/fetch_fsr4_assets.sh.");
+         }
+@@ -225,6 +240,10 @@ void Menu() {
          Checkbox("FSR 4: invert jitter", s.fsr4_invert_jitter);
          Hint("Ghosting diagnostics: FSR 4 uses exposure to normalize color and decide when to discard history. These options apply immediately.");
      }
@@ -1387,7 +2794,7 @@ index c6f7c9a..4459551 100644
      const bool upscaler_on = s.upscaler != BbSettings::UpscalerOff;
      const bool taa = s.upscaler == BbSettings::UpscalerTaa;
      ImGui::BeginDisabled(!upscaler_on);
-@@ -334,6 +345,9 @@ void Menu() {
+@@ -334,6 +353,9 @@ void Menu() {
          ImGui::EndCombo();
      }
      Hint("On: output and presets change without restarting, while game post-processing stays at 1080p. Off: the scene is patched to the preset resolution at startup. Auto enables the live path on capable discrete GPUs. Changes apply after restarting the game.");
@@ -1397,7 +2804,7 @@ index c6f7c9a..4459551 100644
      ImGui::SeparatorText("Game effects (restart required)");
      static const char* lods[] = {"Highest (-2)", "Original", "Lower (1)", "Lowest (2)"};
      static constexpr int lod_values[] = {-2, 0, 1, 2};
-@@ -354,6 +368,7 @@ void Menu() {
+@@ -354,6 +376,7 @@ void Menu() {
      }
      Hint("Effects are applied through game patches at startup (patches/Bloodborne.xml). Motion blur and dynamic shadows can increase GPU load.");
      Hint("Free camera: hold Cross and press L3 (keyboard: Space + Z). Debug menu: left touchpad / Tab. Requires DbgFont14h.ccm and DbgFont14h.tpf in dvdroot_ps4/font from the debug-font mod. Right touchpad: Backspace.");
@@ -1405,15 +2812,26 @@ index c6f7c9a..4459551 100644
  
      bool restart = s.object_motion != s.startup_object_motion ||
                     s.model_lod != s.startup_model_lod ||
-@@ -371,6 +386,7 @@ void Menu() {
+@@ -371,8 +394,18 @@ void Menu() {
          }
      }
  
++    if (std::getenv("BB_DC_UPSCALE") && std::getenv("BB_DC_UPSCALE")[0] == '1') {
++        ImGui::SeparatorText("Frame generation");
++        Checkbox("FSR 3 frame generation", s.frame_gen);
++        ImGui::TextDisabled("A generated frame between each two: twice the frames shown.");
++        if (s.frame_gen && s.upscaler == BbSettings::UpscalerOff) {
++            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Needs an upscaler (FSR 3.1 or FSR 4)");
++        }
++    }
 +    } // !no_upscaler
      ImGui::SeparatorText("Other");
      Checkbox("Show FPS counter", s.show_fps);
++    Checkbox("Motion blur", s.motion_blur);
  
-@@ -397,7 +413,7 @@ void Menu() {
+     ImGui::Spacing();
+     if (ImGui::Button("Close")) {
+@@ -397,7 +430,7 @@ void Menu() {
          quit_armed = false;
      }
      ImGui::SameLine();
@@ -1422,7 +2840,55 @@ index c6f7c9a..4459551 100644
      ImGui::End();
      if (!keep_open) {
          SetOpen(false);
-@@ -464,7 +480,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count)
+@@ -440,14 +473,39 @@ void FpsCounter() {
+                      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                      ImGuiWindowFlags_NoFocusOnAppearing);
+     const auto& s = BbSettings::Get();
+-    ImGui::Text("%.0f FPS  %.1f ms  %s", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
+-                frame_ms_avg,
+-                s.upscaler == BbSettings::UpscalerFsr3   ? "FSR 3.1"
+-                : s.upscaler == BbSettings::UpscalerFsr4 ? "FSR 4"
+-                : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
+-                : s.upscaler == BbSettings::UpscalerTaa ? "TAA"
+-                : s.upscaler == BbSettings::UpscalerDlss ? "DLSS"
+-                                                         : "");
++    const char* upscaler = s.upscaler == BbSettings::UpscalerFsr3     ? "FSR 3.1"
++                           : s.upscaler == BbSettings::UpscalerFsr4   ? "FSR 4"
++                           : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
++                           : s.upscaler == BbSettings::UpscalerTaa    ? "TAA"
++                           : s.upscaler == BbSettings::UpscalerDlss   ? "DLSS"
++                                                                      : "";
++    // Driveclub: the upscaler only counts while it really replaces the TAA resolve (scenes with
++    // a resolve it does not know, menus and movies show the game's own).
++    static const bool dc_mode = [] {
++        const char* env = std::getenv("BB_DC_UPSCALE");
++        return env && env[0] == '1';
++    }();
++    if (dc_mode && s.upscaler != BbSettings::UpscalerOff) {
++        static u64 last_count;
++        static std::chrono::steady_clock::time_point last_change{};
++        const u64 count = BbStats::dc_upscaled_frames.load(std::memory_order_relaxed);
++        const auto now = std::chrono::steady_clock::now();
++        if (count != last_count) {
++            last_count = count;
++            last_change = now;
++        }
++        if (now - last_change > std::chrono::milliseconds(500)) {
++            upscaler = "TAA";
++        }
++    }
++    const float fps = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f;
++    if (Generating() && base_ms_avg > 0.0f) {
++        // Shown frames, the game's own (base) frames, and the base frame time.
++        ImGui::Text("%.0f FPS (%.0f base)  %.1f ms  %s + FG", fps, 1000.0f / base_ms_avg,
++                    base_ms_avg, upscaler);
++    } else {
++        ImGui::Text("%.0f FPS  %.1f ms  %s", fps, frame_ms_avg, upscaler);
++    }
+     ImGui::End();
+ }
+ 
+@@ -464,14 +522,54 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count)
      io.IniFilename = nullptr; // window positions are not kept
      io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
      io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
@@ -1431,8 +2897,98 @@ index c6f7c9a..4459551 100644
  
      ImGui::StyleColorsDark();
      ImGuiStyle& style = ImGui::GetStyle();
+     style.WindowRounding = 6.0f;
+     style.FrameRounding = 4.0f;
+     style.GrabRounding = 4.0f;
+-    style.Colors[ImGuiCol_WindowBg].w = 0.92f;
++    // The launcher's palette: near-black panels, racing red accent (#d81f2a).
++    const auto rgb = [](int hex, float a = 1.0f) {
++        return ImVec4(((hex >> 16) & 0xff) / 255.0f, ((hex >> 8) & 0xff) / 255.0f,
++                      (hex & 0xff) / 255.0f, a);
++    };
++    ImVec4* c = style.Colors;
++    c[ImGuiCol_Text] = rgb(0xe8eaed);
++    c[ImGuiCol_WindowBg] = rgb(0x101318, 0.92f);
++    c[ImGuiCol_PopupBg] = rgb(0x101318, 0.96f);
++    c[ImGuiCol_Border] = rgb(0x2a3038);
++    c[ImGuiCol_FrameBg] = rgb(0x1b2028);
++    c[ImGuiCol_FrameBgHovered] = rgb(0x262c36);
++    c[ImGuiCol_FrameBgActive] = rgb(0x30363f);
++    c[ImGuiCol_TitleBg] = rgb(0x101318);
++    c[ImGuiCol_TitleBgActive] = rgb(0x8f141c);
++    c[ImGuiCol_TitleBgCollapsed] = rgb(0x101318);
++    c[ImGuiCol_CheckMark] = rgb(0xd81f2a);
++    c[ImGuiCol_SliderGrab] = rgb(0xd81f2a);
++    c[ImGuiCol_SliderGrabActive] = rgb(0xf0343f);
++    c[ImGuiCol_Button] = rgb(0xd81f2a, 0.55f);
++    c[ImGuiCol_ButtonHovered] = rgb(0xd81f2a, 0.85f);
++    c[ImGuiCol_ButtonActive] = rgb(0xf0343f);
++    c[ImGuiCol_Header] = rgb(0xd81f2a, 0.40f);
++    c[ImGuiCol_HeaderHovered] = rgb(0xd81f2a, 0.70f);
++    c[ImGuiCol_HeaderActive] = rgb(0xd81f2a);
++    c[ImGuiCol_Separator] = rgb(0x2a3038);
++    c[ImGuiCol_SeparatorHovered] = rgb(0xd81f2a, 0.70f);
++    c[ImGuiCol_SeparatorActive] = rgb(0xd81f2a);
++    c[ImGuiCol_ResizeGrip] = rgb(0xd81f2a, 0.25f);
++    c[ImGuiCol_ResizeGripHovered] = rgb(0xd81f2a, 0.65f);
++    c[ImGuiCol_ResizeGripActive] = rgb(0xd81f2a, 0.95f);
++    c[ImGuiCol_Tab] = rgb(0x1b2028);
++    c[ImGuiCol_TabHovered] = rgb(0xd81f2a, 0.80f);
++    c[ImGuiCol_TabSelected] = rgb(0xb01922);
++    c[ImGuiCol_TabSelectedOverline] = rgb(0xd81f2a);
++    c[ImGuiCol_TabDimmed] = rgb(0x1b2028);
++    c[ImGuiCol_TabDimmedSelected] = rgb(0x8f141c);
++    c[ImGuiCol_TextSelectedBg] = rgb(0xd81f2a, 0.35f);
++    c[ImGuiCol_NavCursor] = rgb(0xd81f2a);
++    c[ImGuiCol_PlotHistogram] = rgb(0xd81f2a);
++    c[ImGuiCol_PlotLines] = rgb(0xd81f2a);
+ 
+     ImFontConfig font_config;
+     font_config.FontDataOwnedByAtlas = false;
+@@ -633,7 +731,7 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
+     text_entry_text = text;
+ }
+ 
+-void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
++void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent, bool generated) {
+     // Present interval for the FPS readout (measured also while nothing is drawn).
+     const auto now = std::chrono::steady_clock::now();
+     const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
+@@ -641,6 +739,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+     if (ms > 0.0f && ms < 1000.0f) {
+         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
+     }
++    // The game's own frames apart, while frame generation adds its frames between them.
++    if (generated) {
++        last_generated = now;
++    } else {
++        const float real_ms =
++            std::chrono::duration<float, std::milli>(now - last_real_present).count();
++        last_real_present = now;
++        if (real_ms > 0.0f && real_ms < 1000.0f) {
++            base_ms_avg = base_ms_avg == 0.0f ? real_ms : base_ms_avg * 0.95f + real_ms * 0.05f;
++        }
++    }
+     if (!Visible()) {
+         return;
+     }
+diff --git a/gpu/shim/bbport_overlay.h b/gpu/shim/bbport_overlay.h
+index acc89b0..7f8ede9 100644
+--- a/gpu/shim/bbport_overlay.h
++++ b/gpu/shim/bbport_overlay.h
+@@ -30,7 +30,9 @@ void UpdateTextInput(SDL_Window* window);
+ bool Visible();
+ 
+ /// Present thread: draws into `view` (layout ColorAttachmentOptimal).
+-void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
++/// generated: frame generation's image (counted in the FPS, not in the game's base rate).
++void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
++            bool generated = false);
+ 
+ /// The menu is open or a text entry is shown: the game's input is held neutral.
+ bool CapturesInput();
 diff --git a/gpu/shim/bbport_settings.cpp b/gpu/shim/bbport_settings.cpp
-index 7743165..c2f9b33 100644
+index 7743165..cf0a78d 100644
 --- a/gpu/shim/bbport_settings.cpp
 +++ b/gpu/shim/bbport_settings.cpp
 @@ -14,7 +14,7 @@ namespace {
@@ -1444,7 +3000,18 @@ index 7743165..c2f9b33 100644
  }
  
  float Clamp(float v, float lo, float hi) {
-@@ -191,7 +191,7 @@ void Save() {
+@@ -52,6 +52,10 @@ void Set(Values& v, const std::string& key, const std::string& value) {
+         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
+     } else if (key == "show_fps") {
+         v.show_fps = i != 0;
++    } else if (key == "frame_gen") {
++        v.frame_gen = i != 0;
++    } else if (key == "motion_blur") {
++        v.motion_blur = i != 0;
+     } else if (key == "fsr4_auto_exposure") {
+         v.fsr4_auto_exposure = i != 0;
+     } else if (key == "fsr4_invert_jitter") {
+@@ -191,15 +195,15 @@ void Save() {
          return;
      }
      std::fprintf(file,
@@ -1452,12 +3019,48 @@ index 7743165..c2f9b33 100644
 +                 "# DCport settings (in-game menu: Insert / L3+R3)\n"
                   "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                   "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
-                  "debug_view=%d\nshow_fps=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
+-                 "debug_view=%d\nshow_fps=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
++                 "debug_view=%d\nshow_fps=%d\nframe_gen=%d\nmotion_blur=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
+                  UpscalerName(v.upscaler), v.preset.load(), int(v.sharpen.load()),
+                  v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),
+                  int(v.object_motion.load()),
+                  v.reactive_scale.load(), v.reactive_threshold.load(), v.reactive_max.load(),
+-                 v.debug_view.load(), int(v.show_fps.load()),
++                 v.debug_view.load(), int(v.show_fps.load()), int(v.frame_gen.load()), int(v.motion_blur.load()),
+                  int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()));
+     // Read by patches.py at start.
+     for (int e = 0; e < EffectCount; ++e) {
+diff --git a/gpu/shim/bbport_settings.h b/gpu/shim/bbport_settings.h
+index 254cfcb..ca9474c 100644
+--- a/gpu/shim/bbport_settings.h
++++ b/gpu/shim/bbport_settings.h
+@@ -74,6 +74,11 @@ struct Values {
+     std::atomic<float> reactive_max{0.9f};
+     std::atomic<int> debug_view{DebugNone};
+     std::atomic<bool> show_fps{false};
++    /// Driveclub: FSR 3 frame generation, one generated frame before each real one (needs FSR).
++    std::atomic<bool> frame_gen{false};
++    /// Driveclub: the TAA resolve's motion blur (off: its strength constant set to 0, so the
++    /// resolve, its anti-aliasing and the upscaler keep running).
++    std::atomic<bool> motion_blur{true};
+     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
+     std::atomic<bool> fsr4_auto_exposure{true};
+     std::atomic<bool> fsr4_invert_jitter{false};
 diff --git a/gpu/shim/bbport_toggles.h b/gpu/shim/bbport_toggles.h
-index 57a9486..5eaf908 100644
+index 57a9486..c458a76 100644
 --- a/gpu/shim/bbport_toggles.h
 +++ b/gpu/shim/bbport_toggles.h
-@@ -119,6 +119,22 @@ inline std::atomic<std::uint64_t> reduced_draws{0}, scene_draws{0};
+@@ -88,6 +88,9 @@ inline std::atomic<int> gpu_thread_clock{-1}; ///< clockid_t of the GPU command
+ inline std::atomic<std::uint64_t> draws{0}, dispatches{0}, submissions{0};
+ /// Frames the GPU command thread has started (display pass), for per-frame diagnostics.
+ inline std::atomic<std::uint64_t> gpu_frames{0};
++/// Driveclub: frames the upscaler replaced the game's TAA resolve in (the FPS counter shows
++/// the upscaler only while this grows).
++inline std::atomic<std::uint64_t> dc_upscaled_frames{0};
+ /// Wall time spent in operations suspected of stalls (ns, all threads).
+ inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}, t_refresh{0},
+     t_staging{0}, t_host_wait{0}, t_copy{0}, copy_bytes{0}, t_read_faults{0}, read_faults{0},
+@@ -119,6 +122,22 @@ inline std::atomic<std::uint64_t> reduced_draws{0}, scene_draws{0};
  /// for host copies before a submission or fence, and for GPU ticks.
  inline std::atomic<std::uint64_t> sync_recording_ns{0}, host_copies_wait_ns{0}, tick_wait_ns{0},
      copy_threads_wait_ns{0}, host_copy_waits{0};
@@ -1480,6 +3083,12 @@ index 57a9486..5eaf908 100644
  struct WaitTimer {
      std::atomic<std::uint64_t>& total;
      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+diff --git a/gpu/third_party/fsr-vulkan b/gpu/third_party/fsr-vulkan
+--- a/gpu/third_party/fsr-vulkan
++++ b/gpu/third_party/fsr-vulkan
+@@ -1 +1 @@
+-Subproject commit c64f093404125e960813f95f1996c14780f0dd69
++Subproject commit c64f093404125e960813f95f1996c14780f0dd69-dirty
 diff --git a/packaging/windows/bb-probe.rc b/packaging/windows/bb-probe.rc
 index 46d615e..a980e63 100644
 --- a/packaging/windows/bb-probe.rc
@@ -1513,460 +3122,6 @@ index 46d615e..a980e63 100644
 +        VALUE "Translation", 0x409, 1200
 +    END
 +END
-diff --git a/src/probe.c b/src/probe.c
-index 07344eb..6b06555 100644
---- a/src/probe.c
-+++ b/src/probe.c
-@@ -13,6 +13,7 @@
- #endif
- #ifdef _WIN32
- #include <windows.h>
-+#include <signal.h>
- #else
- #include <sys/mman.h>
- #include <malloc.h>
-@@ -73,8 +74,20 @@ static void protect(void *p, size_t size, unsigned flags) {
-     if (mprotect(p, size, mode)) fail("mprotect failed");
- #endif
- }
--static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argument) {
-+static ABI uint64_t unresolved(uint32_t id, uintptr_t argument) {
-     if (id >= import_count) fail("bad import trap index");
-+    /* BB_LENIENT_IMPORTS=1: an import nothing implements returns 0 (logged once each) instead of
-+     * stopping, to bring up games other than the one the runtime was written for. */
-+    static int lenient = -1;
-+    if (lenient < 0) lenient = getenv("BB_LENIENT_IMPORTS") && !strcmp(getenv("BB_LENIENT_IMPORTS"), "1");
-+    if (lenient) {
-+        static unsigned char logged[100000];
-+        if (id < sizeof(logged) && !__atomic_exchange_n(&logged[id], 1, __ATOMIC_RELAXED))
-+            printf("Lenient import: %s (%s) returns 0; first argument 0x%" PRIxPTR "\n",
-+                   names[id], runtime_import_name(names[id]), argument);
-+        fflush(stdout);
-+        return 0;
-+    }
-     printf("STOP: first unsupported PS4 import: %s (index %u)\n", names[id], id);
-     printf("API: %s\n", runtime_import_name(names[id]));
-     printf("Caller return offset: 0x%" PRIxPTR "; first argument: 0x%" PRIxPTR "\n",
-@@ -146,7 +159,7 @@ static void check_cpu(void) {
-     snprintf(text,sizeof(text),"This processor cannot run the game:\n%s\n\nMissing instructions: %s\n\n"
-              "The game uses instructions of the PS4's processor. They need an Intel Core of the 4th "
-              "generation (Haswell, 2013) or newer, or an AMD Ryzen.",name,missing);
--    MessageBoxA(NULL,text,"Bloodborne",MB_OK|MB_ICONERROR|MB_SETFOREGROUND);
-+    MessageBoxA(NULL,text,"DRIVECLUB",MB_OK|MB_ICONERROR|MB_SETFOREGROUND);
- #endif
-     exit(24);
- }
-@@ -228,6 +241,29 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
-     return EXCEPTION_CONTINUE_SEARCH;
- }
- static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
-+/* abort() (an uncaught C++ exception, a library check) ends the process with 0xC0000409 and no
-+ * message: say so, with the host call stack as module+offset (llvm-symbolizer resolves them). */
-+static void abort_handler(int sig) {
-+    (void)sig;
-+    printf("STOP: the runtime aborted (abort/terminate); host stack:\n");
-+    void *frames[48];
-+    const USHORT count = RtlCaptureStackBackTrace(1, 48, frames, NULL);
-+    for (USHORT i = 0; i < count; ++i) {
-+        HMODULE module = NULL;
-+        char name[MAX_PATH] = "?";
-+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-+                               (LPCSTR)frames[i], &module) && module) {
-+            GetModuleFileNameA(module, name, sizeof(name));
-+            const char *base = strrchr(name, '\\');
-+            printf("  #%u %s+0x%llx\n", (unsigned)i, base ? base + 1 : name,
-+                   (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)module));
-+        } else {
-+            printf("  #%u %p\n", (unsigned)i, frames[i]);
-+        }
-+    }
-+    fflush(NULL);
-+}
- /* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
-  * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
- uint32_t runtime_thread_tcb_offset(void);
-@@ -493,6 +529,7 @@ int main(int argc, char **argv) {
-     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
-     AddVectoredExceptionHandler(1, vectored_fault);
-     SetUnhandledExceptionFilter(unhandled_fault);
-+    signal(SIGABRT, abort_handler);
-     if (getenv("BB_STRICT_HANDLES")) {
-         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
-         strict.RaiseExceptionOnInvalidHandleReference=1;
-@@ -616,7 +653,7 @@ int main(int argc, char **argv) {
-     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
-     fclose(f);
-     if (!cpu_only) {
--        char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
-+        char title[128]="DRIVECLUB", serial[16]="UNKNOWN", sfo[4096];
-         uint32_t attributes=0;
-         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
-         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
-diff --git a/src/runtime.c b/src/runtime.c
-index 25865ae..005a9d4 100644
---- a/src/runtime.c
-+++ b/src/runtime.c
-@@ -236,16 +236,27 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
-     if (save) return save;
-     uintptr_t file = runtime_file_resolve(name);
-     if (file) return file;
--    return bbgpu_resolve(name);
-+    uintptr_t gpu = bbgpu_resolve(name);
-+    if (gpu) return gpu;
-+    return runtime_dc_resolve(name);
- }
- static const struct { const char *nid, *symbol; } import_names[]={
- #include "import_names.inc"
- };
--/* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
-+static const struct { const char *nid, *symbol; } all_names[]={
-+#include "nid_names_all.inc"
-+};
-+static int compare_nid(const void *key, const void *entry) {
-+    return strncmp((const char *)key, *(const char *const *)entry, 11);
-+}
-+/* Symbol name for a scoped NID: the exact Bloodborne spelling first, then the bare NID
-+ * (other games number their library keys differently), or NULL when unknown. */
- const char *runtime_symbol(const char *nid) {
-     for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
-         if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
--    return NULL;
-+    if (strlen(nid) < 11 || (nid[11] && nid[11] != '#')) return NULL;
-+    const void *found=bsearch(nid,all_names,sizeof(all_names)/sizeof(*all_names),sizeof(*all_names),compare_nid);
-+    return found ? ((const char *const *)found)[1] : NULL;
- }
- /* Same symbol name means same contract whether imported from libkernel or
-  * libScePosix, so newer modules resolve by name through runtime_symbol. */
-diff --git a/src/runtime.h b/src/runtime.h
-index 773ee79..1e4e569 100644
---- a/src/runtime.h
-+++ b/src/runtime.h
-@@ -85,8 +85,15 @@ uintptr_t runtime_pad_resolve(const char *name);
- void runtime_pad_report(void);
- uintptr_t runtime_rtc_resolve(const char *name);
- const char *runtime_file_user_dir(void);
-+const char *runtime_file_app_dir(void);
-+ABI int32_t runtime_addcont_info(uint32_t service, const char *label, void *info);
-+ABI int32_t runtime_addcont_mount(uint32_t service, const char *label, char *mount_point);
- void runtime_savedata_configure(const char *title);
- uintptr_t runtime_savedata_resolve(const char *name);
- void runtime_savedata_report(void);
- void runtime_thread_attach_host(const char *name);
-+/* Driveclub's system functions the Bloodborne runtime has no contract for (runtime_dc.c). */
-+uintptr_t runtime_dc_resolve(const char *name);
-+/* libSceFont on FreeType (runtime_font.c). */
-+uintptr_t runtime_font_resolve(const char *name);
- #endif
-diff --git a/src/runtime_content.c b/src/runtime_content.c
-index 045f3c0..4da5a08 100644
---- a/src/runtime_content.c
-+++ b/src/runtime_content.c
-@@ -1,6 +1,7 @@
- /* Offline AppContent provider for the configured base-game profile.
-- * No package/DLC mounting, downloads, entitlement or license emulation; add-on folders in
-- * <user>/addcont/<title id> and BB_DLC_DIR are reported as installed (see addon_list). */
-+ * No downloads or license checks: add-on folders the player supplies (their own dumped
-+ * entitlement folders) in <user>/addcont/<title id>, BB_DLC_DIR or the game folder itself are
-+ * reported as installed (see addon_list); mounting one maps /addcontN onto its folder. */
- #include "runtime.h"
- #include <dirent.h>
- #include <stdio.h>
-@@ -75,35 +76,33 @@ static ABI int32_t param_int(uint32_t id,int32_t *out) {
- /* SceAppContentAddcontInfo: entitlement label (16 chars + NUL), padding, download status. */
- #define LABEL_SIZE 17
- #define ADDON_INSTALLED 4u
--#define MAX_ADDONS 64
-+#define MAX_ADDONS 2048
- typedef struct { char label[LABEL_SIZE]; char padding[3]; uint32_t status; } AddonInfo;
- /* The add-on folders of one folder: each subfolder is named by its entitlement label (up to 16
-- * characters), as dumped (SPEXPANSIONDLC03/sce_sys/...). Labels seen before are skipped. */
--static void scan_labels(const char *folder,char labels[][LABEL_SIZE],uint32_t *count) {
-+ * characters), as dumped (DCXTOURXXXXXX001/sce_sys/...). Labels seen before are skipped. In the
-+ * game folder only subfolders with their own sce_sys/param.sfo count (not sce_sys, sce_module). */
-+static char label_dirs[MAX_ADDONS][512];
-+static void scan_labels(const char *folder,char labels[][LABEL_SIZE],uint32_t *count,int need_sfo) {
-     DIR *dir=opendir(folder);
-     for (struct dirent *e; dir && (e=readdir(dir));) {
--        char path[4096];
-+        char path[4096], sfo[4200];
-         struct stat entry;
-         size_t n=strlen(e->d_name);
-         if (e->d_name[0]=='.' || n>=LABEL_SIZE || *count>=MAX_ADDONS) continue;
-         if (snprintf(path,sizeof(path),"%s/%s",folder,e->d_name)>=(int)sizeof(path) ||
--            stat(path,&entry) || !S_ISDIR(entry.st_mode)) continue;
-+            stat(path,&entry) || !S_ISDIR(entry.st_mode) || strlen(path)>=sizeof(label_dirs[0])) continue;
-+        if (need_sfo) {
-+            snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",path);
-+            if (stat(sfo,&entry) || !S_ISREG(entry.st_mode)) continue;
-+        }
-         int seen=0;
-         for (uint32_t i=0;i<*count;++i) seen|=!strcmp(labels[i],e->d_name);
--        if (!seen) memcpy(labels[(*count)++],e->d_name,n+1);
-+        if (!seen) { memcpy(labels[*count],e->d_name,n+1); snprintf(label_dirs[*count],sizeof(label_dirs[0]),"%s",path); ++*count; }
-     }
-     if (dir) closedir(dir);
- }
--/* Add-ons are the folders <user>/addcont/<title id>/<entitlement label> (shadPS4's layout) and
-- * those of BB_DLC_DIR (the launcher's DLC folder: <label> folders), each reported as installed.
-- * No add-on data is mounted: Bloodborne: The Old Hunters (SPEXPANSIONDLC03) needs only the
-- * entitlement, its data ships with patch 1.09. Without a list the count is returned, with one
-- * at most capacity entries are written. Never touch unused list slots. */
--static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
--    require_initialized();
--    if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
--    if ((!capacity || !list) && !hits) return PARAMETER;
--    static char labels[MAX_ADDONS][LABEL_SIZE];
-+/* Folders are scanned once per run (DRIVECLUB has over a thousand add-ons and asks per label). */
-+static uint32_t scan_all(char labels[][LABEL_SIZE]) {
-     uint32_t found=0;
-     char root[4096];
-     int fits=snprintf(root,sizeof(root),"%s/addcont",runtime_file_user_dir())<(int)sizeof(root);
-@@ -111,11 +110,34 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
-     for (struct dirent *t; titles && (t=readdir(titles));) {
-         char title[4096];
-         if (t->d_name[0]=='.' || snprintf(title,sizeof(title),"%s/%s",root,t->d_name)>=(int)sizeof(title)) continue;
--        scan_labels(title,labels,&found);
-+        scan_labels(title,labels,&found,0);
-     }
-     if (titles) closedir(titles);
-     const char *dlc=getenv("BB_DLC_DIR");
--    if (dlc && *dlc) scan_labels(dlc,labels,&found);
-+    if (dlc && *dlc) scan_labels(dlc,labels,&found,0);
-+    const char *app=runtime_file_app_dir();
-+    if (app && *app) scan_labels(app,labels,&found,1);
-+    return found;
-+}
-+static char cached_labels[MAX_ADDONS][LABEL_SIZE];
-+static uint32_t cached_count;
-+static int cached;
-+static uint32_t collect_labels(char labels[][LABEL_SIZE]) {
-+    if (!cached) { cached_count=scan_all(cached_labels); cached=1; }
-+    memcpy(labels,cached_labels,(size_t)cached_count*LABEL_SIZE);
-+    return cached_count;
-+}
-+/* Add-ons are the folders <user>/addcont/<title id>/<entitlement label> (shadPS4's layout) and
-+ * those of BB_DLC_DIR (the launcher's DLC folder: <label> folders), each reported as installed.
-+ * No add-on data is mounted: Bloodborne: The Old Hunters (SPEXPANSIONDLC03) needs only the
-+ * entitlement, its data ships with patch 1.09. Without a list the count is returned, with one
-+ * at most capacity entries are written. Never touch unused list slots. */
-+static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
-+    require_initialized();
-+    if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
-+    if ((!capacity || !list) && !hits) return PARAMETER;
-+    static char labels[MAX_ADDONS][LABEL_SIZE];
-+    uint32_t found=collect_labels(labels);
-     uint32_t count=list && capacity && found>capacity ? capacity : found;
-     if (list && capacity) for (uint32_t i=0;i<count;++i) {
-         AddonInfo info;
-@@ -128,6 +150,38 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
-     if (found!=reported) printf("Runtime: AppContent add-ons reported installed: %u\n",(unsigned)(reported=found));
-     ++lists; return 0;
- }
-+/* Index of an installed add-on by entitlement label (SceNpUnifiedEntitlementLabel: 16 chars). */
-+static int find_label(const char *label,char labels[][LABEL_SIZE],uint32_t found) {
-+    if (!label) return -1;
-+    char want[LABEL_SIZE]; memcpy(want,label,LABEL_SIZE-1); want[LABEL_SIZE-1]=0;
-+    for (uint32_t i=0;i<found;++i) if (!strcmp(labels[i],want)) return (int)i;
-+    return -1;
-+}
-+#define ADDCONT_NOT_FOUND ((int32_t)0x80D90007)
-+ABI int32_t runtime_addcont_info(uint32_t service,const char *label,void *info) {
-+    static char labels[MAX_ADDONS][LABEL_SIZE];
-+    if (!label || !info) return PARAMETER;
-+    uint32_t found=collect_labels(labels);
-+    int i=find_label(label,labels,found);
-+    if (i<0 || service) return ADDCONT_NOT_FOUND;
-+    AddonInfo out; memset(&out,0,sizeof(out));
-+    memcpy(out.label,labels[i],strlen(labels[i])); out.status=ADDON_INSTALLED;
-+    memcpy(info,&out,sizeof(out));
-+    return 0;
-+}
-+/* Mounting maps /addcont<N> onto the add-on's folder (entitlement-only add-ons have no data). */
-+ABI int32_t runtime_addcont_mount(uint32_t service,const char *label,char *mount_point) {
-+    static char labels[MAX_ADDONS][LABEL_SIZE];
-+    if (!label || !mount_point) return PARAMETER;
-+    uint32_t found=collect_labels(labels);
-+    int i=find_label(label,labels,found);
-+    if (i<0 || service) return ADDCONT_NOT_FOUND;
-+    char guest[16]; snprintf(guest,sizeof(guest),"/addcont%d",i);
-+    if (runtime_file_mount(guest,label_dirs[i])) return BUSY;
-+    memset(mount_point,0,16); memcpy(mount_point,guest,strlen(guest));
-+    printf("Runtime: AppContent add-on %s mounted at %s\n",labels[i],guest);
-+    return 0;
-+}
- uintptr_t runtime_content_resolve(const char *name) {
-     if (!strcmp(name,"g8cM39EUZ6o#M#N")) return (uintptr_t)module_load;
-     if (!strcmp(name,"fMP5NHUOaMk#M#N")) return (uintptr_t)module_loaded;
-diff --git a/src/runtime_file.c b/src/runtime_file.c
-index c64c0f9..a09cc57 100644
---- a/src/runtime_file.c
-+++ b/src/runtime_file.c
-@@ -105,11 +105,13 @@ void runtime_file_unmount(const char *guest) {
-     }
-     pthread_mutex_unlock(&lock);
- }
--static char user_root[512]="user";
-+static char user_root[512]="user", app_root[512]="";
- const char *runtime_file_user_dir(void) { return user_root; }
-+const char *runtime_file_app_dir(void) { return app_root; }
- void runtime_file_configure(const char *app0,const char *user) {
-     char path[600];
-     snprintf(user_root,sizeof(user_root),"%s",user);
-+    snprintf(app_root,sizeof(app_root),"%s",app0);
-     runtime_file_mount("/app0",app0);
-     runtime_file_mount("/hostapp",app0);
-     const char *writable[]={"temp0","download0","data"};
-diff --git a/src/runtime_input_config.c b/src/runtime_input_config.c
-index 8e359d6..b202c5b 100644
---- a/src/runtime_input_config.c
-+++ b/src/runtime_input_config.c
-@@ -504,7 +504,7 @@ void input_config_defaults(InputConfig *out) {
-  * single binding of that kind. launcher/bbport_input_config.py has a copy of the whole text
-  * (tests/test_input_defaults.py checks that they match). */
- #define DEFAULT_HEADER \
--"# bbport input (shadPS4 syntax: output = input, one input per line).\n" \
-+"# DCport input (shadPS4 syntax: output = input, one input per line).\n" \
- "# A shadPS4 input config (user/input_config/CUSA03173.ini) can be copied over this file.\n" \
- "# F7 toggles the mouse, F8 reloads this file.\n" \
- "\n"
-diff --git a/gpu/shadps4/video_core/host_shaders/dc_merge.comp b/gpu/shadps4/video_core/host_shaders/dc_merge.comp
-new file mode 100644
-index 0000000..0fbf48a
---- /dev/null
-+++ b/gpu/shadps4/video_core/host_shaders/dc_merge.comp
-@@ -0,0 +1,31 @@
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+// Driveclub: the upscaled scene back into the game's R11G11B10 scene color, stored as the
-+// color block would (negatives and NaN as 0, overflow as the largest finite value).
-+#version 450
-+#extension GL_EXT_samplerless_texture_functions : require
-+
-+layout(local_size_x = 8, local_size_y = 8) in;
-+
-+layout(binding = 0) uniform texture2D upscaled;
-+layout(binding = 1) uniform writeonly image2D scene_img;
-+layout(binding = 2) uniform texture2D motion_tex; // pixels, previous - current
-+
-+layout(push_constant) uniform Constants {
-+    uvec2 size;
-+    uint mode; // 0 upscaled scene, 1 motion vectors (BB_DC_DEBUG_MOTION=1)
-+};
-+
-+void main() {
-+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-+    if (any(greaterThanEqual(uvec2(pixel), size))) {
-+        return;
-+    }
-+    vec3 color = texelFetch(upscaled, pixel, 0).rgb;
-+    if (mode == 1u) {
-+        // Motion: red right, green down, blue its length; 0.5 is still (16 px full scale).
-+        const vec2 m = texelFetch(motion_tex, pixel, 0).xy;
-+        color = vec3(0.5 + m / 32.0, length(m) / 16.0) * 0.5;
-+    }
-+    const vec3 stored = mix(vec3(0.0), min(color, vec3(65024.0)), greaterThan(color, vec3(0.0)));
-+    imageStore(scene_img, pixel, vec4(stored, 1.0));
-+}
-diff --git a/gpu/shadps4/video_core/host_shaders/dc_motion.comp b/gpu/shadps4/video_core/host_shaders/dc_motion.comp
-new file mode 100644
-index 0000000..de5d757
---- /dev/null
-+++ b/gpu/shadps4/video_core/host_shaders/dc_motion.comp
-@@ -0,0 +1,63 @@
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+// Driveclub: motion vectors for the temporal upscaler, by the reprojection of the game's own TAA
-+// resolve (compute shader 0x403f86d4): the view position from the depth and the frame's view
-+// ray, through the current -> previous transform of the pixel's object (the world or a car),
-+// projected with the previous frame's camera. Pixels, previous - current, like camera_motion.
-+#version 450
-+#extension GL_EXT_samplerless_texture_functions : require
-+
-+layout(local_size_x = 8, local_size_y = 8) in;
-+
-+// The TAA resolve's buffers: frame constants, camera constants, and the object transforms
-+// (48 dwords per object; rows 16, 20, 24, 28 map view x, y, z and 1 to the previous clip).
-+layout(binding = 0, std430) readonly buffer Frame { uint frame_data[]; };
-+layout(binding = 1, std430) readonly buffer Camera { uint camera_data[]; };
-+layout(binding = 2, std430) readonly buffer Objects { uint object_data[]; };
-+layout(binding = 3) uniform texture2D gbuffer_tex; // RGBA8; alpha * 255, low 6 bits: object
-+layout(binding = 4) uniform texture2D depth_tex;   // D32, reversed (1 = near)
-+layout(binding = 5, rg16f) uniform writeonly image2D motion_img;
-+
-+layout(push_constant) uniform Constants {
-+    vec2 size;      // pixels
-+    vec2 jitter;    // this frame's viewport shift in pixels (x right, y down)
-+    uvec4 offsets;  // dwords from each binding's (aligned) start to the game's buffer
-+};
-+
-+float F(uint v) {
-+    return uintBitsToFloat(v);
-+}
-+
-+float Fr(uint i) { return F(frame_data[offsets.x + i]); }
-+float Ca(uint i) { return F(camera_data[offsets.y + i]); }
-+
-+vec4 Row(uint base) {
-+    base += offsets.z;
-+    return vec4(F(object_data[base]), F(object_data[base + 1u]), F(object_data[base + 2u]),
-+                F(object_data[base + 3u]));
-+}
-+
-+void main() {
-+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
-+        return;
-+    }
-+    // Depth was rasterised through a shifted viewport: the unjittered position, and no jitter
-+    // in the motion vectors.
-+    const vec2 uv = (vec2(pixel) + 0.5) / size - jitter / size;
-+    const float depth = texelFetch(depth_tex, pixel, 0).r;
-+    const uint object = uint(texelFetch(gbuffer_tex, pixel, 0).a * 255.0 + 0.5) & 63u;
-+
-+    const float ray_x = (Fr(76u) * uv.x + Fr(78u)) * Fr(94u) + Fr(92u);
-+    const float ray_y = (Fr(77u) * uv.y + Fr(79u)) * Fr(95u) + Fr(93u);
-+    const float z = 1.0 / -(Ca(118u) * depth + Ca(119u));
-+    const float view_x = z * ray_x;
-+    const float view_y = z * ray_y;
-+
-+    const uint base = object * 48u;
-+    const vec4 col_x = Row(base + 16u), col_y = Row(base + 20u), col_z = Row(base + 24u),
-+               col_w = Row(base + 28u);
-+    const vec4 prev_clip = view_x * col_x + view_y * col_y - z * col_z + col_w;
-+    const vec2 prev_uv =
-+        vec2(Ca(100u), Ca(101u)) * prev_clip.xy / prev_clip.w + vec2(Ca(102u), Ca(103u));
-+    imageStore(motion_img, pixel, vec4((prev_uv - uv) * size, 0.0, 0.0));
-+}
-diff --git a/gpu/shadps4/video_core/host_shaders/ms_depth_to_color.frag b/gpu/shadps4/video_core/host_shaders/ms_depth_to_color.frag
-new file mode 100644
-index 0000000..941eb89
---- /dev/null
-+++ b/gpu/shadps4/video_core/host_shaders/ms_depth_to_color.frag
-@@ -0,0 +1,25 @@
-+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+
-+#version 450 core
-+#extension GL_EXT_samplerless_texture_functions : require
-+
-+// Resolves a multi-sample depth image into a single-sample color image.
-+// Source is bound with aspect=Depth; destination is any Rxf color format
-+// whose R channel will receive the depth value. G/B left at 0, A at 1 so
-+// a shader that reads this as a sampler2D and swizzles to .rrrr or .r
-+// sees the expected depth value either way.
-+//
-+// Sample 0 is representative — averaging all samples would be wrong for
-+// depth-based effects that want a specific visibility decision rather than
-+// an intermediate value.
-+
-+layout (binding = 0, set = 0) uniform texture2DMS depth_ms;
-+
-+layout (location = 0) out vec4 out_color;
-+
-+void main()
-+{
-+    const float d = texelFetch(depth_ms, ivec2(gl_FragCoord.xy), 0).r;
-+    out_color = vec4(d, 0.0, 0.0, 1.0);
-+}
 diff --git a/src/nid_names_all.inc b/src/nid_names_all.inc
 new file mode 100644
 index 0000000..024c6a6
@@ -2941,6 +4096,353 @@ index 0000000..024c6a6
 +{"zlfEH8FmyUA","_Stoul"},
 +{"zr094EQ39Ww","__cxa_pure_virtual"},
 +{"zwY0YV91TTI","sceGnmSubmitCommandBuffers"},
+diff --git a/src/probe.c b/src/probe.c
+index 07344eb..f5b01d3 100644
+--- a/src/probe.c
++++ b/src/probe.c
+@@ -13,6 +13,7 @@
+ #endif
+ #ifdef _WIN32
+ #include <windows.h>
++#include <signal.h>
+ #else
+ #include <sys/mman.h>
+ #include <malloc.h>
+@@ -73,8 +74,20 @@ static void protect(void *p, size_t size, unsigned flags) {
+     if (mprotect(p, size, mode)) fail("mprotect failed");
+ #endif
+ }
+-static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argument) {
++static ABI uint64_t unresolved(uint32_t id, uintptr_t argument) {
+     if (id >= import_count) fail("bad import trap index");
++    /* BB_LENIENT_IMPORTS=1: an import nothing implements returns 0 (logged once each) instead of
++     * stopping, to bring up games other than the one the runtime was written for. */
++    static int lenient = -1;
++    if (lenient < 0) lenient = getenv("BB_LENIENT_IMPORTS") && !strcmp(getenv("BB_LENIENT_IMPORTS"), "1");
++    if (lenient) {
++        static unsigned char logged[100000];
++        if (id < sizeof(logged) && !__atomic_exchange_n(&logged[id], 1, __ATOMIC_RELAXED))
++            printf("Lenient import: %s (%s) returns 0; first argument 0x%" PRIxPTR "\n",
++                   names[id], runtime_import_name(names[id]), argument);
++        fflush(stdout);
++        return 0;
++    }
+     printf("STOP: first unsupported PS4 import: %s (index %u)\n", names[id], id);
+     printf("API: %s\n", runtime_import_name(names[id]));
+     printf("Caller return offset: 0x%" PRIxPTR "; first argument: 0x%" PRIxPTR "\n",
+@@ -146,7 +159,7 @@ static void check_cpu(void) {
+     snprintf(text,sizeof(text),"This processor cannot run the game:\n%s\n\nMissing instructions: %s\n\n"
+              "The game uses instructions of the PS4's processor. They need an Intel Core of the 4th "
+              "generation (Haswell, 2013) or newer, or an AMD Ryzen.",name,missing);
+-    MessageBoxA(NULL,text,"Bloodborne",MB_OK|MB_ICONERROR|MB_SETFOREGROUND);
++    MessageBoxA(NULL,text,"DRIVECLUB",MB_OK|MB_ICONERROR|MB_SETFOREGROUND);
+ #endif
+     exit(24);
+ }
+@@ -179,6 +192,30 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
+     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
+             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
+     if (gpu_enabled) bbgpu_dump_guest_writes(info);
++    /* Host code: unwound with the modules' unwind tables (frame pointers are not kept
++     * everywhere, e.g. in the C++ standard library); stops at guest code, which has none. */
++    {
++        CONTEXT ctx=*c;
++        for (int depth=0; depth<32 && ctx.Rip; ++depth) {
++            DWORD64 module_base=0;
++            PRUNTIME_FUNCTION fn=RtlLookupFunctionEntry(ctx.Rip,&module_base,NULL);
++            if (!fn) {
++                if (depth) break; /* guest code or no table: the rbp chain below */
++                DWORD64 ret=0;
++                SIZE_T got=0;
++                if (!ReadProcessMemory(GetCurrentProcess(),(void *)ctx.Rsp,&ret,sizeof(ret),&got) || got!=sizeof(ret)) break;
++                ctx.Rip=ret;
++                ctx.Rsp+=8;
++            } else {
++                void *handler=NULL;
++                DWORD64 establisher=0;
++                RtlVirtualUnwind(UNW_FLAG_NHANDLER,module_base,ctx.Rip,fn,&ctx,&handler,&establisher,NULL);
++            }
++            if (!ctx.Rip) break;
++            describe_address(where,sizeof(where),(uintptr_t)ctx.Rip);
++            fprintf(stderr,"  unwound #%d %s\n",depth,where);
++        }
++    }
+     /* rbp chain (guest and host code keep frame pointers). */
+     uintptr_t rbp=(uintptr_t)c->Rbp;
+     for (int depth=0; depth<24 && rbp; ++depth) {
+@@ -228,6 +265,41 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
+ static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
++/* abort() (an uncaught C++ exception, a library check) ends the process with 0xC0000409 and no
++ * message: say so, with the host call stack as module+offset (llvm-symbolizer resolves them). */
++static void abort_handler(int sig) {
++    (void)sig;
++    printf("STOP: the runtime aborted (abort/terminate); host stack:\n");
++    void *frames[48];
++    const USHORT count = RtlCaptureStackBackTrace(1, 48, frames, NULL);
++    for (USHORT i = 0; i < count; ++i) {
++        HMODULE module = NULL;
++        char name[MAX_PATH] = "?";
++        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                               (LPCSTR)frames[i], &module) && module) {
++            GetModuleFileNameA(module, name, sizeof(name));
++            const char *base = strrchr(name, '\\');
++            printf("  #%u %s+0x%llx\n", (unsigned)i, base ? base + 1 : name,
++                   (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)module));
++        } else {
++            printf("  #%u %p\n", (unsigned)i, frames[i]);
++        }
++    }
++    fflush(NULL);
++}
++static void invalid_parameter_handler(const wchar_t *expression, const wchar_t *function,
++                                      const wchar_t *file, unsigned line, uintptr_t reserved) {
++    (void)expression; (void)function; (void)file; (void)line; (void)reserved;
++    printf("STOP: invalid parameter to a C runtime function\n");
++    abort_handler(SIGABRT);
++    TerminateProcess(GetCurrentProcess(), 0xC0000409);
++}
++static void purecall_handler(void) {
++    printf("STOP: pure virtual function call\n");
++    abort_handler(SIGABRT);
++    TerminateProcess(GetCurrentProcess(), 0xC0000409);
++}
+ /* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
+  * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
+ uint32_t runtime_thread_tcb_offset(void);
+@@ -493,6 +565,11 @@ int main(int argc, char **argv) {
+     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
+     AddVectoredExceptionHandler(1, vectored_fault);
+     SetUnhandledExceptionFilter(unhandled_fault);
++    signal(SIGABRT, abort_handler);
++    /* The C runtime's invalid-parameter and pure-call checks end the process with a fast
++     * fail (0xC0000409) that no handler sees: report them like an abort first. */
++    _set_invalid_parameter_handler(invalid_parameter_handler);
++    _set_purecall_handler(purecall_handler);
+     if (getenv("BB_STRICT_HANDLES")) {
+         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
+         strict.RaiseExceptionOnInvalidHandleReference=1;
+@@ -616,7 +693,7 @@ int main(int argc, char **argv) {
+     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
+     fclose(f);
+     if (!cpu_only) {
+-        char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
++        char title[128]="DRIVECLUB", serial[16]="UNKNOWN", sfo[4096];
+         uint32_t attributes=0;
+         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
+         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
+@@ -624,7 +701,13 @@ int main(int argc, char **argv) {
+         sfo_value(sfo,"ATTRIBUTE",NULL,0,&attributes);
+         uint64_t sdk=0;
+         if (procparam) memcpy(&sdk,image+procparam+16,8); /* procparam: size, magic, count, sdk_version */
+-        BbGpuConfig gpu={title,serial,user_dir ? user_dir : "user",(uint32_t)sdk,attributes,1920,1080};
++        /* BB_WINDOW_SIZE=<w>x<h>: the window's size (the launcher's Display resolution);
++         * fullscreen covers the monitor whatever it is. */
++        unsigned window_w=1920, window_h=1080;
++        const char *size=getenv("BB_WINDOW_SIZE");
++        if (size && sscanf(size,"%ux%u",&window_w,&window_h)!=2) window_w=1920, window_h=1080;
++        if (window_w<640 || window_h<360 || window_w>7680 || window_h>4320) window_w=1920, window_h=1080;
++        BbGpuConfig gpu={title,serial,user_dir ? user_dir : "user",(uint32_t)sdk,attributes,window_w,window_h};
+         gpu_enabled=1; /* page tracking starts while the rasterizer registers guest memory */
+         if (bbgpu_init(&gpu)) fail("GPU initialization failed");
+         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
+diff --git a/src/runtime.c b/src/runtime.c
+index 25865ae..005a9d4 100644
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -236,16 +236,27 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
+     if (save) return save;
+     uintptr_t file = runtime_file_resolve(name);
+     if (file) return file;
+-    return bbgpu_resolve(name);
++    uintptr_t gpu = bbgpu_resolve(name);
++    if (gpu) return gpu;
++    return runtime_dc_resolve(name);
+ }
+ static const struct { const char *nid, *symbol; } import_names[]={
+ #include "import_names.inc"
+ };
+-/* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
++static const struct { const char *nid, *symbol; } all_names[]={
++#include "nid_names_all.inc"
++};
++static int compare_nid(const void *key, const void *entry) {
++    return strncmp((const char *)key, *(const char *const *)entry, 11);
++}
++/* Symbol name for a scoped NID: the exact Bloodborne spelling first, then the bare NID
++ * (other games number their library keys differently), or NULL when unknown. */
+ const char *runtime_symbol(const char *nid) {
+     for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
+         if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
+-    return NULL;
++    if (strlen(nid) < 11 || (nid[11] && nid[11] != '#')) return NULL;
++    const void *found=bsearch(nid,all_names,sizeof(all_names)/sizeof(*all_names),sizeof(*all_names),compare_nid);
++    return found ? ((const char *const *)found)[1] : NULL;
+ }
+ /* Same symbol name means same contract whether imported from libkernel or
+  * libScePosix, so newer modules resolve by name through runtime_symbol. */
+diff --git a/src/runtime.h b/src/runtime.h
+index 773ee79..1e4e569 100644
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -85,8 +85,15 @@ uintptr_t runtime_pad_resolve(const char *name);
+ void runtime_pad_report(void);
+ uintptr_t runtime_rtc_resolve(const char *name);
+ const char *runtime_file_user_dir(void);
++const char *runtime_file_app_dir(void);
++ABI int32_t runtime_addcont_info(uint32_t service, const char *label, void *info);
++ABI int32_t runtime_addcont_mount(uint32_t service, const char *label, char *mount_point);
+ void runtime_savedata_configure(const char *title);
+ uintptr_t runtime_savedata_resolve(const char *name);
+ void runtime_savedata_report(void);
+ void runtime_thread_attach_host(const char *name);
++/* Driveclub's system functions the Bloodborne runtime has no contract for (runtime_dc.c). */
++uintptr_t runtime_dc_resolve(const char *name);
++/* libSceFont on FreeType (runtime_font.c). */
++uintptr_t runtime_font_resolve(const char *name);
+ #endif
+diff --git a/src/runtime_content.c b/src/runtime_content.c
+index 045f3c0..4da5a08 100644
+--- a/src/runtime_content.c
++++ b/src/runtime_content.c
+@@ -1,6 +1,7 @@
+ /* Offline AppContent provider for the configured base-game profile.
+- * No package/DLC mounting, downloads, entitlement or license emulation; add-on folders in
+- * <user>/addcont/<title id> and BB_DLC_DIR are reported as installed (see addon_list). */
++ * No downloads or license checks: add-on folders the player supplies (their own dumped
++ * entitlement folders) in <user>/addcont/<title id>, BB_DLC_DIR or the game folder itself are
++ * reported as installed (see addon_list); mounting one maps /addcontN onto its folder. */
+ #include "runtime.h"
+ #include <dirent.h>
+ #include <stdio.h>
+@@ -75,35 +76,33 @@ static ABI int32_t param_int(uint32_t id,int32_t *out) {
+ /* SceAppContentAddcontInfo: entitlement label (16 chars + NUL), padding, download status. */
+ #define LABEL_SIZE 17
+ #define ADDON_INSTALLED 4u
+-#define MAX_ADDONS 64
++#define MAX_ADDONS 2048
+ typedef struct { char label[LABEL_SIZE]; char padding[3]; uint32_t status; } AddonInfo;
+ /* The add-on folders of one folder: each subfolder is named by its entitlement label (up to 16
+- * characters), as dumped (SPEXPANSIONDLC03/sce_sys/...). Labels seen before are skipped. */
+-static void scan_labels(const char *folder,char labels[][LABEL_SIZE],uint32_t *count) {
++ * characters), as dumped (DCXTOURXXXXXX001/sce_sys/...). Labels seen before are skipped. In the
++ * game folder only subfolders with their own sce_sys/param.sfo count (not sce_sys, sce_module). */
++static char label_dirs[MAX_ADDONS][512];
++static void scan_labels(const char *folder,char labels[][LABEL_SIZE],uint32_t *count,int need_sfo) {
+     DIR *dir=opendir(folder);
+     for (struct dirent *e; dir && (e=readdir(dir));) {
+-        char path[4096];
++        char path[4096], sfo[4200];
+         struct stat entry;
+         size_t n=strlen(e->d_name);
+         if (e->d_name[0]=='.' || n>=LABEL_SIZE || *count>=MAX_ADDONS) continue;
+         if (snprintf(path,sizeof(path),"%s/%s",folder,e->d_name)>=(int)sizeof(path) ||
+-            stat(path,&entry) || !S_ISDIR(entry.st_mode)) continue;
++            stat(path,&entry) || !S_ISDIR(entry.st_mode) || strlen(path)>=sizeof(label_dirs[0])) continue;
++        if (need_sfo) {
++            snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",path);
++            if (stat(sfo,&entry) || !S_ISREG(entry.st_mode)) continue;
++        }
+         int seen=0;
+         for (uint32_t i=0;i<*count;++i) seen|=!strcmp(labels[i],e->d_name);
+-        if (!seen) memcpy(labels[(*count)++],e->d_name,n+1);
++        if (!seen) { memcpy(labels[*count],e->d_name,n+1); snprintf(label_dirs[*count],sizeof(label_dirs[0]),"%s",path); ++*count; }
+     }
+     if (dir) closedir(dir);
+ }
+-/* Add-ons are the folders <user>/addcont/<title id>/<entitlement label> (shadPS4's layout) and
+- * those of BB_DLC_DIR (the launcher's DLC folder: <label> folders), each reported as installed.
+- * No add-on data is mounted: Bloodborne: The Old Hunters (SPEXPANSIONDLC03) needs only the
+- * entitlement, its data ships with patch 1.09. Without a list the count is returned, with one
+- * at most capacity entries are written. Never touch unused list slots. */
+-static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
+-    require_initialized();
+-    if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
+-    if ((!capacity || !list) && !hits) return PARAMETER;
+-    static char labels[MAX_ADDONS][LABEL_SIZE];
++/* Folders are scanned once per run (DRIVECLUB has over a thousand add-ons and asks per label). */
++static uint32_t scan_all(char labels[][LABEL_SIZE]) {
+     uint32_t found=0;
+     char root[4096];
+     int fits=snprintf(root,sizeof(root),"%s/addcont",runtime_file_user_dir())<(int)sizeof(root);
+@@ -111,11 +110,34 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
+     for (struct dirent *t; titles && (t=readdir(titles));) {
+         char title[4096];
+         if (t->d_name[0]=='.' || snprintf(title,sizeof(title),"%s/%s",root,t->d_name)>=(int)sizeof(title)) continue;
+-        scan_labels(title,labels,&found);
++        scan_labels(title,labels,&found,0);
+     }
+     if (titles) closedir(titles);
+     const char *dlc=getenv("BB_DLC_DIR");
+-    if (dlc && *dlc) scan_labels(dlc,labels,&found);
++    if (dlc && *dlc) scan_labels(dlc,labels,&found,0);
++    const char *app=runtime_file_app_dir();
++    if (app && *app) scan_labels(app,labels,&found,1);
++    return found;
++}
++static char cached_labels[MAX_ADDONS][LABEL_SIZE];
++static uint32_t cached_count;
++static int cached;
++static uint32_t collect_labels(char labels[][LABEL_SIZE]) {
++    if (!cached) { cached_count=scan_all(cached_labels); cached=1; }
++    memcpy(labels,cached_labels,(size_t)cached_count*LABEL_SIZE);
++    return cached_count;
++}
++/* Add-ons are the folders <user>/addcont/<title id>/<entitlement label> (shadPS4's layout) and
++ * those of BB_DLC_DIR (the launcher's DLC folder: <label> folders), each reported as installed.
++ * No add-on data is mounted: Bloodborne: The Old Hunters (SPEXPANSIONDLC03) needs only the
++ * entitlement, its data ships with patch 1.09. Without a list the count is returned, with one
++ * at most capacity entries are written. Never touch unused list slots. */
++static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
++    require_initialized();
++    if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
++    if ((!capacity || !list) && !hits) return PARAMETER;
++    static char labels[MAX_ADDONS][LABEL_SIZE];
++    uint32_t found=collect_labels(labels);
+     uint32_t count=list && capacity && found>capacity ? capacity : found;
+     if (list && capacity) for (uint32_t i=0;i<count;++i) {
+         AddonInfo info;
+@@ -128,6 +150,38 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
+     if (found!=reported) printf("Runtime: AppContent add-ons reported installed: %u\n",(unsigned)(reported=found));
+     ++lists; return 0;
+ }
++/* Index of an installed add-on by entitlement label (SceNpUnifiedEntitlementLabel: 16 chars). */
++static int find_label(const char *label,char labels[][LABEL_SIZE],uint32_t found) {
++    if (!label) return -1;
++    char want[LABEL_SIZE]; memcpy(want,label,LABEL_SIZE-1); want[LABEL_SIZE-1]=0;
++    for (uint32_t i=0;i<found;++i) if (!strcmp(labels[i],want)) return (int)i;
++    return -1;
++}
++#define ADDCONT_NOT_FOUND ((int32_t)0x80D90007)
++ABI int32_t runtime_addcont_info(uint32_t service,const char *label,void *info) {
++    static char labels[MAX_ADDONS][LABEL_SIZE];
++    if (!label || !info) return PARAMETER;
++    uint32_t found=collect_labels(labels);
++    int i=find_label(label,labels,found);
++    if (i<0 || service) return ADDCONT_NOT_FOUND;
++    AddonInfo out; memset(&out,0,sizeof(out));
++    memcpy(out.label,labels[i],strlen(labels[i])); out.status=ADDON_INSTALLED;
++    memcpy(info,&out,sizeof(out));
++    return 0;
++}
++/* Mounting maps /addcont<N> onto the add-on's folder (entitlement-only add-ons have no data). */
++ABI int32_t runtime_addcont_mount(uint32_t service,const char *label,char *mount_point) {
++    static char labels[MAX_ADDONS][LABEL_SIZE];
++    if (!label || !mount_point) return PARAMETER;
++    uint32_t found=collect_labels(labels);
++    int i=find_label(label,labels,found);
++    if (i<0 || service) return ADDCONT_NOT_FOUND;
++    char guest[16]; snprintf(guest,sizeof(guest),"/addcont%d",i);
++    if (runtime_file_mount(guest,label_dirs[i])) return BUSY;
++    memset(mount_point,0,16); memcpy(mount_point,guest,strlen(guest));
++    printf("Runtime: AppContent add-on %s mounted at %s\n",labels[i],guest);
++    return 0;
++}
+ uintptr_t runtime_content_resolve(const char *name) {
+     if (!strcmp(name,"g8cM39EUZ6o#M#N")) return (uintptr_t)module_load;
+     if (!strcmp(name,"fMP5NHUOaMk#M#N")) return (uintptr_t)module_loaded;
 diff --git a/src/runtime_dc.c b/src/runtime_dc.c
 new file mode 100644
 index 0000000..4ee4f87
@@ -3269,6 +4771,66 @@ index 0000000..4ee4f87
 +    if (found) trace(runtime_symbol(name));
 +    return found;
 +}
+diff --git a/src/runtime_file.c b/src/runtime_file.c
+index c64c0f9..84b2c53 100644
+--- a/src/runtime_file.c
++++ b/src/runtime_file.c
+@@ -105,11 +105,13 @@ void runtime_file_unmount(const char *guest) {
+     }
+     pthread_mutex_unlock(&lock);
+ }
+-static char user_root[512]="user";
++static char user_root[512]="user", app_root[512]="";
+ const char *runtime_file_user_dir(void) { return user_root; }
++const char *runtime_file_app_dir(void) { return app_root; }
+ void runtime_file_configure(const char *app0,const char *user) {
+     char path[600];
+     snprintf(user_root,sizeof(user_root),"%s",user);
++    snprintf(app_root,sizeof(app_root),"%s",app0);
+     runtime_file_mount("/app0",app0);
+     runtime_file_mount("/hostapp",app0);
+     const char *writable[]={"temp0","download0","data"};
+@@ -267,6 +269,13 @@ static int game_path(const char *p) {
+     return (!strncmp(p,"/app0",5) && (!p[5] || p[5]=='/')) ||
+            (!strncmp(p,"/hostapp",8) && (!p[8] || p[8]=='/'));
+ }
++/* BB_FILE_TRACE=1: every open of a missing file. DriveClub probes thousands of loose overrides
++   that never exist, so by default only the total is reported at exit. */
++static int file_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_FILE_TRACE"); v=e && e[0]=='1'; } return v; }
++static void not_found(const char *guest) {
++    ++missing;
++    if (file_trace()) printf("Runtime: open(%s) -> not found\n",guest);
++}
+ /* BB_SAVE_TRACE=1: every operation on save files (/savedataN). */
+ static int save_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_SAVE_TRACE"); v=e && e[0]=='1'; } return v; }
+ /* Saves (/savedataN): see File. The copy starts as the old file unless the open truncates. */
+@@ -383,7 +392,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
+         if (!(dir=list_directory(path))) return -EACCES;
+     } else if (flags&0x20000) {
+         e=errno==ENOENT ? ENOENT : ENOTDIR;
+-        if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
++        if (e==ENOENT) not_found(guest);
+         return -e;
+     } else {
+         if (save_path(guest) && (flags&3)) {
+@@ -400,7 +409,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
+             printf("Save trace: open(%s, flags 0x%x) -> host %d%s%s\n",guest,flags,host,temp ? ", copy " : "",temp ? temp : "");
+         if (host<0) {
+             e=errno;
+-            if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
++            if (e==ENOENT) not_found(guest);
+             return -e;
+         }
+         if (host_fstat(host,&s)) memset(&s,0,sizeof(s));
+@@ -421,7 +430,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
+         printf("Save trace: open(%s, flags 0x%x) -> host %d%s%s\n",guest,flags,host,temp ? ", copy " : "",temp ? temp : "");
+     if (host<0) {
+         e=errno;
+-        if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
++        if (e==ENOENT) not_found(guest);
+         return -e;
+     }
+     struct stat s;
 diff --git a/src/runtime_font.c b/src/runtime_font.c
 new file mode 100644
 index 0000000..c43a216
@@ -3588,3 +5150,258 @@ index 0000000..c43a216
 +};
 +
 +uintptr_t runtime_font_resolve(const char *name) { return RUNTIME_LOOKUP(exports, name); }
+diff --git a/src/runtime_input_config.c b/src/runtime_input_config.c
+index 8e359d6..b202c5b 100644
+--- a/src/runtime_input_config.c
++++ b/src/runtime_input_config.c
+@@ -504,7 +504,7 @@ void input_config_defaults(InputConfig *out) {
+  * single binding of that kind. launcher/bbport_input_config.py has a copy of the whole text
+  * (tests/test_input_defaults.py checks that they match). */
+ #define DEFAULT_HEADER \
+-"# bbport input (shadPS4 syntax: output = input, one input per line).\n" \
++"# DCport input (shadPS4 syntax: output = input, one input per line).\n" \
+ "# A shadPS4 input config (user/input_config/CUSA03173.ini) can be copied over this file.\n" \
+ "# F7 toggles the mouse, F8 reloads this file.\n" \
+ "\n"
+diff --git a/tools/fsr4cap/extract.py b/tools/fsr4cap/extract.py
+index 3e4c88f..6e4d9c6 100644
+--- a/tools/fsr4cap/extract.py
++++ b/tools/fsr4cap/extract.py
+@@ -12,16 +12,39 @@
+ #
+ # It also checks the rules vk_fsr411.cpp uses against every capture: the dispatch sequence, the
+ # group counts, the tensor size table and the frame constants. A mismatch is an error.
+-import glob, hashlib, math, os, re, struct, subprocess, sys
++import glob, hashlib, math, os, re, shutil, struct, subprocess, sys
+ 
+ dxil_spirv, root, out = sys.argv[1:4]
+ FLAGS = ['--enable-shader-i8-dot', '--ssbo-uav', '--ssbo-srv', '--class-bindings', '--use-reflection-names',
+          '--mixed-float-dot-product']  # as vkd3d-proton: dot2 of halves into float (VALVE extension)
++# FSR411_PORTABLE=1: without VK_VALVE_shader_mixed_float_dot_product (Windows drivers do not have
++# it): dot2 in plain arithmetic, not bit-exact with the DLL (about 40 dB PSNR) but runs anywhere.
++if os.environ.get('FSR411_PORTABLE') == '1':
++    FLAGS.remove('--mixed-float-dot-product')
+ PREFIX = 'fsr4_model_v07_fp8_no_scale_'
+ SEQUENCE = ['spd', 'prepass', 'pass0_post'] + [f'pass{k}{s}' for k in range(1, 13) for s in ('', '_post')] + ['postpass', 'rcas']
+ LEVEL = {1: 1, 2: 1, 3: 2, 4: 2, 5: 2, 6: 3, 7: 3, 8: 3, 9: 3, 10: 2, 11: 2, 12: 1}
+ errors = 0
+ 
++def postpass_lds(asm):
++    """postpass_lds.py in this process (it also runs inside the packaged launcher): its output,
++    or None and the reason it gave."""
++    import contextlib, io, runpy
++    out = io.StringIO()
++    stdin = sys.stdin
++    sys.stdin = io.StringIO(asm)
++    try:
++        with contextlib.redirect_stdout(out):
++            runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'postpass_lds.py'),
++                           run_name='__main__')
++    except SystemExit as e:
++        if e.code not in (None, 0):
++            return None, str(e.code)
++    finally:
++        sys.stdin = stdin
++    return out.getvalue(), None
++
++
+ def fail(msg):
+     global errors
+     errors += 1
+@@ -119,10 +142,15 @@ for key, entry in sorted(sets.items()):
+             os.replace(spv, os.path.join(d, 'postpass_orig.spv'))
+             asm = subprocess.run(['spirv-dis', os.path.join(d, 'postpass_orig.spv')], check=True,
+                                  capture_output=True, text=True).stdout
+-            lds = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), 'postpass_lds.py')],
+-                                 input=asm, check=True, capture_output=True, text=True).stdout
+-            subprocess.run(['spirv-as', '--target-env', 'spv1.3', '-', '-o', spv], input=lds, check=True,
+-                           text=True)
++            lds, problem = postpass_lds(asm)
++            if lds is not None:
++                subprocess.run(['spirv-as', '--target-env', 'spv1.3', '-', '-o', spv], input=lds,
++                               check=True, text=True)
++            else:
++                # A DLL with rewritten postpass shaders (e.g. performance overrides): its own
++                # postpass as it is, same picture, without the workgroup-memory stores.
++                print(f'{key}: postpass kept as translated ({problem})')
++                shutil.copyfile(os.path.join(d, 'postpass_orig.spv'), spv)
+     open(os.path.join(d, 'initializer.bin'), 'wb').write(entry['init'])
+     print(f'{key}: {len(entry["dxil"])} shaders, initializer {hashlib.sha256(entry["init"]).hexdigest()[:12]}, '
+           f'from {len(entry["caps"])} captures')
+diff --git a/tools/fsr4cap/name_bindings.py b/tools/fsr4cap/name_bindings.py
+new file mode 100644
+index 0000000..72eaa1c
+--- /dev/null
++++ b/tools/fsr4cap/name_bindings.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++# bbport: names the resources of FSR 4.1.1 passes whose DXIL lost its reflection names (DLLs
++# with rewritten shaders, e.g. performance overrides): fsr411.cpp binds resources by name.
++#
++#   name_bindings.py <dxil-spirv> <AMD's original amd_fidelityfx_upscaler_dx12.dll> <asset dir>
++#   name_bindings.py --check <asset dir>   exit 0 when every resource has a name, 3 otherwise
++# (spirv-dis, spirv-as from SPIRV-Tools on PATH.)
++#
++# The original DLL's DXIL containers are read (not run): each pass's binding -> name table comes
++# from them, translated with the flags extract.py uses. Every .spv in <asset dir>/*/ whose bound
++# variables have no name gets the original name of its binding; the code is not changed.
++import glob, os, re, struct, subprocess, sys, tempfile
++
++if sys.argv[1] == '--check':
++    for spv in glob.glob(os.path.join(sys.argv[2], '*', '*.spv')):
++        if os.path.basename(spv) == 'postpass_orig.spv':
++            continue  # kept for reference; the runtime loads postpass.spv
++        asm = subprocess.run(['spirv-dis', spv], check=True, capture_output=True, text=True).stdout
++        names = dict(re.findall(r'OpName (%\w+) "([^"]*)"', asm))
++        if any(not names.get(v) for v in re.findall(r'OpDecorate (%\w+) Binding \d+', asm)):
++            print(f'unnamed resources in {spv}')
++            sys.exit(3)
++    print('every resource has a name')
++    sys.exit(0)
++
++dxil_spirv, original_dll, assets = sys.argv[1:4]
++FLAGS =['--enable-shader-i8-dot', '--ssbo-uav', '--ssbo-srv', '--class-bindings', '--use-reflection-names']
++PREFIX = 'fsr4_model_v07_fp8_no_scale_'
++
++
++def pass_name(blob):
++    for s in re.findall(rb'[A-Za-z_][A-Za-z0-9_]{5,80}', blob):
++        s = s.decode()
++        if s.startswith(PREFIX):
++            return s[len(PREFIX):]
++        if s.startswith('fsr_rcas'):
++            return 'rcas'
++    return None
++
++
++def binding_names(asm):
++    """{binding: name} of the bound variables of a disassembled module ('' when unnamed)."""
++    names = dict(re.findall(r'OpName (%\w+) "([^"]*)"', asm))
++    out = {}
++    for var, binding in re.findall(r'OpDecorate (%\w+) Binding (\d+)', asm):
++        out.setdefault(int(binding), set()).add(names.get(var, ''))
++    return out
++
++
++def disassemble(spv):
++    return subprocess.run(['spirv-dis', spv], check=True, capture_output=True, text=True).stdout
++
++
++# The original pass shaders: DXBC containers in the DLL ('DXBC', hash[16], version, size).
++data = open(original_dll, 'rb').read()
++tables = {}
++with tempfile.TemporaryDirectory() as tmp:
++    for m in re.finditer(rb'DXBC', data):
++        start = m.start()
++        size = struct.unpack_from('<I', data, start + 24)[0]
++        if not 32 < size < 4 << 20 or start + size > len(data):
++            continue
++        blob = data[start:start + size]
++        name = pass_name(blob)
++        if name is None:
++            continue
++        dxil, spv = os.path.join(tmp, 'p.dxil'), os.path.join(tmp, 'p.spv')
++        open(dxil, 'wb').write(blob)
++        if subprocess.run([dxil_spirv, dxil, *FLAGS, '--output', spv],
++                          stderr=subprocess.DEVNULL).returncode:
++            continue
++        for binding, found in binding_names(disassemble(spv)).items():
++            for n in found - {''}:
++                tables.setdefault(name, {}).setdefault(binding, set()).add(re.sub(r'_1$', '', n))
++
++conflicts = 0
++for name, table in tables.items():
++    for binding, found in table.items():
++        if len(found) > 1:
++            conflicts += 1
++            print(f'{name} binding {binding}: names differ between variants: {sorted(found)}')
++if conflicts:
++    sys.exit(1)
++
++named = 0
++for spv in sorted(glob.glob(os.path.join(assets, '*', '*.spv'))):
++    name = os.path.splitext(os.path.basename(spv))[0]
++    if name == 'postpass_orig':
++        continue
++    asm = disassemble(spv)
++    names = dict(re.findall(r'OpName (%\w+) "([^"]*)"', asm))
++    missing = [(var, int(b)) for var, b in re.findall(r'OpDecorate (%\w+) Binding (\d+)', asm)
++               if not names.get(var)]
++    if not missing:
++        continue
++    table = tables.get(name)
++    if table is None:
++        print(f'{spv}: unnamed resources and no original {name} pass')
++        sys.exit(1)
++    for var, binding in missing:
++        if binding not in table:
++            print(f'{spv}: binding {binding} has no original name')
++            sys.exit(1)
++        new = next(iter(table[binding]))
++        line = f'OpName {var} "{new}"'
++        if re.search(rf'OpName {re.escape(var)} "[^"]*"', asm):
++            asm = re.sub(rf'OpName {re.escape(var)} "[^"]*"', line, asm, count=1)
++        else:
++            asm = asm.replace(f'OpName %main "main"', f'OpName %main "main"\n{line}', 1)
++    subprocess.run(['spirv-as', '--preserve-numeric-ids', '--target-env', 'spv1.3', '-', '-o', spv],
++                   input=asm, check=True, text=True)
++    named += 1
++print(f'names restored in {named} shaders (from {sum(len(t) for t in tables.values())} original '
++      f'bindings in {len(tables)} passes)')
+diff --git a/tools/fsr4cap/stage_windows.sh b/tools/fsr4cap/stage_windows.sh
+new file mode 100644
+index 0000000..ec91a10
+--- /dev/null
++++ b/tools/fsr4cap/stage_windows.sh
+@@ -0,0 +1,51 @@
++#!/usr/bin/env bash
++# tools/fsr4cap/stage_windows.sh <target dir>
++# Builds (once) and copies the Windows FSR 4.1.1 set-up tools into <target dir> (a release's
++# bin/fsr411): fsr4cap.exe, dxil-spirv with its library, SPIRV-Tools' spirv-as/spirv-dis, the
++# C++ runtime they share, the scripts, and the tools' licences. The launcher (dcport/fsr411.py)
++# runs them on the player's own AMD DLL. Nothing of AMD's is copied: the FidelityFX headers
++# fetched for building fsr4cap.exe are MIT, and AMD's DLLs are downloaded by the launcher.
++# Run from Git Bash or MSYS2; needs MSYS2 CLANG64 (clang, cmake, ninja, spirv-tools) and git.
++set -euo pipefail
++target=$(realpath -m -- "${1:?target dir}")
++cd -- "$(dirname -- "$0")/../.."
++work=$PWD/out/fsr4cap
++clang64=/c/msys64/clang64/bin
++mkdir -p "$work" "$target"
++in_clang64() { /c/msys64/usr/bin/env.exe MSYSTEM=CLANG64 CHERE_INVOKING=1 /usr/bin/bash -lc "$1"; }
++
++dx=$work/dxil-spirv
++if [[ ! -x $dx/build/dxil-spirv.exe ]]; then
++    rm -rf "$dx"
++    git clone -q https://github.com/HansKristian-Work/dxil-spirv.git "$dx"
++    git -C "$dx" checkout -q 7dc52786cdb1f53c54dd5c5c2698dff00ea5f0a3
++    git -C "$dx" submodule update -q --init --recursive
++    git -C "$dx" apply "$PWD/tools/fsr4cap/dxil-spirv-class-bindings.patch"
++    # libc++ wants <cstdlib> spelled out (third_party/cli_parser).
++    in_clang64 "cd '$dx' && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS=-include cstdlib' >/dev/null && ninja -C build dxil-spirv >/dev/null"
++fi
++
++sdk=$work/ffxsdk
++if [[ ! -f $sdk/Kits/FidelityFX/api/include/ffx_api.h ]]; then
++    rm -rf "$sdk"
++    git clone -q --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git "$sdk"
++    git -C "$sdk" checkout -q 60f4ea81909200d8542eca14dccb2628b763a9a3
++    MSYS_NO_PATHCONV=1 git -C "$(cygpath -w "$sdk")" sparse-checkout set --no-cone \
++        /Kits/FidelityFX/api/include/ /Kits/FidelityFX/upscalers/include/
++fi
++k=$sdk/Kits/FidelityFX
++if [[ ! -f $work/fsr4cap.exe || tools/fsr4cap/fsr4cap.c -nt $work/fsr4cap.exe || tools/fsr4cap/capture.c -nt $work/fsr4cap.exe ]]; then
++    in_clang64 "clang -std=c11 -O1 -I'$k/api/include' -I'$k/upscalers/include' tools/fsr4cap/fsr4cap.c tools/fsr4cap/capture.c tools/fsr4cap/rootsig.c -o '$work/fsr4cap.exe' -ld3d12 -ldxguid -static"
++fi
++
++cp "$work/fsr4cap.exe" "$dx/build/dxil-spirv.exe" "$dx/build/libdxil-spirv-c-shared.dll" "$target/"
++cp "$clang64/spirv-as.exe" "$clang64/spirv-dis.exe" "$clang64/libSPIRV-Tools.dll" "$clang64/libc++.dll" "$target/"
++cp tools/fsr4cap/extract.py tools/fsr4cap/name_bindings.py tools/fsr4cap/postpass_lds.py "$target/"
++mkdir -p "$target/licenses"
++cp "$dx/LICENSE.MIT" "$target/licenses/dxil-spirv-LICENSE.txt"
++cp /c/msys64/clang64/share/licenses/spirv-tools/LICENSE "$target/licenses/SPIRV-Tools-LICENSE.txt" 2>/dev/null || \
++    printf 'SPIRV-Tools: Apache License 2.0, https://github.com/KhronosGroup/SPIRV-Tools\n' > "$target/licenses/SPIRV-Tools-LICENSE.txt"
++cp /c/msys64/clang64/share/licenses/libc++/LICENSE.TXT "$target/licenses/libc++-LICENSE.txt" 2>/dev/null || \
++    printf 'libc++: Apache License 2.0 with LLVM Exceptions, https://llvm.org\n' > "$target/licenses/libc++-LICENSE.txt"
++printf 'fsr4cap.exe, extract.py, name_bindings.py, postpass_lds.py: GPL-2.0-or-later (bbport, DCport).\n' > "$target/licenses/README.txt"
++echo "FSR 4.1.1 tools in $target"
