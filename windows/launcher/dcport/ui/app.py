@@ -479,7 +479,7 @@ class App(tk.Tk):
         if not has_eboot(folder):
             messagebox.showwarning(
                 "DCport", f"There is no eboot.bin in\n{folder}\n\n"
-                "Choose the DRIVECLUB folder (CUSA00003) that contains eboot.bin.", parent=self)
+                "Choose the DRIVECLUB folder that contains eboot.bin.", parent=self)
             return False
         self.settings.game_dir = str(folder)
         self.save_settings()

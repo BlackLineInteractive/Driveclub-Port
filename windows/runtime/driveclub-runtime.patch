@@ -1108,9 +1108,18 @@ index 0000000..897a5f6
 +
 +} // namespace Vulkan
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
-index 2c70bba..f434b0f 100644
+index 2c70bba..67e3376 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
+@@ -133,7 +133,7 @@ struct Fsr4Upscaler::Impl {
+             if (ReadFile(dir + name, data)) {
+                 return true;
+             }
+-            Fail("missing " + dir + name + " (run tools/fetch_fsr4_assets.sh)", true);
++            Fail("missing " + dir + name + " (the FSR edition's fsr4_shaders folder)", true);
+             return false;
+         };
+         if (!load(assets.pre, code[0])) return false;
 @@ -190,6 +190,9 @@ struct Fsr4Upscaler::Impl {
          ffxCreateContextDescUpscale desc{};
          desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
@@ -1121,7 +1130,28 @@ index 2c70bba..f434b0f 100644
          // Any preset's render size fits: the context is not recreated for a size change.
          desc.maxRenderSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
          desc.maxUpscaleSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
-@@ -383,6 +386,10 @@ Fsr4Upscaler::Fsr4Upscaler(const Instance& instance, Scheduler& scheduler)
+@@ -233,7 +236,7 @@ struct Fsr4Upscaler::Impl {
+ 
+     bool Record411(const Frame& f) {
+         if (!instance.IsFsr411Supported()) {
+-            Fail("FSR 4.1.1 needs INT8 dot products and VK_VALVE_shader_mixed_float_dot_product", true);
++            Fail("FSR 4.1.1 needs a GPU with INT8 dot products", true);
+             return false;
+         }
+         if (!fsr411) {
+@@ -263,7 +266,10 @@ struct Fsr4Upscaler::Impl {
+         g.auto_exposure = f.auto_exposure;
+         if (!fsr411->Record(g)) {
+             // Missing assets are permanent for this session; the menu shows the reason.
+-            Fail("FSR 4.1.1: " + fsr411->Error(), fsr411->Error().starts_with("missing"));
++            const bool missing = fsr411->Error().starts_with("missing");
++            Fail("FSR 4.1.1: " + fsr411->Error() +
++                     (missing ? " (set it up in the launcher: SETUP, Set up FSR 4.1.1)" : ""),
++                 missing);
+             return false;
+         }
+         fsr411_ticks.push_back(scheduler.CurrentTick());
+@@ -383,6 +389,10 @@ Fsr4Upscaler::Fsr4Upscaler(const Instance& instance, Scheduler& scheduler)
  
  Fsr4Upscaler::~Fsr4Upscaler() = default;
  
@@ -2722,7 +2752,7 @@ index 494d151..85c8231 100644
      g_window_thread = std::thread([title, width, height] {
          Common::SetCurrentThreadName("bb:window");
 diff --git a/gpu/shim/bbport_overlay.cpp b/gpu/shim/bbport_overlay.cpp
-index c6f7c9a..0323c0c 100644
+index c6f7c9a..7133dea 100644
 --- a/gpu/shim/bbport_overlay.cpp
 +++ b/gpu/shim/bbport_overlay.cpp
 @@ -7,10 +7,12 @@
@@ -2761,7 +2791,7 @@ index c6f7c9a..0323c0c 100644
                        ImGuiWindowFlags_NoCollapse)) {
          ImGui::End();
          return;
-@@ -176,6 +185,12 @@ void Menu() {
+@@ -176,13 +185,21 @@ void Menu() {
      ImGui::Text("%.0f FPS  (%.1f ms)", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
                  frame_ms_avg);
  
@@ -2774,16 +2804,41 @@ index c6f7c9a..0323c0c 100644
      ImGui::SeparatorText("Temporal upscaling");
      static const char* upscalers[] = {"Off", "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
                                       "TAA (native anti-aliasing)", "DLSS (NVIDIA RTX)"};
-@@ -217,7 +232,7 @@ void Menu() {
+-    static const char* later[] = {"XeSS"};
+     int upscaler = s.upscaler;
+     if (ImGui::BeginCombo("Upscaler", upscalers[upscaler])) {
+         for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
++            if (i == BbSettings::UpscalerDlss) {
++                continue; // DCport: Driveclub's upscaler path has no DLSS
++            }
+             const bool supported = i == BbSettings::UpscalerFsr4 ? s.fsr4_supported.load()
+                 : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
+                 : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load() : true;
+@@ -196,13 +213,6 @@ void Menu() {
+                 ImGui::TextDisabled("- unsupported by this GPU");
+             }
+         }
+-        for (const char* name : later) {
+-            ImGui::BeginDisabled();
+-            ImGui::Selectable(name, false);
+-            ImGui::EndDisabled();
+-            ImGui::SameLine();
+-            ImGui::TextDisabled("- in development");
+-        }
+         ImGui::EndCombo();
+     }
+     if (const char* problem = s.dlss_problem.load(); problem && upscaler == BbSettings::UpscalerDlss) {
+@@ -217,14 +227,18 @@ void Menu() {
      }
      if (BbSettings::IsFsr4(s.upscaler)) {
          if (s.upscaler == BbSettings::UpscalerFsr411) {
 -            Hint("FSR 4.1.1 INT8: AMD 4.1.1 DLL model reproduced in Vulkan. One model covers Native through Performance, with another for Ultra Performance. Assets: tools/fsr4cap/build_assets.sh (requires the DLL and Proton).");
 +            Hint("FSR 4.1.1 INT8: AMD 4.1.1 DLL model reproduced in Vulkan. One model covers Native through Performance, with another for Ultra Performance. Set it up once in the launcher (SETUP, Set up FSR 4.1.1) from your own amd_fidelityfx_upscaler_dx12.dll.");
          } else {
-             Hint("FSR 4 INT8 uses the v07 model from the AMD FidelityFX SDK. Higher quality than FSR 3.1, with more GPU work. Changing presets rebuilds the model and may pause briefly. Assets: tools/fetch_fsr4_assets.sh.");
+-            Hint("FSR 4 INT8 uses the v07 model from the AMD FidelityFX SDK. Higher quality than FSR 3.1, with more GPU work. Changing presets rebuilds the model and may pause briefly. Assets: tools/fetch_fsr4_assets.sh.");
++            Hint("FSR 4 INT8 uses the v07 model from the AMD FidelityFX SDK. Higher quality than FSR 3.1, with more GPU work. Its files come with the FSR edition (fsr4_shaders folder).");
          }
-@@ -225,6 +240,10 @@ void Menu() {
+         Checkbox("FSR 4: auto exposure", s.fsr4_auto_exposure);
          Checkbox("FSR 4: invert jitter", s.fsr4_invert_jitter);
          Hint("Ghosting diagnostics: FSR 4 uses exposure to normalize color and decide when to discard history. These options apply immediately.");
      }
@@ -2794,7 +2849,7 @@ index c6f7c9a..0323c0c 100644
      const bool upscaler_on = s.upscaler != BbSettings::UpscalerOff;
      const bool taa = s.upscaler == BbSettings::UpscalerTaa;
      ImGui::BeginDisabled(!upscaler_on);
-@@ -334,6 +353,9 @@ void Menu() {
+@@ -334,6 +348,9 @@ void Menu() {
          ImGui::EndCombo();
      }
      Hint("On: output and presets change without restarting, while game post-processing stays at 1080p. Off: the scene is patched to the preset resolution at startup. Auto enables the live path on capable discrete GPUs. Changes apply after restarting the game.");
@@ -2804,7 +2859,7 @@ index c6f7c9a..0323c0c 100644
      ImGui::SeparatorText("Game effects (restart required)");
      static const char* lods[] = {"Highest (-2)", "Original", "Lower (1)", "Lowest (2)"};
      static constexpr int lod_values[] = {-2, 0, 1, 2};
-@@ -354,6 +376,7 @@ void Menu() {
+@@ -354,6 +371,7 @@ void Menu() {
      }
      Hint("Effects are applied through game patches at startup (patches/Bloodborne.xml). Motion blur and dynamic shadows can increase GPU load.");
      Hint("Free camera: hold Cross and press L3 (keyboard: Space + Z). Debug menu: left touchpad / Tab. Requires DbgFont14h.ccm and DbgFont14h.tpf in dvdroot_ps4/font from the debug-font mod. Right touchpad: Backspace.");
@@ -2812,7 +2867,7 @@ index c6f7c9a..0323c0c 100644
  
      bool restart = s.object_motion != s.startup_object_motion ||
                     s.model_lod != s.startup_model_lod ||
-@@ -371,8 +394,18 @@ void Menu() {
+@@ -371,8 +389,18 @@ void Menu() {
          }
      }
  
@@ -2831,7 +2886,7 @@ index c6f7c9a..0323c0c 100644
  
      ImGui::Spacing();
      if (ImGui::Button("Close")) {
-@@ -397,7 +430,7 @@ void Menu() {
+@@ -397,7 +425,7 @@ void Menu() {
          quit_armed = false;
      }
      ImGui::SameLine();
@@ -2840,7 +2895,7 @@ index c6f7c9a..0323c0c 100644
      ImGui::End();
      if (!keep_open) {
          SetOpen(false);
-@@ -440,14 +473,39 @@ void FpsCounter() {
+@@ -440,14 +468,39 @@ void FpsCounter() {
                       ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                       ImGuiWindowFlags_NoFocusOnAppearing);
      const auto& s = BbSettings::Get();
@@ -2888,7 +2943,7 @@ index c6f7c9a..0323c0c 100644
      ImGui::End();
  }
  
-@@ -464,14 +522,54 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count)
+@@ -464,14 +517,54 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count)
      io.IniFilename = nullptr; // window positions are not kept
      io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
      io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
@@ -2945,7 +3000,7 @@ index c6f7c9a..0323c0c 100644
  
      ImFontConfig font_config;
      font_config.FontDataOwnedByAtlas = false;
-@@ -633,7 +731,7 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
+@@ -633,7 +726,7 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
      text_entry_text = text;
  }
  
@@ -2954,7 +3009,7 @@ index c6f7c9a..0323c0c 100644
      // Present interval for the FPS readout (measured also while nothing is drawn).
      const auto now = std::chrono::steady_clock::now();
      const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
-@@ -641,6 +739,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+@@ -641,6 +734,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
      if (ms > 0.0f && ms < 1000.0f) {
          frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
      }
@@ -2988,7 +3043,7 @@ index acc89b0..7f8ede9 100644
  /// The menu is open or a text entry is shown: the game's input is held neutral.
  bool CapturesInput();
 diff --git a/gpu/shim/bbport_settings.cpp b/gpu/shim/bbport_settings.cpp
-index 7743165..cf0a78d 100644
+index 7743165..c6318c2 100644
 --- a/gpu/shim/bbport_settings.cpp
 +++ b/gpu/shim/bbport_settings.cpp
 @@ -14,7 +14,7 @@ namespace {
@@ -3011,7 +3066,45 @@ index 7743165..cf0a78d 100644
      } else if (key == "fsr4_auto_exposure") {
          v.fsr4_auto_exposure = i != 0;
      } else if (key == "fsr4_invert_jitter") {
-@@ -191,15 +195,15 @@ void Save() {
+@@ -183,23 +187,53 @@ bool ResolutionNeedsRestart() {
+          (v.upscaler == UpscalerTaa) != (v.startup_upscaler == UpscalerTaa));
+ }
+ 
++// Lines of the current file whose keys Save() does not write itself (the launcher's
++// threaded_recording, for one), so a menu save keeps them.
++std::string ForeignLines() {
++    static constexpr const char* own[] = {
++        "upscaler", "preset", "sharpen", "sharpness", "jitter", "reactive", "object_motion",
++        "reactive_scale", "reactive_threshold", "reactive_max", "debug_view", "show_fps",
++        "frame_gen", "motion_blur", "fsr4_auto_exposure", "fsr4_invert_jitter", "model_lod",
++        "output_res", "hud_position", "live_resolution"};
++    std::string kept;
++    FILE* file = std::fopen(Path(), "r");
++    if (!file) return kept;
++    char line[512];
++    while (std::fgets(line, sizeof(line), file)) {
++        const std::string_view text(line);
++        const auto eq = text.find('=');
++        if (text.starts_with('#') || eq == std::string_view::npos) continue;
++        const std::string_view key = text.substr(0, eq);
++        bool mine = std::any_of(std::begin(own), std::end(own),
++                                [&](const char* k) { return key == k; });
++        for (int e = 0; e < EffectCount && !mine; ++e) mine = key == Effects[e].key;
++        if (!mine) {
++            kept += line;
++            if (!text.ends_with('\n')) kept += '\n';
++        }
++    }
++    std::fclose(file);
++    return kept;
++}
++
+ void Save() {
+     const auto& v = Get();
++    const std::string kept = ForeignLines();
+     FILE* file = std::fopen(Path(), "w");
+     if (!file) {
+         std::printf("Settings: cannot write %s\n", Path());
          return;
      }
      std::fprintf(file,
@@ -3030,6 +3123,14 @@ index 7743165..cf0a78d 100644
                   int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()));
      // Read by patches.py at start.
      for (int e = 0; e < EffectCount; ++e) {
+@@ -212,6 +246,7 @@ void Save() {
+     // Read by run.sh at start.
+     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
+                                                   : v.live_resolution ? "1" : "0");
++    std::fputs(kept.c_str(), file);
+     std::fclose(file);
+ }
+ 
 diff --git a/gpu/shim/bbport_settings.h b/gpu/shim/bbport_settings.h
 index 254cfcb..ca9474c 100644
 --- a/gpu/shim/bbport_settings.h
@@ -5163,6 +5264,40 @@ index 8e359d6..b202c5b 100644
  "# A shadPS4 input config (user/input_config/CUSA03173.ini) can be copied over this file.\n" \
  "# F7 toggles the mouse, F8 reloads this file.\n" \
  "\n"
+diff --git a/src/runtime_savedata.c b/src/runtime_savedata.c
+index 9a16a9a..cde9c7d 100644
+--- a/src/runtime_savedata.c
++++ b/src/runtime_savedata.c
+@@ -111,8 +111,28 @@ static int make_dirs(const char *path) {
+     for (char *p=buffer+1;*p;++p) if (*p=='/') { *p=0; mkdir(buffer,0755); *p='/'; }
+     return mkdir(buffer,0755) && errno!=EEXIST ? -1 : 0;
+ }
++/* Driveclub's regional releases (same 01.28 game): saves made with one are used by another
++ * when the game's own folder does not exist yet. */
++static const char *const driveclub_ids[]={"CUSA00003","CUSA00064","CUSA00066","CUSA00093","CUSA00879"};
++static int is_driveclub(const char *id) {
++    for (size_t i=0;i<sizeof(driveclub_ids)/sizeof(*driveclub_ids);++i) if (!strcmp(id,driveclub_ids[i])) return 1;
++    return 0;
++}
++static int is_dir(const char *path) { struct stat st; return !stat(path,&st) && S_ISDIR(st.st_mode); }
+ static void root(int32_t user, const char *title, char *out, size_t size) {
+-    snprintf(out,size,"%s/savedata/%d/%s",runtime_file_user_dir(),user,title && *title ? title : title_id);
++    const char *id=title && *title ? title : title_id;
++    snprintf(out,size,"%s/savedata/%d/%s",runtime_file_user_dir(),user,id);
++    if (!is_driveclub(id) || is_dir(out)) return;
++    char other[700];
++    for (size_t i=0;i<sizeof(driveclub_ids)/sizeof(*driveclub_ids);++i) {
++        snprintf(other,sizeof(other),"%s/savedata/%d/%s",runtime_file_user_dir(),user,driveclub_ids[i]);
++        if (is_dir(other)) {
++            static int told;
++            if (!told++) printf("Runtime: %s has no save folder; using the %s saves\n",id,driveclub_ids[i]);
++            snprintf(out,size,"%s",other);
++            return;
++        }
++    }
+ }
+ static int valid_name(const char *name, size_t max) {
+     size_t n=strnlen(name,max);
 diff --git a/tools/fsr4cap/extract.py b/tools/fsr4cap/extract.py
 index 3e4c88f..6e4d9c6 100644
 --- a/tools/fsr4cap/extract.py

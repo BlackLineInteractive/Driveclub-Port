@@ -15,11 +15,6 @@ ROWS = (("profile", "Profile"), ("fps", "Frame rate"), ("window", "Window"),
         ("counter", "FPS counter"))
 
 
-def _short_version(app_ver: str) -> str:
-    major, _, minor = app_ver.partition(".")
-    return f"{int(major)}.{minor}" if major.isdigit() and minor else app_ver
-
-
 class _Sweep(tk.Canvas):
     """Slim progress bar with a red segment sweeping across (length of work unknown)."""
 
@@ -389,7 +384,7 @@ class RacePage(tk.Frame):
         self._art = art
         sub = ""
         if info is not None and info.title_id:
-            sub = f"{info.title_id} · v{_short_version(info.app_ver)}"
+            sub = f"{info.title_id} · v{info.app_ver}"
         self.hero.itemconfigure(self._sub_item, text=self._spaced(sub))
         self._schedule_render(0)
 

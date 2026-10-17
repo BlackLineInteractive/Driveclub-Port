@@ -29,12 +29,16 @@ def fps_note(fps: int) -> str:
     return ""
 
 
+def _ini_value(paths: AppPaths, key: str, default: str) -> str:
+    try:
+        return read_ini(paths.ini).get(key, default).strip()
+    except OSError:
+        return default
+
+
 def frame_gen_on(paths: AppPaths) -> bool:
     """dcport.ini's frame_gen (the SETUP page or the game's menu writes it)."""
-    try:
-        return read_ini(paths.ini).get("frame_gen", "0").strip() == "1"
-    except OSError:
-        return False
+    return _ini_value(paths, "frame_gen", "0") == "1"
 
 
 def game_command(paths: AppPaths, game_dir: Path, fps: int,
@@ -57,7 +61,9 @@ def game_env(paths: AppPaths, s: LauncherSettings, fsr: bool,
         "BB_CONFIG": str(paths.ini),
         "BB_LENIENT_IMPORTS": "1",
         "BB_READBACKS": "0",
-        "BB_DRAW_PIPE": "1",
+        # dcport.ini threaded_recording=0: draws recorded on the GPU thread itself (slower;
+        # for testing the intermittent AMD device-lost crash).
+        "BB_DRAW_PIPE": "0" if _ini_value(paths, "threaded_recording", "1") == "0" else "1",
         "BB_PREP_WORKERS": "0",
         "BB_FULLSCREEN": "1" if s.fullscreen else "0",
         "BB_WINDOW_SIZE": "{}x{}".format(*window_size(s.window_size)),

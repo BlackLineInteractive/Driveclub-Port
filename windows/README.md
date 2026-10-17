@@ -1,6 +1,6 @@
 # DCport — Driveclub on Windows
 
-The Windows backend of Driveclub Native: DRIVECLUB (PS4, CUSA00003, v1.28) running natively on Windows. The game's own x86-64 code runs directly on the PC; its graphics are translated to Vulkan (shadPS4's renderer).
+The Windows backend of Driveclub Native: DRIVECLUB (PS4, v01.28: EU CUSA00003 or US CUSA00093) running natively on Windows. The game's own x86-64 code runs directly on the PC; its graphics are translated to Vulkan (shadPS4's renderer).
 
 ![DCport launcher](media/launcher.png)
 
@@ -28,6 +28,13 @@ Nothing of AMD's is in the download or in this repository: every player builds i
 
 Also new: **FSR in every race** (0.2.0's FSR ran in menus only), **FSR 3 frame generation** with a HUD-less copy of each frame, a **PATCHES** tab, window size and render resolution settings.
 
+## 0.3.1 hotfix
+
+- US copies (CUSA00093) are accepted: the launcher said "patches need 1.28" for them although the game is 01.28. Versions now show as on the PS4 (01.28).
+- Saves made with one region are used by the other when it has no save folder of its own (nothing is moved).
+- In-game menu saves keep launcher settings in `dcport.ini` they do not manage.
+- Clearer FSR 4 / 4.1.1 fallback messages (FSR 3.1 is used, and the menu says why).
+
 ## Download
 
 Get the latest release from the Releases page:
@@ -35,7 +42,7 @@ Get the latest release from the Releases page:
 - `DCport-<version>-windows-fsr.zip`: with FSR 3.1 and FSR 4 (FSR 4 needs a recent AMD or NVIDIA GPU)
 - `DCport-<version>-windows.zip`: without upscaling
 
-No game files are included. You need your own dump of DRIVECLUB 1.28 (the folder with `eboot.bin` and the `game*.dat` files).
+No game files are included. You need your own dump of DRIVECLUB 01.28, EU (CUSA00003) or US (CUSA00093) (the folder with `eboot.bin` and the `game*.dat` files).
 
 ## Playing
 
@@ -81,7 +88,7 @@ DCport is built on other people's work: the native PS4 runtime by deadinside28 a
 
 ## Legal disclaimer
 
-- **No Proprietary Game Files:** This project does not distribute, host, or link to any copyrighted material, proprietary game assets, PKG dumps, ROMs, executables (eboot.bin), libraries (.prx), engine archives (.dat), audio, or textures. Users must provide their own legitimately acquired copy of Driveclub (CUSA00003) and of any DLC. On Windows, DCport reads it from your folder and builds its working files on your own PC; nothing from the game is ever uploaded or shared. Please do not ask for, or share, game files anywhere in this project.
+- **No Proprietary Game Files:** This project does not distribute, host, or link to any copyrighted material, proprietary game assets, PKG dumps, ROMs, executables (eboot.bin), libraries (.prx), engine archives (.dat), audio, or textures. Users must provide their own legitimately acquired copy of Driveclub and of any DLC. On Windows, DCport reads it from your folder and builds its working files on your own PC; nothing from the game is ever uploaded or shared. Please do not ask for, or share, game files anywhere in this project.
 - **Intellectual Property:** Driveclub is a registered trademark of Sony Interactive Entertainment LLC. All trademarks, service marks, game titles, and copyrighted assets belong to Sony Interactive Entertainment and Evolution Studios. PlayStation and PS4 are trademarks of Sony Interactive Entertainment Inc.
 - **Educational and Preservation Purpose:** This repository is an independent reverse-engineering project conducted strictly for interoperability, software preservation, and educational purposes. It is not affiliated with, endorsed by, or sponsored by Sony Interactive Entertainment, Evolution Studios, or any associated entities.
 - **Free:** DCport is free and always will be. If someone sold it to you, ask for your money back.
