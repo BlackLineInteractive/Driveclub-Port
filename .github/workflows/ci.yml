@@ -11,6 +11,11 @@ jobs:
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
+      # std::jthread / std::stop_token need a recent libc++ (the runner's default
+      # Xcode may be older than the one we build with).
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
       - name: Dependencies
         run: brew install cmake ninja sdl3
       - name: Configure
