@@ -7,7 +7,14 @@
 ![LOGO](media/logo.png)
 ![Driveclub In-Game](media/2026-10-14_22-34-39.png)
 
-A native port of **Driveclub** (PS4, CUSA00003 v1.05) to macOS with rendering via **Metal 3**.
+A native port of **Driveclub** (PS4, CUSA00003) to **macOS** and **Windows**.
+
+| Platform | Game version | Renderer | Where | Maintainer |
+|---|---|---|---|---|
+| macOS (Intel) | v1.05 | Metal 3 | this repository's `src/` | [BlackLineInteractive](https://github.com/BlackLineInteractive) |
+| Windows 10/11 | v1.28 | Vulkan (shadPS4's renderer), FSR 3.1 / FSR 4 | [`windows/`](windows/README.md) — ready-to-play builds on the [Windows releases](https://github.com/qnfn/Driveclub-Port/releases) | [qnfn](https://github.com/qnfn) |
+
+The sections below describe the macOS backend; the Windows backend (DCport) runs on a native PS4 runtime based on [Supermedo/bloodborne_pc](https://github.com/Supermedo/bloodborne_pc) and is documented in [`windows/README.md`](windows/README.md).
 
 This is not a general-purpose emulator. PS4 code is x86-64, so on Intel Macs it executes directly without CPU recompilation. We only replace what is console-specific: Sony system libraries (HLE) and the AMD Liverpool GPU (GCN) - with a custom Metal renderer tailored specifically for this single game.
 
@@ -36,23 +43,30 @@ Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the 
 - On discrete AMD GPUs, memory is not unified: dirty page tracking and uploading modified ranges only.
 - Explicit discrete GPU selection on dual-GPU MacBooks (`DC_GPU=<partial_name>` override).
 
-## Windows (DCport)
-
-A separate Windows backend lives in [`windows/`](windows/README.md), maintained by [qnfn](https://github.com/qnfn). It targets **Driveclub v1.28** (CUSA00003) and runs on a different native PS4 runtime (based on [Supermedo/bloodborne_pc](https://github.com/Supermedo/bloodborne_pc) with shadPS4's Vulkan renderer), with its own launcher, FSR 3.1/FSR 4 and DLC support. Ready-to-play builds: [Windows releases](https://github.com/qnfn/Driveclub-Port/releases). The architecture described above is the macOS backend.
-
 ## Requirements
+
+**macOS**
 
 - Intel Mac (x86_64), Metal 3-capable GPU (tested: AMD Radeon Pro 5500M)
 - Xcode, CMake >= 3.24, Ninja, SDL3 (`brew install cmake ninja sdl3`)
 - Your own copy of the game as a decrypted dump (fSELF/fPKG)
 
+**Windows**
+
+- Windows 10/11 64-bit, a CPU with AVX, a Vulkan 1.3 GPU (FSR 4 needs a recent AMD or NVIDIA GPU)
+- Your own decrypted dump of Driveclub v1.28; no Python or build tools needed for the release builds
+
 ## Build
+
+**macOS**
 
 ```bash
 cmake -S . -B build -G Ninja
 cmake --build build
 ./build/driveclub
 ```
+
+**Windows**: download a release build, or build the launcher and runtime from [`windows/`](windows/README.md).
 
 ### Vulkan renderer
 
@@ -69,8 +83,8 @@ command processor stays the front end. It is built when a Vulkan loader is found
 - The GPU needs sparse buffers (`sparseResidencyBuffer`) and `robustness2`: desktop AMD,
   NVIDIA and Intel drivers on Windows/Linux have them; MoltenVK on Intel Macs does not, so
   there the renderer stops with an error after creating the device.
-- Windows/Linux builds still need the core (`src/core`: loader, memory, signals, TLS) ported;
-  it is macOS-only for now.
+- This repository's core (`src/core`: loader, memory, signals, TLS) is macOS-only for now;
+  the playable Windows version is the separate DCport backend in [`windows/`](windows/README.md).
 - Options: `DC_VK_GPU=<index>`, `DC_VK_VALIDATION=1`, `DC_VK_MARKERS=1`, `DC_VK_DUMP_SHADERS=1`,
   `DC_VK_READBACKS=0|1|2`, `DC_VK_LOG=debug`.
 
@@ -104,6 +118,7 @@ This project is licensed under the **GNU General Public License v2.0 or later (G
 
 - [shadPS4](https://github.com/shadps4-emu/shadPS4) - PS4 emulator, the primary source of knowledge on ELF loading, HLE libraries, PM4, and GCN shader recompilation. Its Vulkan renderer and shader recompiler are the Vulkan backend here (`third_party/shadps4`, GPL-2.0-or-later; see its README for the local changes).
 - [OpenGNM](https://ps4-opengnm.github.io/opengnm/) - documentation on PS4 Gnm and GCN shaders.
+- Windows backend: deadinside28 and Supermedo (native PS4 runtime), FireBurn (FSR-Vulkan, FSR 4 assets), akitaonrails and the patch authors; see [`windows/README.md`](windows/README.md).
 
 ## Community & Support
 
