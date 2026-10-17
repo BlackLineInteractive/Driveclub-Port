@@ -2,7 +2,7 @@
 import json
 import os
 import tempfile
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 
 from .paths import AppPaths
 from .profiles import DEFAULT as DEFAULT_PROFILE
@@ -18,6 +18,10 @@ class LauncherSettings:
     shortcut_direct: bool = False
     steam_direct: bool = True
     profile: str = DEFAULT_PROFILE  # whose saves are in user/savedata
+    render_res: str = "1080p"  # dcport.patches.RESOLUTIONS
+    window_size: str = "1920x1080"  # windowed mode only
+    patches: list = field(default_factory=list)  # names of dcport.patches.TOGGLES
+    patch_timing: str = "deltatime"  # dcport.patches.TIMING
 
 
 def _valid(value, default) -> bool:
@@ -50,6 +54,7 @@ def load_settings(paths: AppPaths) -> LauncherSettings:
             setattr(s, f.name, data[f.name])
     if not 30 <= s.fps <= 240:
         s.fps = LauncherSettings.fps
+    s.patches = [n for n in s.patches if isinstance(n, str)]
     if not valid_name(s.profile):
         s.profile = DEFAULT_PROFILE  # a hand-edited name; no folder is moved for it
     return s

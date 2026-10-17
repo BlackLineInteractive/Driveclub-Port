@@ -129,6 +129,10 @@ def run(paths: AppPaths, fsr: bool, extra: list[str], *, run_process=None,
             return 1
 
     _default_fps_counter(paths)
+    from dcport import patches
+    error = patches.build_for_session(paths, game_dir, s)
+    if error:
+        print(error)  # the game still starts, with the patches it had
     cmd = game_command(paths, game_dir, s.fps, extra)
     code = run_process(cmd, game_env(paths, s, fsr, dict(os.environ)), paths.log)
     if code != 0:
