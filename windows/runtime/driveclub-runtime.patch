@@ -673,10 +673,10 @@ index 4dd46cf..b61fb7f 100644
      auto [width, height] = cur_size;
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_breadcrumbs.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_breadcrumbs.cpp
 new file mode 100644
-index 0000000..a0649da
+index 0000000..bb64d06
 --- /dev/null
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_breadcrumbs.cpp
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,168 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 +
@@ -684,6 +684,7 @@ index 0000000..a0649da
 +#include <atomic>
 +#include <cstdio>
 +#include <cstdlib>
++#include <vector>
 +#include <vk_mem_alloc.h>
 +#include "video_core/renderer_vulkan/vk_instance.h"
 +
@@ -695,6 +696,56 @@ index 0000000..a0649da
 +vk::Buffer buffer{};
 +std::array<std::atomic<u32>, SiteCount> sequence{};
 +std::atomic<bool> reported{false};
++// DCport: VK_EXT_device_fault, for the faulting address after a loss.
++VkDevice fault_device = VK_NULL_HANDLE;
++PFN_vkGetDeviceFaultInfoEXT get_fault_info = nullptr;
++
++const char* FaultKind(VkDeviceFaultAddressTypeEXT type) {
++    switch (type) {
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "none";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "invalid read";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "invalid write";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "invalid execute";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "shader at (unknown)";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "shader at (invalid)";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "shader at (fault)";
++    default: return "other";
++    }
++}
++
++void ReportFault() {
++    if (!get_fault_info) {
++        return;
++    }
++    VkDeviceFaultCountsEXT counts{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
++    if (get_fault_info(fault_device, &counts, nullptr) != VK_SUCCESS) {
++        std::printf("GPU fault: the driver gave no details\n");
++        return;
++    }
++    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
++    std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
++    counts.vendorBinarySize = 0;
++    VkDeviceFaultInfoEXT info{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,
++                              .pAddressInfos = addresses.empty() ? nullptr : addresses.data(),
++                              .pVendorInfos = vendor.empty() ? nullptr : vendor.data()};
++    const VkResult result = get_fault_info(fault_device, &counts, &info);
++    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
++        std::printf("GPU fault: the driver gave no details (%d)\n", int(result));
++        return;
++    }
++    std::printf("GPU fault: %s\n", info.description[0] ? info.description : "(no description)");
++    for (u32 i = 0; i < counts.addressInfoCount; ++i) {
++        const auto& a = addresses[i];
++        std::printf("  %s at GPU address %#llx (+/- %#llx)\n", FaultKind(a.addressType),
++                    (unsigned long long)a.reportedAddress,
++                    (unsigned long long)a.addressPrecision);
++    }
++    for (u32 i = 0; i < counts.vendorInfoCount; ++i) {
++        std::printf("  vendor: %s (code %#llx, data %#llx)\n", vendor[i].description,
++                    (unsigned long long)vendor[i].vendorFaultCode,
++                    (unsigned long long)vendor[i].vendorFaultData);
++    }
++}
 +
 +const char* SiteName(u32 site) {
 +    switch (site) {
@@ -713,6 +764,14 @@ index 0000000..a0649da
 +} // namespace
 +
 +void Init(const Instance& instance) {
++    if (instance.IsDeviceFaultSupported() && !get_fault_info) {
++        fault_device = instance.GetDevice();
++        get_fault_info = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
++            instance.GetDevice().getProcAddr("vkGetDeviceFaultInfoEXT"));
++        if (get_fault_info) {
++            std::printf("GPU faults: on (VK_EXT_device_fault); a device loss names the address\n");
++        }
++    }
 +    const char* env = std::getenv("BB_GPU_MARKERS");
 +    if ((env && env[0] == '0') || !instance.IsAmdBufferMarkerSupported() || slots) {
 +        return;
@@ -766,19 +825,22 @@ index 0000000..a0649da
 +}
 +
 +void Report() {
-+    if (!slots || reported.exchange(true)) {
++    if (reported.exchange(true)) {
 +        return;
 +    }
-+    std::printf("GPU markers at the device loss (started / finished / recorded):\n");
-+    for (u32 site = 0; site < SiteCount; ++site) {
-+        const u32 recorded = sequence[site].load();
-+        if (!recorded) {
-+            continue;
++    if (slots) {
++        std::printf("GPU markers at the device loss (started / finished / recorded):\n");
++        for (u32 site = 0; site < SiteCount; ++site) {
++            const u32 recorded = sequence[site].load();
++            if (!recorded) {
++                continue;
++            }
++            const u32 started = slots[site * 2], finished = slots[site * 2 + 1];
++            std::printf("  %-42s %u / %u / %u%s\n", SiteName(site), started, finished,
++                        recorded, started != finished ? "  <- running on the GPU" : "");
 +        }
-+        const u32 started = slots[site * 2], finished = slots[site * 2 + 1];
-+        std::printf("  %-42s %u / %u / %u%s\n", SiteName(site), started, finished, recorded,
-+                    started != finished ? "  <- running on the GPU" : "");
 +    }
++    ReportFault();
 +    std::fflush(stdout);
 +}
 +
@@ -1468,7 +1530,7 @@ index 506cc51..6fd582b 100644
      /// cannot run (Problem() says why; missing assets or device features are permanent).
      bool Record(const Frame& frame);
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.cpp
-index ddd57f5..b5fe841 100644
+index ddd57f5..c8045cf 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.cpp
 @@ -13,6 +13,7 @@
@@ -1479,15 +1541,37 @@ index ddd57f5..b5fe841 100644
  #include "video_core/renderer_vulkan/vk_platform.h"
  
  #include <vk_mem_alloc.h>
-@@ -380,6 +381,7 @@ bool Instance::CreateDevice() {
+@@ -380,6 +381,9 @@ bool Instance::CreateDevice() {
              feature_chain.get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
      }
      shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
 +    amd_buffer_marker = add_extension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
++    // DCport: after a device loss the driver names the faulting GPU address (vk_breadcrumbs).
++    device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
      if (shader_clock) {
          shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
          LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
-@@ -706,6 +708,7 @@ bool Instance::CreateDevice() {
+@@ -584,6 +588,9 @@ bool Instance::CreateDevice() {
+         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE{
+             .shaderMixedFloatDotProductFloat16AccFloat32 = true,
+         },
++        vk::PhysicalDeviceFaultFeaturesEXT{
++            .deviceFault = true,
++        },
+     };
+ 
+     if (!custom_border_color) {
+@@ -641,6 +648,9 @@ bool Instance::CreateDevice() {
+     if (!mixed_float_dot_product) {
+         device_chain.unlink<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
+     }
++    if (!device_fault) {
++        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
++    }
+ 
+     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+     if (device_result != vk::Result::eSuccess && enabled_extensions.size() > renderer_extension_count) {
+@@ -706,6 +716,7 @@ bool Instance::CreateDevice() {
      }
  
      CreateAllocator();
@@ -1496,7 +1580,7 @@ index ddd57f5..b5fe841 100644
  }
  
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
-index fad0a85..7670c7a 100644
+index fad0a85..a570291 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
 @@ -3,6 +3,7 @@
@@ -1507,7 +1591,22 @@ index fad0a85..7670c7a 100644
  #include <span>
  #include <unordered_map>
  
-@@ -293,9 +294,30 @@ public:
+@@ -287,15 +288,50 @@ public:
+     /// bbport: the FSR 4 v07 INT8/DOT4 shaders can run (Float16, Int8, Int16, packed int8 dot
+     /// products, linear compute derivatives, extended storage image formats).
+     bool IsFsr4Int8Supported() const {
++        // DCport: Intel Arc never finished setting up the INT8 model (no error, the game stops
++        // after "FSR 4 inputs"); FSR 3.1 is used there. BB_FSR4_INTEL=1 tries it anyway.
++        static const bool intel_forced = [] {
++            const char* env = std::getenv("BB_FSR4_INTEL");
++            return env && env[0] == '1';
++        }();
++        if (properties.vendorID == 0x8086 && !intel_forced) {
++            return false;
++        }
+         return vk12_features.shaderFloat16 && vk12_features.shaderInt8 && features.shaderInt16 &&
+                vk13_features.shaderIntegerDotProduct && compute_shader_derivatives &&
+                compute_shader_derivatives_features.computeDerivativeGroupLinear &&
                 features.shaderStorageImageExtendedFormats;
      }
  
@@ -1524,30 +1623,55 @@ index fad0a85..7670c7a 100644
 +    }
 +
 +    /// bbport: draws prepared and Vulkan commands recorded on worker threads (faster).
-+    /// BB_THREADED_RECORDING=0/1 (dcport.ini threaded_recording); unset or "auto": off on AMD
-+    /// RX 6000 and older (device ids below 0x7440), whose driver loses the device mid-race with it.
++    /// BB_THREADED_RECORDING=0/1 (dcport.ini threaded_recording); unset or "auto": off (DCport
++    /// 0.3.7: it lost the device mid-race on RX 6000 and the testers' newer GPUs ran clean
++    /// without it; SETUP > Threading > On turns it on).
 +    bool ThreadedRecording() const {
 +        const char* env = std::getenv("BB_THREADED_RECORDING");
 +        if (env && (env[0] == '0' || env[0] == '1')) {
 +            return env[0] == '1';
 +        }
-+        return !(properties.vendorID == 0x1002 && properties.deviceID < 0x7440);
++        return false;
 +    }
 +
 +    /// bbport: VK_AMD_buffer_marker (GPU breadcrumbs for device losses).
++    bool IsDeviceFaultSupported() const {
++        return device_fault;
++    }
++
 +    bool IsAmdBufferMarkerSupported() const {
 +        return amd_buffer_marker;
      }
  
      /// VK_KHR_shader_clock is supported.
-@@ -571,6 +593,7 @@ private:
+@@ -571,6 +607,8 @@ private:
      bool image_2d_view_of_3d{};
      bool image_view_min_lod{};
      bool shader_clock{};
 +    bool amd_buffer_marker{};
++    bool device_fault{};
      bool compute_shader_derivatives{};
      bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
      bool supports_memory_budget{};
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_object_motion.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_object_motion.cpp
+index 7203c54..c480c8a 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_object_motion.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_object_motion.cpp
+@@ -69,6 +69,14 @@ ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
+     // without it, with motion from the camera only.
+     const auto props = instance.GetPhysicalDevice().getProperties();
+     const char* forced = std::getenv("BB_OBJECT_MOTION");
++    // DCport: Driveclub's upscaler takes its motion from the game's TAA resolve (dc_motion), not
++    // from these vertex stores; with them on, newer GPUs (RX 7000/9000, Intel Arc) lost the device
++    // right after a car's geometry loaded. Off in Driveclub mode unless BB_OBJECT_MOTION=1.
++    const char* dc = std::getenv("BB_DC_UPSCALE");
++    if (dc && dc[0] == '1' && !(forced && forced[0] == '1')) {
++        std::printf("Object motion: off (Driveclub's upscaler takes its motion from the game)\n");
++        return;
++    }
+     if (props.vendorID == 0x1002 && props.deviceID < 0x7440 && !(forced && forced[0] == '1')) {
+         std::printf("Object motion: off on this AMD GPU (RX 6000 and older lose the device with it; "
+                     "BB_OBJECT_MOTION=1 turns it on)\n");
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp
 index d8e35d3..0f33059 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp
@@ -2612,10 +2736,29 @@ index 1ca0873..01761ae 100644
      Scheduler& scheduler;
  
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_swapchain.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_swapchain.cpp
-index f2d6bba..53d3f64 100644
+index f2d6bba..a1bca2f 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_swapchain.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_swapchain.cpp
-@@ -144,7 +144,7 @@ bool Swapchain::Present() {
+@@ -8,6 +8,7 @@
+ #include "core/emulator_settings.h"
+ #include "imgui/renderer/imgui_core.h"
+ #include "sdl_window.h"
++#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_swapchain.h"
+ 
+@@ -118,6 +119,10 @@ bool Swapchain::AcquireNextImage() {
+         needs_recreation = true;
+         break;
+     default:
++        // DCport: a device loss can show here first (no submit noticed it yet).
++        if (result == vk::Result::eErrorDeviceLost) {
++            Breadcrumbs::Report();
++        }
+         LOG_CRITICAL(Render_Vulkan, "Swapchain acquire returned unknown result {}",
+                      vk::to_string(result));
+         UNREACHABLE();
+@@ -144,7 +149,7 @@ bool Swapchain::Present() {
                     vk::to_string(result));
      }
  
@@ -2624,7 +2767,7 @@ index f2d6bba..53d3f64 100644
  
      return !needs_recreation;
  }
-@@ -283,7 +283,11 @@ void Swapchain::Destroy() {
+@@ -283,7 +288,11 @@ void Swapchain::Destroy() {
  
  void Swapchain::RefreshSemaphores() {
      const vk::Device device = instance.GetDevice();
@@ -3657,7 +3800,7 @@ index 494d151..85c8231 100644
      g_window_thread = std::thread([title, width, height] {
          Common::SetCurrentThreadName("bb:window");
 diff --git a/gpu/shim/bbport_overlay.cpp b/gpu/shim/bbport_overlay.cpp
-index c6f7c9a..4e1e4ca 100644
+index c6f7c9a..f102515 100644
 --- a/gpu/shim/bbport_overlay.cpp
 +++ b/gpu/shim/bbport_overlay.cpp
 @@ -7,10 +7,12 @@
@@ -3779,7 +3922,18 @@ index c6f7c9a..4e1e4ca 100644
      Checkbox("Sharpening (RCAS)", s.sharpen);
      ImGui::BeginDisabled(!s.sharpen);
      Slider("Sharpness", s.sharpness, 0.0f, 2.0f);
-@@ -296,6 +321,7 @@ void Menu() {
+@@ -287,8 +312,10 @@ void Menu() {
+     }
+     ImGui::EndDisabled();
+     ImGui::EndDisabled();
++    if (!dc_menu) {  // DCport: off in Driveclub mode (the game's TAA data gives the motion)
+     Checkbox("Object motion vectors", s.object_motion);
+     Hint("Accurate vectors for animated objects reduce breakup on clothing and weapons during movement. Static geometry receives no extra pass. Changes require a restart.");
++    }
+     bool show_motion = s.debug_view == BbSettings::DebugMotion;
+     if (ImGui::Checkbox("Show motion vectors (debug)", &show_motion)) {
+         s.debug_view = show_motion ? BbSettings::DebugMotion : BbSettings::DebugNone;
+@@ -296,6 +323,7 @@ void Menu() {
      Hint("Red/green: horizontal/vertical motion (8 pixels = full brightness). Blue: the pixel has accurate object motion, beyond camera motion. A moving object with no blue or red/green is treated as stationary and may leave trails.");
      ImGui::EndDisabled(); // upscaler off
  
@@ -3787,7 +3941,7 @@ index c6f7c9a..4e1e4ca 100644
      ImGui::SeparatorText("Output resolution");
      static const char* outputs[] = {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160",
                                      "2560 x 1080 (21:9)", "3440 x 1440 (21:9)",
-@@ -334,6 +360,10 @@ void Menu() {
+@@ -334,6 +362,10 @@ void Menu() {
          ImGui::EndCombo();
      }
      Hint("On: output and presets change without restarting, while game post-processing stays at 1080p. Off: the scene is patched to the preset resolution at startup. Auto enables the live path on capable discrete GPUs. Changes apply after restarting the game.");
@@ -3798,7 +3952,7 @@ index c6f7c9a..4e1e4ca 100644
      ImGui::SeparatorText("Game effects (restart required)");
      static const char* lods[] = {"Highest (-2)", "Original", "Lower (1)", "Lowest (2)"};
      static constexpr int lod_values[] = {-2, 0, 1, 2};
-@@ -354,6 +384,7 @@ void Menu() {
+@@ -354,6 +386,7 @@ void Menu() {
      }
      Hint("Effects are applied through game patches at startup (patches/Bloodborne.xml). Motion blur and dynamic shadows can increase GPU load.");
      Hint("Free camera: hold Cross and press L3 (keyboard: Space + Z). Debug menu: left touchpad / Tab. Requires DbgFont14h.ccm and DbgFont14h.tpf in dvdroot_ps4/font from the debug-font mod. Right touchpad: Backspace.");
@@ -3806,7 +3960,7 @@ index c6f7c9a..4e1e4ca 100644
  
      bool restart = s.object_motion != s.startup_object_motion ||
                     s.model_lod != s.startup_model_lod ||
-@@ -371,6 +402,7 @@ void Menu() {
+@@ -371,6 +404,7 @@ void Menu() {
          }
      }
  
@@ -3814,7 +3968,7 @@ index c6f7c9a..4e1e4ca 100644
      ImGui::SeparatorText("Other");
      Checkbox("Show FPS counter", s.show_fps);
  
-@@ -397,7 +429,7 @@ void Menu() {
+@@ -397,7 +431,7 @@ void Menu() {
          quit_armed = false;
      }
      ImGui::SameLine();
@@ -3823,7 +3977,7 @@ index c6f7c9a..4e1e4ca 100644
      ImGui::End();
      if (!keep_open) {
          SetOpen(false);
-@@ -440,14 +472,39 @@ void FpsCounter() {
+@@ -440,14 +474,39 @@ void FpsCounter() {
                       ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                       ImGuiWindowFlags_NoFocusOnAppearing);
      const auto& s = BbSettings::Get();
@@ -3871,7 +4025,7 @@ index c6f7c9a..4e1e4ca 100644
      ImGui::End();
  }
  
-@@ -464,14 +521,54 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count)
+@@ -464,14 +523,54 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count)
      io.IniFilename = nullptr; // window positions are not kept
      io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
      io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
@@ -3928,7 +4082,7 @@ index c6f7c9a..4e1e4ca 100644
  
      ImFontConfig font_config;
      font_config.FontDataOwnedByAtlas = false;
-@@ -633,7 +730,7 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
+@@ -633,7 +732,7 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
      text_entry_text = text;
  }
  
@@ -3937,7 +4091,7 @@ index c6f7c9a..4e1e4ca 100644
      // Present interval for the FPS readout (measured also while nothing is drawn).
      const auto now = std::chrono::steady_clock::now();
      const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
-@@ -641,6 +738,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+@@ -641,6 +740,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
      if (ms > 0.0f && ms < 1000.0f) {
          frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
      }

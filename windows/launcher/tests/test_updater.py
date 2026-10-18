@@ -37,6 +37,8 @@ def test_newest_picks_the_highest_release_with_this_editions_zip():
     assert updater.newest(rels, "0.3.5", fsr=False).version == "0.4.0"
     assert updater.newest(rels, "0.4.0", fsr=True) is None
     assert updater.newest(rels, "0.3.5-test", fsr=True).version == "0.4.0"
+    assert updater.newest(rels, "0.4.0-test", fsr=True).version == "0.4.0"   # its final release
+    assert updater.newest(rels, "0.4.1-test", fsr=True) is None              # never a downgrade
     assert updater.newest({"message": "rate limited"}, "0.3.5", fsr=True) is None
 
 

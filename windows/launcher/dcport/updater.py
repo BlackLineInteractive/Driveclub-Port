@@ -34,6 +34,12 @@ def parse_version(text: str) -> "tuple[int, ...] | None":
     return tuple(int(x) for x in m.groups()) if m else None
 
 
+def _current(text: str) -> "tuple[tuple[int, ...], bool] | None":
+    """The running version and whether it is a test build ('0.3.7-test' comes before 0.3.7)."""
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(-.+)?", text.strip())
+    return (tuple(int(x) for x in m.groups()[:3]), bool(m.group(4))) if m else None
+
+
 @dataclass(frozen=True)
 class Release:
     version: str
@@ -49,7 +55,7 @@ def asset_name(version: str, fsr: bool) -> str:
 
 def newest(releases: list, current: str, fsr: bool) -> "Release | None":
     """The newest published release above `current` that has this edition's zip."""
-    mine = parse_version(current)
+    mine = _current(current)
     best = None
     for r in releases if isinstance(releases, list) else []:
         if not isinstance(r, dict) or r.get("draft") or r.get("prerelease"):
@@ -59,8 +65,10 @@ def newest(releases: list, current: str, fsr: bool) -> "Release | None":
             continue
         version = tag[len(TAG_PREFIX):]
         parsed = parse_version(version)
-        if parsed is None or (mine is not None and parsed <= mine):
+        if parsed is None:
             continue
+        if mine is not None and (parsed < mine[0] or (parsed == mine[0] and not mine[1])):
+            continue  # older, or this very release (a test build gets its final release)
         if best is not None and parsed <= parse_version(best.version):
             continue
         for a in r.get("assets", []) or []:

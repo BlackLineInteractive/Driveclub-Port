@@ -110,7 +110,7 @@ def game_env(paths: AppPaths, s: LauncherSettings, fsr: bool,
         "DC_LANGUAGE": game_language(paths),
     })
     # dcport.ini threaded_recording=0/1 (SETUP > Threading); Auto (anything else) lets the
-    # runtime decide: off on AMD RX 6000 and older, on elsewhere.
+    # runtime decide: off (it can crash mid-race).
     env.pop("BB_THREADED_RECORDING", None)
     threading = _ini_value(paths, "threaded_recording", "auto")
     if threading in ("0", "1"):

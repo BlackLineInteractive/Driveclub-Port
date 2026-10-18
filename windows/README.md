@@ -7,6 +7,14 @@ The Windows backend of Driveclub Native: DRIVECLUB (PS4, v01.28: EU CUSA00003 or
 ![DRIVECLUB BIKES on Windows, FSR 4](media/ingame-bike.png)
 ![Event preview on Windows, FSR 4](media/ingame-track.png)
 
+## 0.3.7
+
+- **Fewer "Device lost" crashes.** The crash right after a car loads is gone in testing (RX 9070 XT): the "Object motion" pass, left over from the runtime DCport is built on, is off in DRIVECLUB (its FSR takes the motion from the game itself), and threaded recording is off by default (SETUP > Threading > On turns it on).
+- **Intel CPUs (12th gen and later): random startup crash fixed** (`Fault: read access to 0 at guest offset 0x64db13`). On these CPUs an exception saves more on the stack, over memory the game still uses. The prepare step now finds the affected functions in your own game files (eboot and modules) and runs their memory accesses with the stack moved out of the way. Found by jony113. On AMD CPUs nothing changes except a tiny overhead.
+- **Intel Arc GPUs:** FSR 3.1 is used; FSR 4 did not finish starting on Intel's driver.
+- After a "Device lost" crash the log also shows the GPU address that faulted (where the driver supports it).
+- Test builds of the launcher only update to their own final release or newer.
+
 ## 0.3.6
 
 - **Render above 1080p removed.** The community resolution patches (1440p, 1800p, 4K) left part of the game's lighting at 1080p (a square in the top left of the picture) and races lost the GPU with them. The game renders at 1080p; on a 1440p or 4K window or screen the picture is scaled up with FSR 1 and sharpened, which ran without those crashes.
@@ -107,7 +115,7 @@ Requirements: Windows 10/11 64-bit, a CPU with AVX, a Vulkan 1.3 GPU.
 
 ## Source in this folder
 
-- `launcher/`: the DCport launcher (Python 3.12, Tkinter, Pillow; frozen with PyInstaller via `build.sh fsr|nofsr`) and the first-run prepare tool (`launcher/prepare/`). Tests: `python -m pytest tests`.
+- `launcher/`: the DCport launcher (Python 3.12, Tkinter, Pillow; frozen with PyInstaller via `build.sh fsr|nofsr`) and the first-run prepare tool (`launcher/prepare/`, needs [capstone](https://www.capstone-engine.org/) (BSD) for the red-zone analysis). Tests: `python -m pytest tests`.
 - `runtime/driveclub-runtime.patch`: the Driveclub changes to the native PS4 runtime, against [Supermedo/bloodborne_pc](https://github.com/Supermedo/bloodborne_pc) commit `fce08780508a72f50d34a3d3a2926e746d12284c` (version 1.8.2). Apply with `git apply`, then build with `build.sh` in MSYS2 CLANG64.
 - `runtime/fsr-vulkan.patch.txt`: one small change to its FSR-Vulkan submodule.
 - `patches/Driveclub.xml`: community patches (60 FPS with deltatime and others).

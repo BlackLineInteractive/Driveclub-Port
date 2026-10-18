@@ -23,10 +23,8 @@ DEFAULT_SHARPNESS = 0.30  # the runtime's value when dcport.ini has none
 WINDOW_CHOICES = tuple((f"{w}x{h}", "4K" if h == 2160 else f"{h}p")
                        for w, h in patches.WINDOW_SIZES)
 THREADING_CHOICES = (("auto", "Auto"), ("1", "On"), ("0", "Off"))
-THREADING_NOTE = ("Threading: the game's GPU work is prepared on extra threads (more FPS). "
-                  "Auto turns it off on AMD Radeon RX 6000 and older, which run fine without it "
-                  "and can crash mid-race with it, and on for other cards (NVIDIA, newer AMD). "
-                  "If the game crashes, try Off; if it runs fine, try On for more FPS. "
+THREADING_NOTE = ("Threading: the game's GPU work is prepared on extra threads. It gives more FPS "
+                  "but can crash mid-race, so Auto keeps it off (as Off does); On turns it on. "
                   "Applies on the next PLAY.")
 AA_NOTE = ("FSR is DRIVECLUB's anti-aliasing at 1080p (native AA), not an upscaler: the game's "
            "effects and HUD after it stay at 1080p, so there are no Quality, Balanced or "
