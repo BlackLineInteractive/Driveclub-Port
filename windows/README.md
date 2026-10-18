@@ -22,11 +22,22 @@ What happens in those two minutes, all on your PC:
 - **Repairs stripped shaders.** DLLs with performance-rewritten shaders lose their resource names; the builder restores them from AMD's original shaders (downloaded from AMD's public FidelityFX SDK and only read, never run).
 - **Checks everything.** The dispatch sequence, group counts, tensor sizes and constants of every pass are checked against the rules the Vulkan replay uses before anything is written.
 
-The result, `fsr4_411/`, is replayed by the runtime every frame (about 1 ms at 1080p). It works with **frame generation** too: `FSR 4.1.1 + FG` at 120 FPS (60 base) on an RX 6750 XT, an RDNA 2 card. Without the window: `DriveClub.exe --setup-fsr411 <path to the DLL>`.
+The result, `fsr4_411/`, is replayed by the runtime every frame (about 1 ms at 1080p). Frame generation runs on top of it, but not on Radeon RX 6000 cards (see 0.3.4). Without the window: `DriveClub.exe --setup-fsr411 <path to the DLL>`.
 
 Nothing of AMD's is in the download or in this repository: every player builds it from their own DLL. AMD's own DLL offers FSR 4.1.1 on Radeon RX 9000 cards only; other cards need a version of the DLL that lifts that limit.
 
 Also new: **FSR in every race** (0.2.0's FSR ran in menus only), **FSR 3 frame generation** with a HUD-less copy of each frame, a **PATCHES** tab, window size and render resolution settings.
+
+## 0.3.4
+
+- **Freeze mid-race fixed** (picture stops, sound loops). Two game threads waited for each other on a read-write lock: on PS4 a thread that already holds a read lock may take it again while a writer waits; the Windows lock made it wait behind the writer. Both of the game's lock APIs now follow the PS4 rule.
+- **Frame generation and AMD Radeon RX 6000 and older: leave it off.** On these cards it loses the GPU ("Device lost") a few minutes into some races, with every upscaler. New GPU markers in the log showed AMD's FSR 3.1 frame interpolation running when it happens. AMD Fluid Motion Frames (Adrenalin) or Lossless Scaling add frames from outside the game instead.
+- **GPU markers:** after a "Device lost" crash the log lists which GPU step was running (AMD cards, `VK_AMD_buffer_marker`). Send it with crash reports.
+- **Player name:** SETUP > Game > Player name (saved in `dcport.ini` as `player_name`). The default is "Player".
+- **Frame generation "Image only"** (game menu, for testing): frames from the pictures alone, without the game's depth and motion.
+- Auto exposure: small GPU results the game reads back (such as brightness) are copied first when a frame's read-back budget runs out, so exposure keeps updating in busy scenes (the screen could stay too dark after bright-to-dark changes, or flicker).
+- Colour-surface metadata reads (CMask) are answered as "not compressed" instead of stale memory, and logged once instead of every frame.
+- Frame generation presents two images per frame: the swapchain now has enough acquire semaphores for that.
 
 ## 0.3.3 hotfix
 

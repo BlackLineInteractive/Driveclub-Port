@@ -88,6 +88,16 @@ def test_frame_gen_halves_the_game_frame_rate(tmp_path):
     assert game_env(paths, LauncherSettings(fps=120), fsr=True, base={})["BB_FPS_LIMIT"] == "120"
 
 
+def test_player_name(tmp_path):
+    paths = AppPaths.for_root(tmp_path)
+    paths.ini.parent.mkdir(parents=True, exist_ok=True)
+    assert game_env(paths, LauncherSettings(), fsr=True, base={})["BB_USER_NAME"] == "Player"
+    paths.ini.write_text("player_name= qnfn " + chr(10), encoding="utf-8")
+    assert game_env(paths, LauncherSettings(), fsr=True, base={})["BB_USER_NAME"] == "qnfn"
+    paths.ini.write_text("player_name=" + "x" * 30 + chr(10), encoding="utf-8")
+    assert game_env(paths, LauncherSettings(), fsr=True, base={})["BB_USER_NAME"] == "x" * 16
+
+
 def test_threaded_recording_setting(tmp_path):
     paths = AppPaths.for_root(tmp_path)
     paths.ini.parent.mkdir(parents=True, exist_ok=True)

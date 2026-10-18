@@ -36,9 +36,21 @@ def _ini_value(paths: AppPaths, key: str, default: str) -> str:
         return default
 
 
+DEFAULT_PLAYER_NAME = "Player"
+
+
+def player_name(paths: AppPaths) -> str:
+    """dcport.ini player_name (SETUP > Player name): the name the game shows for the player.
+    Printable characters only, at most 16 (a PSN online ID's length)."""
+    raw = _ini_value(paths, "player_name", DEFAULT_PLAYER_NAME)
+    name = "".join(c for c in raw if c.isprintable()).strip()[:16]
+    return name or DEFAULT_PLAYER_NAME
+
+
 def frame_gen_on(paths: AppPaths) -> bool:
     """dcport.ini's frame_gen (the SETUP page or the game's menu writes it)."""
     return _ini_value(paths, "frame_gen", "0") == "1"
+
 
 
 def game_command(paths: AppPaths, game_dir: Path, fps: int,
@@ -66,6 +78,7 @@ def game_env(paths: AppPaths, s: LauncherSettings, fsr: bool,
         "BB_FULLSCREEN": "1" if s.fullscreen else "0",
         "BB_WINDOW_SIZE": "{}x{}".format(*window_size(s.window_size)),
         "BB_DMEM_MB": str(dmem_mb(s)),
+        "BB_USER_NAME": player_name(paths),
     })
     # dcport.ini threaded_recording=0/1 (SETUP > Threading); Auto (anything else) lets the
     # runtime decide: off on AMD RX 6000 and older, on elsewhere.

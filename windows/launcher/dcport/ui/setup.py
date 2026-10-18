@@ -8,7 +8,7 @@ from tkinter import filedialog
 from dcport import fsr411, patches
 from dcport.game import ready_checks
 from dcport.prepare_state import is_prepared
-from dcport.runtime import FPS_PRESETS, fps_note, parse_fps
+from dcport.runtime import FPS_PRESETS, fps_note, parse_fps, player_name
 from dcport.ui import theme
 
 FPS_ERROR = "Enter a whole number from 30 to 240"
@@ -128,6 +128,16 @@ class SetupPage(tk.Frame):
         self.game_check.pack(fill="x", pady=(app.px(12), 0))
         self.files_check = theme.text_label(card, app)
         self.files_check.pack(fill="x", pady=(app.px(4), 0))
+        row = self._row(card)
+        row.pack(fill="x", pady=(app.px(14), 0))
+        theme.text_label(row, app, "Player name").pack(side="left")
+        self.player_name = theme.Field(row, app, width=app.px(160))
+        self.player_name.pack(side="left", padx=(app.px(12), app.px(8)))
+        theme.text_label(row, app, "shown in the game, then Enter", font="small",
+                         fg="muted").pack(side="left", padx=(app.px(6), 0))
+        entry = self.player_name.entry
+        for key in ("<Return>", "<KP_Enter>", "<FocusOut>"):
+            entry.bind(key, lambda e: self.set_player_name(entry.get()), add="+")
 
     def _build_fps(self, card) -> None:
         app = self.app
@@ -259,6 +269,12 @@ class SetupPage(tk.Frame):
         """
         app, s = self.app, self.app.settings
         self.folder.set(s.game_dir or "No folder chosen")
+        try:
+            typing_name = self.focus_get() is self.player_name.entry
+        except (KeyError, tk.TclError):
+            typing_name = False
+        if not typing_name:
+            self.player_name.set(player_name(app.paths))
         if not self._typing():
             if s.fps in FPS_PRESETS:
                 self.fps_choice.set(s.fps)
@@ -533,6 +549,15 @@ class SetupPage(tk.Frame):
     def set_threading(self, value: str) -> None:
         self._show_status(self.app.update_game_ini({"threaded_recording": value}) or "")
         self.threading_choice.set(threading_value(self.app.game_ini()))
+
+    def set_player_name(self, text: str) -> None:
+        name = "".join(c for c in text if c.isprintable()).strip()[:16]
+        if not name or name == player_name(self.app.paths):
+            self.player_name.set(player_name(self.app.paths))
+            return
+        self._show_status(self.app.update_game_ini({"player_name": name}) or
+                          f"Player name: {name} (from the next start)")
+        self.player_name.set(name)
 
     def set_frame_gen(self, on: bool) -> None:
         self._show_status(self.app.update_game_ini({"frame_gen": "1" if on else "0"}) or "")
