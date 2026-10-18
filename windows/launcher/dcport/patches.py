@@ -26,7 +26,7 @@ MOTION_BLUR = "Disable motion blur and depth of field"
 TOGGLES = (
     Toggle(MOTION_BLUR, "No motion blur or depth of field",
            "A sharper picture in motion. The game uses one shader for both, and for its "
-           "anti-aliasing: with this on, FSR and frame generation cannot run."),
+           "anti-aliasing: with this on, FSR cannot run."),
     Toggle("Barrier Disable", "No track barriers",
            "Drive off the track without the invisible walls."),
     Toggle("Reset Disable", "No reset to track",
@@ -56,6 +56,8 @@ class Resolution:
     extra_dmem_mb: int
 
 
+# Above 1080p the community render patches leave some of the game's passes at 1080p (a square
+# at x 1920 / y 1080 in the picture) and can lose the device: optional, 1080p by default.
 RESOLUTIONS = (
     Resolution("1080p", "1080p", (1920, 1080), (), 0),
     Resolution("1440p", "1440p", (2560, 1440),

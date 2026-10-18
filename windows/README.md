@@ -7,13 +7,25 @@ The Windows backend of Driveclub Native: DRIVECLUB (PS4, v01.28: EU CUSA00003 or
 ![DRIVECLUB BIKES on Windows, FSR 4](media/ingame-bike.png)
 ![Event preview on Windows, FSR 4](media/ingame-track.png)
 
+## 0.3.5
+
+- **Intel CPUs work.** DRIVECLUB uses an AMD-only instruction (SSE4a `EXTRQ`, 316 places in the 01.28 eboot); Intel CPUs closed the game at the first one (`0xC000001D`). On CPUs without SSE4a the prepare step now replaces each with an equivalent two-shift sequence (found and verified by jony113). AMD installs are unchanged.
+- **Automatic updates.** The launcher checks this repository's releases when it starts, downloads the new version of its edition in the background (checked against GitHub's SHA-256) and offers **Restart to update**. Program files are replaced; saves, settings, controls, profiles, backups and `fsr4_411/` stay. Updating to 0.3.5 itself is manual, once.
+- **FSR is anti-aliasing, not an upscaler.** FSR 3.1 / 4 / 4.1.1 run inside DRIVECLUB's own anti-aliasing step (native AA). Everything after that step, the game's effects and HUD, stays at 1080p, so there are no Quality, Balanced or Performance modes: those would need the rest of the frame at a higher size. The launcher and the in-game menu now say anti-aliasing.
+- **Bigger screens:** the 1080p frame is scaled to a bigger window or screen with FSR 1 and sharpened (FSR edition).
+- **Render above 1080p is optional, with a warning.** The community resolution patches leave part of the game's lighting at 1080p (a square in the top left of the picture, with or without FSR) and some races lose the GPU there. 1080p is the default and recommended.
+- **The in-game Output resolution / Preset / Live resolution options are gone** (left over from the Bloodborne runtime this is built on): changing the output resolution mid-race lost the GPU.
+- **Frame generation removed.** AMD's FSR 3.1 frame interpolation lost the GPU mid-race (GPU markers, 0.3.4), and it only doubled frames the game already showed. AMD Fluid Motion Frames (Adrenalin) or Lossless Scaling add frames from outside the game.
+- **Language:** SETUP > Language, with the languages of your copy (EU: 14, US: English, French, Portuguese (Brazil), Spanish (Latin America)).
+- Known: some races can still end with "Device lost" after a few minutes on some AMD cards (also in 0.3.4). Please send the log with its GPU markers.
+
 ## ⚡ New in 0.3.0: FSR 4.1.1, built on your own PC, in one click
 
-AMD ships FSR 4.1.1 as a DirectX 12 DLL. DCport's **FSR 4.1.1 builder** turns your own copy of that DLL into a native **Vulkan** upscaler for Driveclub — no Wine, no Linux, no tools to install:
+AMD ships FSR 4.1.1 as a DirectX 12 DLL. DCport's **FSR 4.1.1 builder** turns your own copy of that DLL into native **Vulkan** anti-aliasing for Driveclub — no Wine, no Linux, no tools to install:
 
-1. SETUP → Upscaling → **Set up FSR 4.1.1…**
+1. SETUP → Anti-aliasing (FSR) → **Set up FSR 4.1.1…**
 2. Pick your `amd_fidelityfx_upscaler_dx12.dll` (4.1.x).
-3. About two minutes later, choose **FSR 4.1.1** as the upscaler. Done.
+3. About two minutes later, choose **FSR 4.1.1** as the mode. Done.
 
 What happens in those two minutes, all on your PC:
 
@@ -22,11 +34,11 @@ What happens in those two minutes, all on your PC:
 - **Repairs stripped shaders.** DLLs with performance-rewritten shaders lose their resource names; the builder restores them from AMD's original shaders (downloaded from AMD's public FidelityFX SDK and only read, never run).
 - **Checks everything.** The dispatch sequence, group counts, tensor sizes and constants of every pass are checked against the rules the Vulkan replay uses before anything is written.
 
-The result, `fsr4_411/`, is replayed by the runtime every frame (about 1 ms at 1080p). Frame generation runs on top of it, but not on Radeon RX 6000 cards (see 0.3.4). Without the window: `DriveClub.exe --setup-fsr411 <path to the DLL>`.
+The result, `fsr4_411/`, is replayed by the runtime every frame (about 1 ms at 1080p). Without the window: `DriveClub.exe --setup-fsr411 <path to the DLL>`.
 
 Nothing of AMD's is in the download or in this repository: every player builds it from their own DLL. AMD's own DLL offers FSR 4.1.1 on Radeon RX 9000 cards only; other cards need a version of the DLL that lifts that limit.
 
-Also new: **FSR in every race** (0.2.0's FSR ran in menus only), **FSR 3 frame generation** with a HUD-less copy of each frame, a **PATCHES** tab, window size and render resolution settings.
+Also new in 0.3.0: **FSR in every race** (0.2.0's FSR ran in menus only), a **PATCHES** tab, window size and render resolution settings.
 
 ## 0.3.4
 
@@ -61,7 +73,7 @@ Also new: **FSR in every race** (0.2.0's FSR ran in menus only), **FSR 3 frame g
 Get the latest release from the Releases page:
 
 - `DCport-<version>-windows-fsr.zip`: with FSR 3.1 and FSR 4 (FSR 4 needs a recent AMD or NVIDIA GPU)
-- `DCport-<version>-windows.zip`: without upscaling
+- `DCport-<version>-windows.zip`: without FSR
 
 No game files are included. You need your own dump of DRIVECLUB 01.28, EU (CUSA00003) or US (CUSA00093) (the folder with `eboot.bin` and the `game*.dat` files).
 
@@ -71,7 +83,7 @@ No game files are included. You need your own dump of DRIVECLUB 01.28, EU (CUSA0
 2. The first time, choose your game folder. On the first PLAY, DCport prepares the game files on your PC (once, under a minute).
 3. The launcher has six tabs:
    - **RACE**: game art, ready checks, PLAY, quick frame rate, window and FPS counter
-   - **SETUP**: game folder, frame rate (30–240, tested up to 120), window mode and size, render resolution (1080p–4K), FPS counter; FSR edition: upscaler, sharpness, frame generation, FSR 4.1.1 set-up
+   - **SETUP**: game folder, player name, language, frame rate (30–240, tested up to 120), window mode and size, render resolution (1080p recommended), FPS counter, threading; FSR edition: anti-aliasing (FSR 3.1 / 4 / 4.1.1), sharpness, FSR 4.1.1 set-up
    - **PATCHES**: community game patches (frame-rate patch type, no barriers, no reset, no motion blur/DOF, photo mode)
    - **CONTROLS**: keyboard and controller bindings
    - **GARAGE**: save profiles, backups with restore, shader cache, desktop shortcut, Add to Steam
@@ -84,8 +96,7 @@ Requirements: Windows 10/11 64-bit, a CPU with AVX, a Vulkan 1.3 GPU.
 
 ### FSR edition extras (0.3.0)
 
-- **FSR in every race:** Driveclub's TAA resolve comes in three variants (menus, races, others); FSR 3.1/4 replace all of them. The FPS counter names the upscaler only while it really runs ("TAA" otherwise).
-- **Frame generation:** FSR 3 frame interpolation (FSR-Vulkan) with a HUD-less copy of each frame; the game runs at half the chosen rate and every frame gets a generated one (120 FPS = 60 + 60). The counter shows both rates.
+- **FSR in every race:** Driveclub's TAA resolve comes in three variants (menus, races, others); FSR 3.1/4 replace all of them. The FPS counter names the FSR mode only while it really runs ("TAA" otherwise).
 - **FSR 4.1.1 (optional, bring your own DLL):** SETUP > *Set up FSR 4.1.1…* runs your own `amd_fidelityfx_upscaler_dx12.dll` once on DirectX 12, translates its shaders to SPIR-V on your PC (`bin/fsr411`: fsr4cap, dxil-spirv, SPIRV-Tools) and writes `fsr4_411/`, which the runtime replays in Vulkan. Nothing of AMD's is in the release or in this repository; AMD's FidelityFX loader is downloaded from AMD's public SDK repository during set-up. AMD's own DLL offers FSR 4.1.1 on Radeon RX 9000 only.
 
 ## Source in this folder

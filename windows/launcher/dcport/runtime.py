@@ -47,9 +47,37 @@ def player_name(paths: AppPaths) -> str:
     return name or DEFAULT_PLAYER_NAME
 
 
-def frame_gen_on(paths: AppPaths) -> bool:
-    """dcport.ini's frame_gen (the SETUP page or the game's menu writes it)."""
-    return _ini_value(paths, "frame_gen", "0") == "1"
+# PS4 system language codes (SystemService parameter 1); the game picks its text from it.
+# Each region's game has its own languages: other codes show English.
+LANGUAGES_EU = (  # CUSA00003
+    ("1", "English"), ("2", "Français"), ("4", "Deutsch"), ("5", "Italiano"), ("3", "Español"),
+    ("7", "Português"), ("6", "Nederlands"), ("16", "Polski"), ("8", "Русский"),
+    ("19", "Türkçe"), ("13", "Svenska"), ("14", "Dansk"), ("15", "Norsk"), ("12", "Suomi"),
+)
+LANGUAGES_US = (  # CUSA00093
+    ("1", "English"), ("2", "Français"), ("17", "Português (Brasil)"),
+    ("20", "Español (Latinoamérica)"),
+)
+LANGUAGES = LANGUAGES_EU + LANGUAGES_US[2:]
+
+
+def languages_for(title_id: str) -> tuple[tuple[str, str], ...]:
+    """The languages of this region's game (CUSA00003 EU, CUSA00093 US); both if unknown."""
+    if title_id == "CUSA00003":
+        return LANGUAGES_EU
+    if title_id == "CUSA00093":
+        return LANGUAGES_US
+    return LANGUAGES
+
+
+DEFAULT_LANGUAGE = "1"
+
+
+def game_language(paths: AppPaths) -> str:
+    """dcport.ini language (SETUP > Language): a PS4 system language code, English (US) if
+    missing or unknown."""
+    value = _ini_value(paths, "language", DEFAULT_LANGUAGE)
+    return value if value in dict(LANGUAGES) else DEFAULT_LANGUAGE
 
 
 
@@ -79,6 +107,7 @@ def game_env(paths: AppPaths, s: LauncherSettings, fsr: bool,
         "BB_WINDOW_SIZE": "{}x{}".format(*window_size(s.window_size)),
         "BB_DMEM_MB": str(dmem_mb(s)),
         "BB_USER_NAME": player_name(paths),
+        "DC_LANGUAGE": game_language(paths),
     })
     # dcport.ini threaded_recording=0/1 (SETUP > Threading); Auto (anything else) lets the
     # runtime decide: off on AMD RX 6000 and older, on elsewhere.
@@ -90,17 +119,18 @@ def game_env(paths: AppPaths, s: LauncherSettings, fsr: bool,
         env["BB_VBLANK_HZ"] = "60"
         env["BB_FPS_LIMIT"] = "0"
     else:
-        # With frame generation the game makes half the frames and each gets a generated one.
-        game_fps = max(FPS_MIN, s.fps // 2) if fsr and frame_gen_on(paths) else s.fps
-        env["BB_VBLANK_HZ"] = str(game_fps)
-        env["BB_FPS_LIMIT"] = str(game_fps)
+        env["BB_VBLANK_HZ"] = str(s.fps)
+        env["BB_FPS_LIMIT"] = str(s.fps)
     if fsr:
         env.pop("BB_UPSCALER", None)
         env["BB_DC_UPSCALE"] = "1"
+        # The 1080p frame scaled to a bigger window or screen with FSR 1 and RCAS.
+        env["BB_FSR1"] = "1"
         env["BB_FSR4_DIR"] = str(paths.fsr4_dir)
         env["BB_FSR411_DIR"] = str(paths.root / "fsr4_411")  # built by SETUP (dcport.fsr411)
     else:
         env.pop("BB_FSR4_DIR", None)
+        env.pop("BB_FSR1", None)
         env["BB_UPSCALER"] = "none"
         env["BB_DC_UPSCALE"] = "0"
     return env
