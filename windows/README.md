@@ -21,7 +21,7 @@ The Windows backend of Driveclub Native: DRIVECLUB (PS4, v01.28: EU CUSA00003 or
 - **Bigger screens:** the 1080p frame is scaled to a bigger window or screen with FSR 1 and sharpened (FSR edition).
 - **Render above 1080p is optional, with a warning.** The community resolution patches leave part of the game's lighting at 1080p (a square in the top left of the picture, with or without FSR) and some races lose the GPU there. 1080p is the default and recommended.
 - **The in-game Output resolution / Preset / Live resolution options are gone** (left over from the Bloodborne runtime this is built on): changing the output resolution mid-race lost the GPU.
-- **Frame generation removed.** AMD's FSR 3.1 frame interpolation lost the GPU mid-race (GPU markers, 0.3.4), and it only doubled frames the game already showed. AMD Fluid Motion Frames (Adrenalin) or Lossless Scaling add frames from outside the game.
+- **Frame generation removed** because it did not work.
 - **Language:** SETUP > Language, with the languages of your copy (EU: 14, US: English, French, Portuguese (Brazil), Spanish (Latin America)).
 - Known: some races can still end with "Device lost" after a few minutes on some AMD cards (also in 0.3.4). Please send the log with its GPU markers.
 
@@ -49,7 +49,7 @@ Also new in 0.3.0: **FSR in every race** (0.2.0's FSR ran in menus only), a **PA
 ## 0.3.4
 
 - **Freeze mid-race fixed** (picture stops, sound loops). Two game threads waited for each other on a read-write lock: on PS4 a thread that already holds a read lock may take it again while a writer waits; the Windows lock made it wait behind the writer. Both of the game's lock APIs now follow the PS4 rule.
-- **Frame generation and AMD Radeon RX 6000 and older: leave it off.** On these cards it loses the GPU ("Device lost") a few minutes into some races, with every upscaler. New GPU markers in the log showed AMD's FSR 3.1 frame interpolation running when it happens. AMD Fluid Motion Frames (Adrenalin) or Lossless Scaling add frames from outside the game instead.
+- **Frame generation: leave it off** (removed in 0.3.5 because it did not work).
 - **GPU markers:** after a "Device lost" crash the log lists which GPU step was running (AMD cards, `VK_AMD_buffer_marker`). Send it with crash reports.
 - **Player name:** SETUP > Game > Player name (saved in `dcport.ini` as `player_name`). The default is "Player".
 - **Frame generation "Image only"** (game menu, for testing): frames from the pictures alone, without the game's depth and motion.
