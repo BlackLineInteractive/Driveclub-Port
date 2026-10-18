@@ -70,7 +70,7 @@ def test_env_window_and_render_resolution(tmp_path):
     paths = AppPaths.for_root(tmp_path)
     s = LauncherSettings(window_size="2560x1440", render_res="2160p")
     e = game_env(paths, s, fsr=True, base={})
-    assert e["BB_WINDOW_SIZE"] == "2560x1440" and e["BB_DMEM_MB"] == str(5056 + 5000)
+    assert e["BB_WINDOW_SIZE"] == "2560x1440" and e["BB_DMEM_MB"] == "5056"
     assert e["BB_FSR1"] == "1" and "BB_FSR1" not in game_env(paths, s, fsr=False, base={})
     e = game_env(paths, LauncherSettings(window_size="99x1", render_res="8k"), fsr=True, base={})
     assert e["BB_WINDOW_SIZE"] == "1920x1080" and e["BB_DMEM_MB"] == "5056"

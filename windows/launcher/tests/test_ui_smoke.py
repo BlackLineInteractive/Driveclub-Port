@@ -371,7 +371,7 @@ def test_run_task_reports_on_the_ui_thread(tmp_path):
 
 
 def test_version_and_bundled_resources(monkeypatch, tmp_path):
-    assert dcport.__version__ == "0.3.5"
+    assert dcport.__version__ == "0.3.6"
     assert theme.default_controls() == DEFAULT_INPUT.resolve()
     assert theme.assets_dir() == DEFAULT_INPUT.resolve().parent / "assets"
     monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
@@ -1117,5 +1117,37 @@ def test_no_update_check_outside_the_packaged_launcher(tmp_path, monkeypatch):
     try:
         app.update()
         assert called == [] and app.update_text() == ""
+    finally:
+        app.destroy()
+
+
+def test_check_for_updates_button_reports(tmp_path, monkeypatch):
+    from dcport import updater
+    from tests.test_updater import RELEASE, make_install, make_zip
+    root = tmp_path / "DCport"
+    make_install(root)
+    monkeypatch.setenv("DCPORT_UPDATE_TEST", "1")
+    monkeypatch.setenv("DCPORT_NO_UPDATES", "1")  # no check at start; only the button
+    found = []
+    monkeypatch.setattr(updater, "check", lambda current, fsr: found[0] if found else None)
+    monkeypatch.setattr(updater, "download",
+                        lambda release, folder, fsr: make_zip(tmp_path / "u.zip", RELEASE))
+    app = App(AppPaths.for_root(root), fsr=True)
+    try:
+        app.show("setup"); page = app.pages["setup"]
+        page.check_updates()
+        pump(app, lambda: "up to date" in page.status.cget("text"))
+        assert app.update_text() == ""
+        found.append(updater.Release("0.9.0", "https://dl/x.zip", 1, "", ""))
+        page.check_updates()
+        pump(app, lambda: "0.9.0 is ready" in page.status.cget("text"))
+        assert "DCport 0.9.0 is ready to install" in app.update_text()
+
+        def fail(current, fsr):
+            raise OSError("offline")
+        monkeypatch.setattr(updater, "check", fail)
+        app.update_ready = None
+        page.check_updates()
+        pump(app, lambda: "Could not check" in page.status.cget("text"))
     finally:
         app.destroy()

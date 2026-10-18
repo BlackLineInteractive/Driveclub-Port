@@ -57,6 +57,17 @@ def has_eboot(game_dir: Path) -> bool:
     return (Path(game_dir) / "eboot.bin").is_file()
 
 
+UPDATE_ONLY = ("This folder is the 01.28 update without the base game (no game.chc). Copy the "
+               "update's files over your base game (01.00) folder, replacing the old ones, and "
+               "choose that folder.")
+
+
+def is_update_only(game_dir: Path) -> bool:
+    """An unpacked update package: the 01.28 eboot.bin but none of the base game's files
+    (game.chc, the content index, ships with the base game only). The game crashes at boot."""
+    return has_eboot(game_dir) and not (Path(game_dir) / "game.chc").is_file()
+
+
 def art_path(game_dir: Path) -> "Path | None":
     # DRIVECLUB's pic0 is the race background; its pic1 is the Evolution Studios logo.
     for name in ("pic0.png", "pic1.png"):
@@ -84,6 +95,8 @@ def ready_checks(game_dir: Path, paths: AppPaths, gpu: "str | None",
     info = game_info(game_dir)
     if not has_eboot(game_dir):
         game = Check("Choose the DRIVECLUB folder", "bad")
+    elif is_update_only(game_dir):
+        game = Check("Update only: put it over the base game", "bad")
     elif info and info.app_ver == "01.28":  # any region; prepare/dc_patches.py checks the same
         game = Check(f"DRIVECLUB {info.title_id} v01.28", "ok")
     else:

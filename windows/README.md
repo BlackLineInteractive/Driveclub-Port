@@ -7,6 +7,12 @@ The Windows backend of Driveclub Native: DRIVECLUB (PS4, v01.28: EU CUSA00003 or
 ![DRIVECLUB BIKES on Windows, FSR 4](media/ingame-bike.png)
 ![Event preview on Windows, FSR 4](media/ingame-track.png)
 
+## 0.3.6
+
+- **Render above 1080p removed.** The community resolution patches (1440p, 1800p, 4K) left part of the game's lighting at 1080p (a square in the top left of the picture) and races lost the GPU with them. The game renders at 1080p; on a 1440p or 4K window or screen the picture is scaled up with FSR 1 and sharpened, which ran without those crashes.
+- **SETUP > Check for updates:** checks at any time (the launcher also checks at every start and downloads in the background).
+- **Update-only folders are refused.** A folder with the 01.28 update package alone (eboot.bin but no `game.chc`) crashed at boot; the launcher now says to copy the update over the base game (01.00) and choose that folder.
+
 ## 0.3.5
 
 - **Intel CPUs work.** DRIVECLUB uses an AMD-only instruction (SSE4a `EXTRQ`, 316 places in the 01.28 eboot); Intel CPUs closed the game at the first one (`0xC000001D`). On CPUs without SSE4a the prepare step now replaces each with an equivalent two-shift sequence (found and verified by jony113). AMD installs are unchanged.
@@ -83,7 +89,7 @@ No game files are included. You need your own dump of DRIVECLUB 01.28, EU (CUSA0
 2. The first time, choose your game folder. On the first PLAY, DCport prepares the game files on your PC (once, under a minute).
 3. The launcher has six tabs:
    - **RACE**: game art, ready checks, PLAY, quick frame rate, window and FPS counter
-   - **SETUP**: game folder, player name, language, frame rate (30–240, tested up to 120), window mode and size, render resolution (1080p recommended), FPS counter, threading; FSR edition: anti-aliasing (FSR 3.1 / 4 / 4.1.1), sharpness, FSR 4.1.1 set-up
+   - **SETUP**: game folder, player name, language, frame rate (30–240, tested up to 120), window mode and size, FPS counter, threading; FSR edition: anti-aliasing (FSR 3.1 / 4 / 4.1.1), sharpness, FSR 4.1.1 set-up
    - **PATCHES**: community game patches (frame-rate patch type, no barriers, no reset, no motion blur/DOF, photo mode)
    - **CONTROLS**: keyboard and controller bindings
    - **GARAGE**: save profiles, backups with restore, shader cache, desktop shortcut, Add to Steam

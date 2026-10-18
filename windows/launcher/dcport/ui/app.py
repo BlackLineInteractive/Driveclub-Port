@@ -16,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 from dcport import __version__, patches, profiles, sysinfo, updater
-from dcport.game import art_path, game_info, has_eboot, ready_checks
+from dcport.game import UPDATE_ONLY, art_path, game_info, has_eboot, is_update_only, ready_checks
 from dcport.ini import read_ini, update_ini
 from dcport.paths import AppPaths
 from dcport.prepare_state import is_prepared, prepare_command
@@ -394,6 +394,7 @@ class App(tk.Tk):
     def _build_update_bar(self) -> None:
         """Shown once a newer release is downloaded: restart to install it."""
         self.update_ready: "tuple | None" = None  # (Release, zip path)
+        self.update_checking = False
         bar = self.update_bar = tk.Frame(self)
         self.paint(bar, bg="panel")
         inner = tk.Frame(bar)
@@ -411,29 +412,62 @@ class App(tk.Tk):
                                              bg_role="panel")
         self.notes_button.pack(side="right", padx=(0, self.px(10)))
 
+    @staticmethod
+    def updates_possible() -> bool:
+        """Only the packaged launcher updates itself (never a source tree)."""
+        return getattr(sys, "frozen", False) or os.environ.get("DCPORT_UPDATE_TEST") == "1"
+
     def _start_update_check(self) -> None:
-        """Once per start, packaged launcher only: the newest release of this edition is
-        downloaded in the background (DCPORT_NO_UPDATES=1 turns it off)."""
-        packaged = getattr(sys, "frozen", False) or os.environ.get("DCPORT_UPDATE_TEST") == "1"
-        if not packaged or os.environ.get("DCPORT_NO_UPDATES") == "1":
+        """Once per start: the newest release of this edition is downloaded in the background
+        (DCPORT_NO_UPDATES=1 turns it off)."""
+        if not self.updates_possible() or os.environ.get("DCPORT_NO_UPDATES") == "1":
             return
+        updater.clean_up(self.paths.root)
+        self.check_for_updates()
+
+    def check_for_updates(self, report=None) -> None:
+        """Looks for a newer release and downloads it; the update bar then offers the restart.
+        report(text, role), when given, hears the outcome (SETUP's Check for updates)."""
+        if self.update_ready:
+            self.update_bar.pack(fill="x", before=self.body)
+            if report:
+                report(f"DCport {self.update_ready[0].version} is ready: Restart to update above.",
+                       "ok")
+            return
+        if not self.updates_possible():
+            if report:
+                report("Updates work in the released DCport only.", "warn")
+            return
+        if self.update_checking:
+            return
+        self.update_checking = True
         root, fsr = self.paths.root, self.fsr
-        updater.clean_up(root)
 
         def work():
             release = updater.check(__version__, fsr)
             if release is None:
                 return None
+            if report:
+                self._results.put(("task", lambda r, e: report(
+                    f"Downloading DCport {release.version}…", "muted"), None, None))
             return release, updater.download(release, root / "updates", fsr)
 
         def done(result, error) -> None:
+            self.update_checking = False
             if error is not None:
                 print(f"Update check: {_reason(error)}", file=sys.stderr)
-            elif result is not None:
+                if report:
+                    report(f"Could not check for updates: {_reason(error)}", "bad")
+            elif result is None:
+                if report:
+                    report(f"DCport {__version__} is up to date.", "ok")
+            else:
                 self.update_ready = result
                 self.update_label.configure(
                     text=f"DCport {result[0].version} is ready to install (you have {__version__}).")
                 self.update_bar.pack(fill="x", before=self.body)
+                if report:
+                    report(f"DCport {result[0].version} is ready: Restart to update above.", "ok")
 
         self.run_task(work, done)
 
@@ -570,6 +604,9 @@ class App(tk.Tk):
                 "DCport", f"There is no eboot.bin in\n{folder}\n\n"
                 "Choose the DRIVECLUB folder that contains eboot.bin.", parent=self)
             return False
+        if is_update_only(folder):
+            messagebox.showwarning("DCport", f"{folder}\n\n{UPDATE_ONLY}", parent=self)
+            return False
         self.settings.game_dir = str(folder)
         self.save_settings()
         self.refresh_game()
@@ -631,6 +668,9 @@ class App(tk.Tk):
             if not self.ask_game_folder():
                 return None
             gd = self.game_dir()
+        if gd is not None and is_update_only(gd):
+            race.show_message(UPDATE_ONLY, "bad")
+            return None
         race.clear_message()
         return gd
 
