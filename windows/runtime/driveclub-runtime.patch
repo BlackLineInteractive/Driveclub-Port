@@ -216,10 +216,28 @@ index 6318e26..4c6f530 100644
          ++wait_cursor;
      }
 diff --git a/gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp b/gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp
-index 18476d4..8b03c41 100644
+index 18476d4..32a2128 100644
 --- a/gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp
 +++ b/gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp
-@@ -148,6 +148,15 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
+@@ -8,6 +8,9 @@
+ #include <algorithm>
+ #include <bit>
+ #include <cstdlib>
++#include <cstdio>
++#include <cstring>
++#include <atomic>
+ #include <magic_enum/magic_enum.hpp>
+ #include "bbport_copy.h"
+ #include "bbport_toggles.h"
+@@ -19,6 +22,7 @@
+ #include "video_core/buffer_cache/memory_tracker.h"
+ #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
++#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
+ #include "video_core/renderer_vulkan/vk_runtime.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/texture_cache/texture_cache.h"
+@@ -148,6 +152,15 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
  }
  
  void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
@@ -235,7 +253,7 @@ index 18476d4..8b03c41 100644
      const auto flush_request = [this, device_addr, size, is_write] {
          const u32 first_block = device_addr >> block_shift;
          const u32 last_block = (device_addr + size - 1) >> block_shift;
-@@ -173,6 +182,100 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
+@@ -173,6 +186,122 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
      }
  }
  
@@ -271,15 +289,37 @@ index 18476d4..8b03c41 100644
 +    };
 +    std::vector<Readback> readbacks;
 +    u64 total = 0;
++    // bbport: over the budget, small ranges (exposure values and other CPU-read results) go
++    // first; cutting by address dropped the same high ranges every busy frame.
++    u64 merged_bytes = 0;
++    for (const auto& range : merged) {
++        merged_bytes += Common::AlignUp(range.second, 64);
++    }
++    if (merged_bytes > AsyncReadbackMaxFrameBytes) {
++        std::stable_sort(merged.begin(), merged.end(),
++                         [](const auto& a, const auto& b) { return a.second < b.second; });
++    }
++    u64 dropped = 0;
 +    for (const auto& [addr, size] : merged) {
 +        if (total + size > AsyncReadbackMaxFrameBytes) {
-+            break;
++            ++dropped;
++            continue;
 +        }
 +        readbacks.push_back({addr, size, total});
 +        total += Common::AlignUp(size, 64);
 +        BbStats::async_ranges[size <= 256 ? 0 : size <= 4_KB ? 1 : size <= 64_KB ? 2 : 3]
 +            .fetch_add(1, std::memory_order_relaxed);
 +        BbStats::async_bytes.fetch_add(size, std::memory_order_relaxed);
++    }
++    if (dropped) {
++        static std::atomic<int> reported{0};
++        if (reported.fetch_add(1) < 8) {
++            std::printf("Async readback: %llu ranges over the %llu MiB frame budget skipped "
++                        "(%llu MiB written)\n",
++                        static_cast<unsigned long long>(dropped),
++                        static_cast<unsigned long long>(AsyncReadbackMaxFrameBytes >> 20),
++                        static_cast<unsigned long long>(merged_bytes >> 20));
++        }
 +    }
 +    if (readbacks.empty()) {
 +        return;
@@ -336,7 +376,7 @@ index 18476d4..8b03c41 100644
  void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
      boost::container::small_vector<vk::BufferCopy, 1> copies;
      u64 total_size_bytes = 0;
-@@ -202,7 +305,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
+@@ -202,7 +331,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
          copy.dstOffset += download.offset;
      }
      runtime.CopyBuffer(arena, download.buffer, copies);
@@ -348,7 +388,7 @@ index 18476d4..8b03c41 100644
  
      download.buffer->Invalidate(download.offset, download.size);
      for (const auto& copy : copies) {
-@@ -345,6 +451,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
+@@ -345,6 +477,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
      }
      if (is_written) {
          gpu_modified_ranges.Add(device_addr, size);
@@ -359,6 +399,45 @@ index 18476d4..8b03c41 100644
      }
      return {arena, arena->Offset(device_addr)};
  }
+@@ -638,8 +774,26 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
+             static constexpr u32 ZmaskUncompressed = 0xf;
+             runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
+             return true;
+-        } else {
+-            LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
++        }
++        // bbport: color targets are never fast-cleared here, so CMask reads see every tile as
++        // expanded (all ones) instead of stale guest memory. BB_CMASK_FILL=0 restores the old path.
++        static const bool cmask_fill = [] {
++            const char* env = std::getenv("BB_CMASK_FILL");
++            return !env || std::strcmp(env, "0") != 0;
++        }();
++        static std::atomic<int> logged{0};
++        if (*type == TextureCache::MetaType::CMask && cmask_fill) {
++            if (logged.fetch_add(1) == 0) {
++                std::printf("GPU: CMask read at %#llx, filled as uncompressed (BB_CMASK_FILL=0 "
++                            "turns this off)\n",
++                            static_cast<unsigned long long>(device_addr));
++            }
++            runtime.FillBuffer(arena, arena->Offset(device_addr), size, 0xffffffffu);
++            return true;
++        }
++        if (logged.fetch_add(1) < 4) {
++            LOG_WARNING(Render_Vulkan, "Unhandled metadata type {} (logged 4 times)",
++                        magic_enum::enum_name(*type));
+         }
+     }
+     // bbport: most texel buffers alias no image; remember misses until images change.
+@@ -727,6 +881,9 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+ 
+     info.AddWait(signal_sema, signal_tick);
+     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
++    if (submit_result == vk::Result::eErrorDeviceLost) {
++        Vulkan::Breadcrumbs::Report();
++    }
+     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+ 
+     pending_binds.clear();
 diff --git a/gpu/shadps4/video_core/buffer_cache/buffer_cache.h b/gpu/shadps4/video_core/buffer_cache/buffer_cache.h
 index 0ab18c2..8f8c4b0 100644
 --- a/gpu/shadps4/video_core/buffer_cache/buffer_cache.h
@@ -568,12 +647,249 @@ index 0000000..941eb89
 +    const float d = texelFetch(depth_ms, ivec2(gl_FragCoord.xy), 0).r;
 +    out_color = vec4(d, 0.0, 0.0, 1.0);
 +}
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/host_passes/fsr_pass.cpp b/gpu/shadps4/video_core/renderer_vulkan/host_passes/fsr_pass.cpp
+index 4dd46cf..b61fb7f 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/host_passes/fsr_pass.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/host_passes/fsr_pass.cpp
+@@ -1,6 +1,8 @@
+ //  SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ //  SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdio>
++
+ #include "common/assert.h"
+ #include "core/emulator_settings.h"
+ #include "video_core/host_shaders/fsr_easu_comp.h"
+@@ -144,6 +146,10 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
+     DebugState.is_using_fsr = true;
+ 
+     if (output_size != cur_size) {
++        // DCport: once per size, so a log shows the frame was scaled to the window or screen.
++        std::printf("Window scaling: FSR 1 %ux%u -> %ux%u (RCAS %s)\n", input_size.width,
++                    input_size.height, output_size.width, output_size.height,
++                    settings.use_rcas ? "on" : "off");
+         ResizeAndInvalidate(output_size.width, output_size.height);
+     }
+     auto [width, height] = cur_size;
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_breadcrumbs.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_breadcrumbs.cpp
+new file mode 100644
+index 0000000..bb64d06
+--- /dev/null
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_breadcrumbs.cpp
+@@ -0,0 +1,168 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
++
++#include <array>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++#include <vk_mem_alloc.h>
++#include "video_core/renderer_vulkan/vk_instance.h"
++
++namespace Vulkan::Breadcrumbs {
++namespace {
++
++// Per site: [0] last started, [1] last finished (sequence numbers, 0 = never).
++volatile u32* slots = nullptr;
++vk::Buffer buffer{};
++std::array<std::atomic<u32>, SiteCount> sequence{};
++std::atomic<bool> reported{false};
++// DCport: VK_EXT_device_fault, for the faulting address after a loss.
++VkDevice fault_device = VK_NULL_HANDLE;
++PFN_vkGetDeviceFaultInfoEXT get_fault_info = nullptr;
++
++const char* FaultKind(VkDeviceFaultAddressTypeEXT type) {
++    switch (type) {
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "none";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "invalid read";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "invalid write";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "invalid execute";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "shader at (unknown)";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "shader at (invalid)";
++    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "shader at (fault)";
++    default: return "other";
++    }
++}
++
++void ReportFault() {
++    if (!get_fault_info) {
++        return;
++    }
++    VkDeviceFaultCountsEXT counts{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
++    if (get_fault_info(fault_device, &counts, nullptr) != VK_SUCCESS) {
++        std::printf("GPU fault: the driver gave no details\n");
++        return;
++    }
++    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
++    std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
++    counts.vendorBinarySize = 0;
++    VkDeviceFaultInfoEXT info{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,
++                              .pAddressInfos = addresses.empty() ? nullptr : addresses.data(),
++                              .pVendorInfos = vendor.empty() ? nullptr : vendor.data()};
++    const VkResult result = get_fault_info(fault_device, &counts, &info);
++    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
++        std::printf("GPU fault: the driver gave no details (%d)\n", int(result));
++        return;
++    }
++    std::printf("GPU fault: %s\n", info.description[0] ? info.description : "(no description)");
++    for (u32 i = 0; i < counts.addressInfoCount; ++i) {
++        const auto& a = addresses[i];
++        std::printf("  %s at GPU address %#llx (+/- %#llx)\n", FaultKind(a.addressType),
++                    (unsigned long long)a.reportedAddress,
++                    (unsigned long long)a.addressPrecision);
++    }
++    for (u32 i = 0; i < counts.vendorInfoCount; ++i) {
++        std::printf("  vendor: %s (code %#llx, data %#llx)\n", vendor[i].description,
++                    (unsigned long long)vendor[i].vendorFaultCode,
++                    (unsigned long long)vendor[i].vendorFaultData);
++    }
++}
++
++const char* SiteName(u32 site) {
++    switch (site) {
++    case Submit0 + 0: return "submission (scheduler 0)";
++    case Submit0 + 1: return "submission (scheduler 1)";
++    case Submit0 + 2: return "submission (scheduler 2)";
++    case Submit0 + 3: return "submission (scheduler 3)";
++    case DcUpscale: return "Driveclub upscaler (motion + FSR + merge)";
++    case FrameGen: return "frame generation";
++    case Present: return "present blit";
++    case HudlessCopy: return "HUD-less copy";
++    default: return "other";
++    }
++}
++
++} // namespace
++
++void Init(const Instance& instance) {
++    if (instance.IsDeviceFaultSupported() && !get_fault_info) {
++        fault_device = instance.GetDevice();
++        get_fault_info = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
++            instance.GetDevice().getProcAddr("vkGetDeviceFaultInfoEXT"));
++        if (get_fault_info) {
++            std::printf("GPU faults: on (VK_EXT_device_fault); a device loss names the address\n");
++        }
++    }
++    const char* env = std::getenv("BB_GPU_MARKERS");
++    if ((env && env[0] == '0') || !instance.IsAmdBufferMarkerSupported() || slots) {
++        return;
++    }
++    const VkBufferCreateInfo buffer_ci{
++        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++        .size = SiteCount * 2 * sizeof(u32),
++        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++    };
++    // Host memory: still readable after the device is gone.
++    const VmaAllocationCreateInfo alloc_ci{
++        .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
++                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
++        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
++        .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++    };
++    VkBuffer raw{};
++    VmaAllocation allocation{};
++    VmaAllocationInfo info{};
++    if (vmaCreateBuffer(instance.GetAllocator(), &buffer_ci, &alloc_ci, &raw, &allocation,
++                        &info) != VK_SUCCESS ||
++        !info.pMappedData) {
++        std::printf("GPU markers: no host buffer, off\n");
++        return;
++    }
++    buffer = raw;
++    slots = static_cast<volatile u32*>(info.pMappedData);
++    for (u32 i = 0; i < SiteCount * 2; ++i) {
++        slots[i] = 0;
++    }
++    std::printf("GPU markers: on (VK_AMD_buffer_marker); a device loss reports where the GPU was\n");
++}
++
++void Begin(vk::CommandBuffer cmdbuf, u32 site) {
++    if (!slots || site >= SiteCount) {
++        return;
++    }
++    const u32 seq = sequence[site].fetch_add(1, std::memory_order_relaxed) + 1;
++    cmdbuf.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eTopOfPipe, buffer,
++                                site * 2 * sizeof(u32), seq);
++}
++
++void End(vk::CommandBuffer cmdbuf, u32 site) {
++    if (!slots || site >= SiteCount) {
++        return;
++    }
++    // The sequence Begin used: the same thread records both for a site.
++    const u32 seq = sequence[site].load(std::memory_order_relaxed);
++    cmdbuf.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eBottomOfPipe, buffer,
++                                (site * 2 + 1) * sizeof(u32), seq);
++}
++
++void Report() {
++    if (reported.exchange(true)) {
++        return;
++    }
++    if (slots) {
++        std::printf("GPU markers at the device loss (started / finished / recorded):\n");
++        for (u32 site = 0; site < SiteCount; ++site) {
++            const u32 recorded = sequence[site].load();
++            if (!recorded) {
++                continue;
++            }
++            const u32 started = slots[site * 2], finished = slots[site * 2 + 1];
++            std::printf("  %-42s %u / %u / %u%s\n", SiteName(site), started, finished,
++                        recorded, started != finished ? "  <- running on the GPU" : "");
++        }
++    }
++    ReportFault();
++    std::fflush(stdout);
++}
++
++} // namespace Vulkan::Breadcrumbs
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_breadcrumbs.h b/gpu/shadps4/video_core/renderer_vulkan/vk_breadcrumbs.h
+new file mode 100644
+index 0000000..88a7af3
+--- /dev/null
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_breadcrumbs.h
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++
++#include "common/types.h"
++#include "video_core/renderer_vulkan/vk_common.h"
++
++namespace Vulkan {
++
++class Instance;
++
++/// bbport: GPU breadcrumbs for device losses. Each site writes a sequence number when the GPU
++/// starts it (top of pipe) and when it finishes it (bottom of pipe) into host memory with
++/// VK_AMD_buffer_marker; after a device loss Report() prints the sites started but not
++/// finished, which is where the GPU was. Off without the extension or with BB_GPU_MARKERS=0.
++namespace Breadcrumbs {
++
++enum Site : u32 {
++    Submit0 = 0, ///< one per scheduler (Submit0 + its index), the whole command buffer
++    DcUpscale = 8,
++    FrameGen = 9,
++    Present = 10,
++    HudlessCopy = 11,
++    SiteCount = 16,
++};
++
++void Init(const Instance& instance);
++void Begin(vk::CommandBuffer cmdbuf, u32 site);
++void End(vk::CommandBuffer cmdbuf, u32 site);
++/// Prints where the GPU was (once); call before reporting a device loss.
++void Report();
++
++} // namespace Breadcrumbs
++} // namespace Vulkan
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_frame_generation.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_frame_generation.cpp
 new file mode 100644
-index 0000000..d2f202a
+index 0000000..48732eb
 --- /dev/null
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_frame_generation.cpp
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,494 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +#include "video_core/renderer_vulkan/vk_frame_generation.h"
 +
@@ -844,10 +1160,14 @@ index 0000000..d2f202a
 +        have_previous = false;
 +        return false;
 +    }
++    // Image only: flat depth and zero motion at the window's size, so
++    // the interpolation finds motion from the pictures alone; nothing else from the game.
++    const bool image_only = settings.frame_gen_image_only;
 +    // Rendering above the window's size: depth and motion are scaled down to it first.
-+    const bool shrink = inputs->width > frame.width || inputs->height > frame.height;
-+    const u32 rw = shrink ? frame.width : inputs->width;
-+    const u32 rh = shrink ? frame.height : inputs->height;
++    const bool shrink =
++        !image_only && (inputs->width > frame.width || inputs->height > frame.height);
++    const u32 rw = shrink || image_only ? frame.width : inputs->width;
++    const u32 rh = shrink || image_only ? frame.height : inputs->height;
 +    if (!EnsureContext(rw, rh, frame.width, frame.height) || !EnsureGenerated(frame)) {
 +        failed = true;
 +        return false;
@@ -874,6 +1194,24 @@ index 0000000..d2f202a
 +            // Nearest: depth and motion are not blended across edges.
 +            cmdbuf.blitImage(src, vk::ImageLayout::eGeneral, dst,
 +                             vk::ImageLayout::eTransferDstOptimal, scale, vk::Filter::eNearest);
++            Barrier(cmdbuf, dst, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eGeneral,
++                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
++                    vk::PipelineStageFlagBits2::eComputeShader,
++                    vk::AccessFlagBits2::eShaderRead);
++        }
++        depth = small_depth;
++        motion = small_motion;
++    }
++    if (image_only) {
++        // Reversed infinite depth: 0 is far away everywhere.
++        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
++        for (const vk::Image dst : {small_depth, small_motion}) {
++            Barrier(cmdbuf, dst, vk::ImageLayout::eUndefined,
++                    vk::ImageLayout::eTransferDstOptimal, all, vk::AccessFlagBits2::eNone,
++                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
++            cmdbuf.clearColorImage(dst, vk::ImageLayout::eTransferDstOptimal,
++                                   vk::ClearColorValue{std::array{0.0f, 0.0f, 0.0f, 0.0f}},
++                                   range);
 +            Barrier(cmdbuf, dst, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eGeneral,
 +                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 +                    vk::PipelineStageFlagBits2::eComputeShader,
@@ -909,7 +1247,7 @@ index 0000000..d2f202a
 +            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 +    // The frame before its HUD (the display buffer, kept by the upscaler, Transfer source):
 +    // the interpolation then leaves the HUD where it is.
-+    const bool hudless = inputs->hudless != vk::Image{};
++    const bool hudless = !image_only && inputs->hudless != vk::Image{};
 +    if (hudless) {
 +        Barrier(cmdbuf, hudless_image, vk::ImageLayout::eUndefined,
 +                vk::ImageLayout::eTransferDstOptimal, all, vk::AccessFlagBits2::eNone, transfer,
@@ -960,7 +1298,10 @@ index 0000000..d2f202a
 +    prepare.renderSize = {rw, rh};
 +    prepare.jitterOffset = {0.0f, 0.0f};
 +    // Pixels at render size, as the upscaler takes them; scaled with the images.
-+    prepare.motionVectorScale = {float(rw) / float(inputs->width), float(rh) / float(inputs->height)};
++    prepare.motionVectorScale =
++        image_only ? FfxVkPortableFloat2{1.0f, 1.0f}
++                   : FfxVkPortableFloat2{float(rw) / float(inputs->width),
++                                         float(rh) / float(inputs->height)};
 +    prepare.frameTimeMilliseconds = inputs->frame_ms;
 +    prepare.cameraNear = inputs->near_plane;
 +    prepare.cameraFar = 1.0e6f;
@@ -1108,9 +1449,18 @@ index 0000000..897a5f6
 +
 +} // namespace Vulkan
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
-index 2c70bba..f434b0f 100644
+index 2c70bba..67e3376 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
+@@ -133,7 +133,7 @@ struct Fsr4Upscaler::Impl {
+             if (ReadFile(dir + name, data)) {
+                 return true;
+             }
+-            Fail("missing " + dir + name + " (run tools/fetch_fsr4_assets.sh)", true);
++            Fail("missing " + dir + name + " (the FSR edition's fsr4_shaders folder)", true);
+             return false;
+         };
+         if (!load(assets.pre, code[0])) return false;
 @@ -190,6 +190,9 @@ struct Fsr4Upscaler::Impl {
          ffxCreateContextDescUpscale desc{};
          desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
@@ -1121,7 +1471,28 @@ index 2c70bba..f434b0f 100644
          // Any preset's render size fits: the context is not recreated for a size change.
          desc.maxRenderSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
          desc.maxUpscaleSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
-@@ -383,6 +386,10 @@ Fsr4Upscaler::Fsr4Upscaler(const Instance& instance, Scheduler& scheduler)
+@@ -233,7 +236,7 @@ struct Fsr4Upscaler::Impl {
+ 
+     bool Record411(const Frame& f) {
+         if (!instance.IsFsr411Supported()) {
+-            Fail("FSR 4.1.1 needs INT8 dot products and VK_VALVE_shader_mixed_float_dot_product", true);
++            Fail("FSR 4.1.1 needs a GPU with INT8 dot products", true);
+             return false;
+         }
+         if (!fsr411) {
+@@ -263,7 +266,10 @@ struct Fsr4Upscaler::Impl {
+         g.auto_exposure = f.auto_exposure;
+         if (!fsr411->Record(g)) {
+             // Missing assets are permanent for this session; the menu shows the reason.
+-            Fail("FSR 4.1.1: " + fsr411->Error(), fsr411->Error().starts_with("missing"));
++            const bool missing = fsr411->Error().starts_with("missing");
++            Fail("FSR 4.1.1: " + fsr411->Error() +
++                     (missing ? " (set it up in the launcher: SETUP, Set up FSR 4.1.1)" : ""),
++                 missing);
+             return false;
+         }
+         fsr411_ticks.push_back(scheduler.CurrentTick());
+@@ -383,6 +389,10 @@ Fsr4Upscaler::Fsr4Upscaler(const Instance& instance, Scheduler& scheduler)
  
  Fsr4Upscaler::~Fsr4Upscaler() = default;
  
@@ -1158,11 +1529,84 @@ index 506cc51..6fd582b 100644
      /// Records FSR 4 into `frame.cmdbuf`; the output stays in General. False when FSR 4
      /// cannot run (Problem() says why; missing assets or device features are permanent).
      bool Record(const Frame& frame);
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.cpp
+index ddd57f5..c8045cf 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.cpp
+@@ -13,6 +13,7 @@
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_dlss.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
++#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
+ #include "video_core/renderer_vulkan/vk_platform.h"
+ 
+ #include <vk_mem_alloc.h>
+@@ -380,6 +381,9 @@ bool Instance::CreateDevice() {
+             feature_chain.get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
+     }
+     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
++    amd_buffer_marker = add_extension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
++    // DCport: after a device loss the driver names the faulting GPU address (vk_breadcrumbs).
++    device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+     if (shader_clock) {
+         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
+         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
+@@ -584,6 +588,9 @@ bool Instance::CreateDevice() {
+         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE{
+             .shaderMixedFloatDotProductFloat16AccFloat32 = true,
+         },
++        vk::PhysicalDeviceFaultFeaturesEXT{
++            .deviceFault = true,
++        },
+     };
+ 
+     if (!custom_border_color) {
+@@ -641,6 +648,9 @@ bool Instance::CreateDevice() {
+     if (!mixed_float_dot_product) {
+         device_chain.unlink<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
+     }
++    if (!device_fault) {
++        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
++    }
+ 
+     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+     if (device_result != vk::Result::eSuccess && enabled_extensions.size() > renderer_extension_count) {
+@@ -706,6 +716,7 @@ bool Instance::CreateDevice() {
+     }
+ 
+     CreateAllocator();
++    Breadcrumbs::Init(*this);
+     return true;
+ }
+ 
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
-index fad0a85..38a6e6f 100644
+index fad0a85..a570291 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_instance.h
-@@ -293,9 +293,14 @@ public:
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <cstdlib>
+ #include <span>
+ #include <unordered_map>
+ 
+@@ -287,15 +288,50 @@ public:
+     /// bbport: the FSR 4 v07 INT8/DOT4 shaders can run (Float16, Int8, Int16, packed int8 dot
+     /// products, linear compute derivatives, extended storage image formats).
+     bool IsFsr4Int8Supported() const {
++        // DCport: Intel Arc never finished setting up the INT8 model (no error, the game stops
++        // after "FSR 4 inputs"); FSR 3.1 is used there. BB_FSR4_INTEL=1 tries it anyway.
++        static const bool intel_forced = [] {
++            const char* env = std::getenv("BB_FSR4_INTEL");
++            return env && env[0] == '1';
++        }();
++        if (properties.vendorID == 0x8086 && !intel_forced) {
++            return false;
++        }
+         return vk12_features.shaderFloat16 && vk12_features.shaderInt8 && features.shaderInt16 &&
+                vk13_features.shaderIntegerDotProduct && compute_shader_derivatives &&
+                compute_shader_derivatives_features.computeDerivativeGroupLinear &&
                 features.shaderStorageImageExtendedFormats;
      }
  
@@ -1176,22 +1620,115 @@ index fad0a85..38a6e6f 100644
 +    }
 +    bool HasMixedFloatDotProduct() const {
 +        return mixed_float_dot_product;
++    }
++
++    /// bbport: draws prepared and Vulkan commands recorded on worker threads (faster).
++    /// BB_THREADED_RECORDING=0/1 (dcport.ini threaded_recording); unset or "auto": off (DCport
++    /// 0.3.7: it lost the device mid-race on RX 6000 and the testers' newer GPUs ran clean
++    /// without it; SETUP > Threading > On turns it on).
++    bool ThreadedRecording() const {
++        const char* env = std::getenv("BB_THREADED_RECORDING");
++        if (env && (env[0] == '0' || env[0] == '1')) {
++            return env[0] == '1';
++        }
++        return false;
++    }
++
++    /// bbport: VK_AMD_buffer_marker (GPU breadcrumbs for device losses).
++    bool IsDeviceFaultSupported() const {
++        return device_fault;
++    }
++
++    bool IsAmdBufferMarkerSupported() const {
++        return amd_buffer_marker;
      }
  
      /// VK_KHR_shader_clock is supported.
+@@ -571,6 +607,8 @@ private:
+     bool image_2d_view_of_3d{};
+     bool image_view_min_lod{};
+     bool shader_clock{};
++    bool amd_buffer_marker{};
++    bool device_fault{};
+     bool compute_shader_derivatives{};
+     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
+     bool supports_memory_budget{};
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_object_motion.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_object_motion.cpp
+index 7203c54..c480c8a 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_object_motion.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_object_motion.cpp
+@@ -69,6 +69,14 @@ ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
+     // without it, with motion from the camera only.
+     const auto props = instance.GetPhysicalDevice().getProperties();
+     const char* forced = std::getenv("BB_OBJECT_MOTION");
++    // DCport: Driveclub's upscaler takes its motion from the game's TAA resolve (dc_motion), not
++    // from these vertex stores; with them on, newer GPUs (RX 7000/9000, Intel Arc) lost the device
++    // right after a car's geometry loaded. Off in Driveclub mode unless BB_OBJECT_MOTION=1.
++    const char* dc = std::getenv("BB_DC_UPSCALE");
++    if (dc && dc[0] == '1' && !(forced && forced[0] == '1')) {
++        std::printf("Object motion: off (Driveclub's upscaler takes its motion from the game)\n");
++        return;
++    }
+     if (props.vendorID == 0x1002 && props.deviceID < 0x7440 && !(forced && forced[0] == '1')) {
+         std::printf("Object motion: off on this AMD GPU (RX 6000 and older lose the device with it; "
+                     "BB_OBJECT_MOTION=1 turns it on)\n");
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index d8e35d3..0f33059 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <atomic>
+ #include <chrono>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
+@@ -822,6 +823,30 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
+              perm_idx != 0 ? "(permutation)" : "");
+     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+     CompileTimer timer;
++    // DCport: BB_DC_RES_SCAN=1 lists the game shaders holding 1080p screen constants (1920,
++    // 1080, 960, 540 and their reciprocals, as floats or integers), for the render patches.
++    static const bool res_scan = std::getenv("BB_DC_RES_SCAN") != nullptr;
++    if (res_scan) {
++        struct Known { u32 bits; const char* name; };
++        static constexpr Known known[] = {
++            {0x44F00000u, "1920.0"}, {0x44870000u, "1080.0"}, {0x44700000u, "960.0"},
++            {0x44070000u, "540.0"}, {0x3A088889u, "1/1920"}, {0x3A72B9D6u, "1/1080"},
++            {0x3A888889u, "1/960"}, {0x3AF2B9D6u, "1/540"}, {1920u, "1920"}, {1080u, "1080"},
++            {0x3A088888u, "1/1920~"}, {0x3A72B9D5u, "1/1080~"}};
++        std::string found;
++        for (const u32 word : code) {
++            for (const auto& k : known) {
++                if (word == k.bits) {
++                    found += ' ';
++                    found += k.name;
++                }
++            }
++        }
++        if (!found.empty()) {
++            std::printf("Res scan: stage %d shader %016llx:%s\n", int(info.hw_stage),
++                        (unsigned long long)info.pgm_hash, found.c_str());
++        }
++    }
+ 
+     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp
-index 77df0d0..b69b534 100644
+index 77df0d0..26ed090 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.cpp
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,8 @@
  #include "video_core/renderer_vulkan/vk_platform.h"
  #include "bbport_overlay.h"
  #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 +#include "video_core/renderer_vulkan/vk_frame_generation.h"
++#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
  #include "video_core/renderer_vulkan/vk_presenter.h"
  #include "video_core/renderer_vulkan/vk_rasterizer.h"
  #include "video_core/texture_cache/image.h"
-@@ -35,6 +36,7 @@
+@@ -35,6 +37,7 @@
  #include <span>
  #include <sstream>
  #include <system_error>
@@ -1199,7 +1736,16 @@ index 77df0d0..b69b534 100644
  #include <vector>
  #include <vk_mem_alloc.h>
  #ifdef MemoryBarrier
-@@ -156,7 +158,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
+@@ -130,7 +133,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
+     : window{window_}, liverpool{liverpool_},
+       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
+                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
+-      draw_scheduler{instance, true}, present_scheduler{instance}, flip_scheduler{instance},
++      draw_scheduler{instance, instance.ThreadedRecording()}, present_scheduler{instance}, flip_scheduler{instance},
+       swapchain{instance, window}, runtime{instance, draw_scheduler},
+       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
+       texture_cache{rasterizer->GetTextureCache()} {
+@@ -156,7 +159,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
      fsr_pass.Create(device, instance.GetAllocator(), num_images);
      pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
      BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
@@ -1208,7 +1754,7 @@ index 77df0d0..b69b534 100644
  }
  
  Presenter::~Presenter() {
-@@ -169,7 +171,9 @@ Presenter::~Presenter() {
+@@ -169,7 +172,9 @@ Presenter::~Presenter() {
      Check(flip_scheduler.CommandBuffer().reset());
  
      const vk::Device device = instance.GetDevice();
@@ -1218,7 +1764,17 @@ index 77df0d0..b69b534 100644
          vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
          device.destroyImageView(frame.image_view);
          device.destroyFence(frame.present_done);
-@@ -466,6 +470,22 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
+@@ -260,6 +265,9 @@ Frame* Presenter::PrepareLastFrame() {
+         if (result == vk::Result::eTimeout) {
+             continue;
+         }
++        if (result == vk::Result::eErrorDeviceLost) {
++            Breadcrumbs::Report();
++        }
+         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
+                    "Device lost during waiting for a frame");
+     }
+@@ -466,6 +474,24 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
          ++frame_dump_index;
      }
  
@@ -1235,13 +1791,15 @@ index 77df0d0..b69b534 100644
 +                        upscaler.fg_handed.exchange(0), upscaler.display_draws.exchange(0) / 300.0);
 +            fg_flips = 0;
 +        }
++        Breadcrumbs::Begin(cmdbuf, Breadcrumbs::FrameGen);
 +        frame_generator->Record(cmdbuf, *frame, scene ? &fg : nullptr);
++        Breadcrumbs::End(cmdbuf, Breadcrumbs::FrameGen);
 +    }
 +
      // Flush frame creation commands.
      frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
      frame->ready_tick = draw_scheduler.CurrentTick();
-@@ -497,6 +517,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
+@@ -497,6 +523,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
  Frame* Presenter::PrepareBlankFrame(bool present_thread) {
      // Request a free presentation frame.
      Frame* frame = GetRenderFrame();
@@ -1249,7 +1807,7 @@ index 77df0d0..b69b534 100644
  
      auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
      scheduler.EndRendering();
-@@ -585,6 +606,61 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+@@ -585,6 +612,61 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
          return;
      }
  
@@ -1311,7 +1869,7 @@ index 77df0d0..b69b534 100644
      // Recreate the swapchain if the window was resized.
      if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
          swapchain.Recreate(window.GetWidth(), window.GetHeight());
-@@ -595,17 +671,19 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+@@ -595,17 +677,19 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
          if (!swapchain.AcquireNextImage()) {
              // User resizes the window too fast and GPU can't keep up. Skip this frame.
              LOG_WARNING(Render_Vulkan, "Skipping frame!");
@@ -1336,7 +1894,15 @@ index 77df0d0..b69b534 100644
  
      // bbport: the game frame is blitted (letterboxed) straight into the swapchain image.
      const vk::Image swapchain_image = swapchain.Image();
-@@ -646,7 +724,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+@@ -618,6 +702,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+         });
+     }
+ 
++    Breadcrumbs::Begin(cmdbuf, Breadcrumbs::Present);
+     {
+         const vk::Extent2D extent = swapchain.GetExtent();
+         SetExpectedGameSize(s32(extent.width), s32(extent.height));
+@@ -646,7 +731,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                  .newLayout = vk::ImageLayout::eTransferSrcOptimal,
                  .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                  .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -1345,7 +1911,7 @@ index 77df0d0..b69b534 100644
                  .subresourceRange = color_range,
              },
          };
-@@ -661,7 +739,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+@@ -661,7 +746,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
          };
          cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
                                 vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
@@ -1354,7 +1920,7 @@ index 77df0d0..b69b534 100644
                           vk::ImageLayout::eTransferDstOptimal,
                           MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
                           vk::Filter::eLinear);
-@@ -688,7 +766,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+@@ -688,7 +773,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                  .newLayout = vk::ImageLayout::eGeneral,
                  .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                  .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -1363,7 +1929,7 @@ index 77df0d0..b69b534 100644
                  .subresourceRange = color_range,
              },
          };
-@@ -696,7 +774,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+@@ -696,7 +781,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                                 vk::PipelineStageFlagBits::eAllCommands,
                                 vk::DependencyFlagBits::eByRegion, {}, {}, post_barriers);
          if (overlay) {
@@ -1372,7 +1938,15 @@ index 77df0d0..b69b534 100644
              const vk::ImageMemoryBarrier to_present{
                  .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
                  .dstAccessMask = vk::AccessFlagBits::eNone,
-@@ -722,7 +800,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+@@ -712,6 +797,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+                                    vk::DependencyFlagBits::eByRegion, {}, {}, to_present);
+         }
+     }
++    Breadcrumbs::End(cmdbuf, Breadcrumbs::Present);
+     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
+         cmdbuf.endDebugUtilsLabelEXT();
+     }
+@@ -722,7 +808,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
      info.AddWait(swapchain.GetImageAcquiredSemaphore());
      info.AddWait(frame->ready_semaphore, frame->ready_tick);
      info.AddSignal(swapchain.GetPresentReadySemaphore());
@@ -1383,7 +1957,7 @@ index 77df0d0..b69b534 100644
      scheduler.Flush(info);
  
      // Present to swapchain.
-@@ -732,11 +812,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+@@ -732,11 +820,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
              swapchain.Recreate(window.GetWidth(), window.GetHeight());
          }
      }
@@ -1396,6 +1970,16 @@ index 77df0d0..b69b534 100644
  }
  
  Frame* Presenter::GetRenderFrame() {
+@@ -762,6 +846,9 @@ Frame* Presenter::GetRenderFrame() {
+ 
+     // Wait for the presentation to be finished so all frame resources are free
+     while (wait() != vk::Result::eSuccess) {
++        if (result == vk::Result::eErrorDeviceLost) {
++            Breadcrumbs::Report();
++        }
+         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
+                    "Device lost during waiting for a frame");
+         // Retry if the waiting times out
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.h b/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.h
 index 7eaf065..1866655 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_presenter.h
@@ -1442,10 +2026,10 @@ index 7eaf065..1866655 100644
      vk::UniqueCommandPool command_pool;
      std::vector<Frame> present_frames;
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
-index c941f6b..c4a52ca 100644
+index c941f6b..bea0734 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp
-@@ -3,8 +3,11 @@
+@@ -3,8 +3,12 @@
  
  #include <xxhash.h>
  #include <mutex>
@@ -1453,11 +2037,12 @@ index c941f6b..c4a52ca 100644
 +#include <unordered_set>
  #include <set>
  #include "video_core/renderer_vulkan/ui_composition.h"
++#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 +#include "bbport_settings.h"
  #include "bbport_toggles.h"
  #include "video_core/renderer_vulkan/vk_frame_capture.h"
  #include "common/debug.h"
-@@ -20,6 +23,7 @@
+@@ -20,6 +24,7 @@
  #include "video_core/renderer_vulkan/vk_instance.h"
  #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
  #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -1465,7 +2050,24 @@ index c941f6b..c4a52ca 100644
  #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
  #include "bbport_threads.h"
  #include "video_core/renderer_vulkan/vk_runtime.h"
-@@ -273,6 +277,26 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+@@ -65,7 +70,15 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
+     memory->SetRasterizer(this);
+ 
+     GpuProfiler::Init(instance, scheduler);
+-    if (DrawPipeWanted()) {
++    {
++        const char* env = std::getenv("BB_THREADED_RECORDING");
++        const bool forced = env && (env[0] == '0' || env[0] == '1');
++        std::printf("Threaded recording: %s%s\n", instance.ThreadedRecording() ? "on" : "off",
++                    forced ? " (setting)"
++                    : instance.ThreadedRecording() ? " (auto)"
++                                                   : " (auto: AMD RX 6000 and older)");
++    }
++    if (instance.ThreadedRecording() && DrawPipeWanted()) {
+         constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
+         draw_pipe = std::make_unique<DrawPipe>(&RunDrawPacket, this);
+     }
+@@ -273,6 +286,26 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
      if (upscaler->Enabled() && cb_descs[0].first) {
          upscaler->OnColorTarget(cb_descs[0].first);
      }
@@ -1492,7 +2094,169 @@ index c941f6b..c4a52ca 100644
      // bbport: scene color: a full-size RGBA16F target drawn with the scene depth.
      if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth() &&
          cb_descs[0].first && std::popcount(key.mrt_mask) <= 2) {
-@@ -440,6 +464,10 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
+@@ -408,6 +441,161 @@ bool Rasterizer::OnStageA() const {
+ namespace {
+ /// Stage A: cycles waited per drain site (BB_FRAME_STATS), keyed by function name and line.
+ std::unordered_map<const char*, std::unordered_map<u32, u64>> drain_sites;
++
++using Mat4 = std::array<std::array<double, 4>, 4>;
++
++Mat4 Load4(const float* f) {
++    Mat4 m{};
++    for (int i = 0; i < 16; ++i) m[i / 4][i % 4] = f[i];
++    return m;
++}
++
++void Store4(float* f, const Mat4& m) {
++    for (int i = 0; i < 16; ++i) f[i] = float(m[i / 4][i % 4]);
++}
++
++Mat4 Mul4(const Mat4& a, const Mat4& b) {
++    Mat4 r{};
++    for (int i = 0; i < 4; ++i)
++        for (int j = 0; j < 4; ++j)
++            for (int k = 0; k < 4; ++k) r[i][j] += a[i][k] * b[k][j];
++    return r;
++}
++
++bool Inverse4(const Mat4& m, Mat4& out) {
++    std::array<std::array<double, 8>, 4> a{};
++    for (int i = 0; i < 4; ++i) {
++        for (int j = 0; j < 4; ++j) a[i][j] = m[i][j];
++        a[i][4 + i] = 1.0;
++    }
++    for (int c = 0; c < 4; ++c) {
++        int p = c;
++        for (int r = c + 1; r < 4; ++r) {
++            if (std::abs(a[r][c]) > std::abs(a[p][c])) p = r;
++        }
++        if (std::abs(a[p][c]) < 1e-12) return false;
++        std::swap(a[c], a[p]);
++        const double pivot = a[c][c];
++        for (double& x : a[c]) x /= pivot;
++        for (int r = 0; r < 4; ++r) {
++            if (r == c) continue;
++            const double f = a[r][c];
++            for (int j = 0; j < 8; ++j) a[r][j] -= f * a[c][j];
++        }
++    }
++    for (int i = 0; i < 4; ++i)
++        for (int j = 0; j < 4; ++j) out[i][j] = a[i][4 + j];
++    return true;
++}
++
++/// Driveclub: the TAA resolve's motion blur covers the movement since the previous frame, so at
++/// 120 FPS it is a quarter of the game's 30 FPS look. k = the game's frame rate / 30 (measured
++/// between resolves) times dcport.ini motion_blur, so 1 looks like 30 FPS at any rate.
++/// Research only (BB_DC_BLUR_AUTO=1, or BB_DC_BLUR_SCALE=<k> for a fixed k): with the object
++/// transforms stretched the whole picture smears over time, even at k = 0, as if the game read
++/// them back for later frames; off by default (k = 1, nothing written).
++double DcBlurScale() {
++    static const double fixed_k = [] {
++        const char* env = std::getenv("BB_DC_BLUR_SCALE");
++        return env ? std::atof(env) : -1.0;
++    }();
++    static const bool automatic = std::getenv("BB_DC_BLUR_AUTO") != nullptr;
++    if (fixed_k < 0.0 && !automatic) {
++        return 1.0;
++    }
++    // Seconds per game frame, smoothed; a second resolve within 2 ms is the same frame.
++    static auto last = std::chrono::steady_clock::now();
++    static double frame_s = 1.0 / 30.0;
++    const auto now = std::chrono::steady_clock::now();
++    const double dt = std::chrono::duration<double>(now - last).count();
++    if (dt > 0.002) {
++        last = now;
++        if (dt < 0.25) {
++            frame_s += (dt - frame_s) * 0.1;
++        }
++    }
++    return fixed_k >= 0.0 ? fixed_k
++                          : std::clamp((1.0 / 30.0) / frame_s, 1.0, 8.0) *
++                                double(BbSettings::Get().motion_blur.load());
++}
++
++/// The resolve's object transforms, 48 dwords per object (the world, the cars): dwords 0..15 the
++/// object's movement since the previous frame (row vectors, near the identity), 16..31 its
++/// product with a fixed matrix Q (dc_motion.comp reads these rows) and 32..47 the inverse
++/// movement's. The movement is stretched by k and both products rebuilt from Q. An object the
++/// game did not rewrite since the last call keeps what was written then (not stretched twice).
++void DcScaleObjectMotion(float* objects, u32 count, double k) {
++    // Per buffer address: the game cycles through several copies of this buffer.
++    static std::unordered_map<const float*, std::vector<float>> written_by_buffer;
++    auto& written = written_by_buffer[objects];
++    if (written.size() < size_t(count) * 48) {
++        written.assign(size_t(count) * 48, std::nanf(""));
++    }
++    for (u32 o = 0; o < count; ++o) {
++        float* t = objects + o * 48;
++        float* w = written.data() + o * 48;
++        if (std::memcmp(t, w, 48 * 4) == 0) {
++            continue;
++        }
++        const Mat4 move = Load4(t);
++        // A camera cut or a teleport (large movement in one frame) is not stretched.
++        double change = 0.0;
++        for (int i = 0; i < 3; ++i)
++            for (int j = 0; j < 3; ++j) change = std::max(change, std::abs(move[i][j] - (i == j)));
++        if (change > 0.1 || std::abs(move[0][3]) + std::abs(move[1][3]) + std::abs(move[2][3]) > 1e-4 ||
++            std::abs(move[3][3] - 1.0) > 1e-4) {
++            continue;
++        }
++        Mat4 move_inv;
++        if (!Inverse4(move, move_inv)) {
++            continue;
++        }
++        const Mat4 q = Mul4(move_inv, Load4(t + 16));
++        Mat4 stretched{};
++        for (int i = 0; i < 4; ++i)
++            for (int j = 0; j < 4; ++j) {
++                const double id = i == j ? 1.0 : 0.0;
++                stretched[i][j] = id + k * (move[i][j] - id);
++            }
++        Mat4 stretched_inv;
++        if (!Inverse4(stretched, stretched_inv)) {
++            continue;
++        }
++        Store4(t, stretched);
++        Store4(t + 16, Mul4(stretched, q));
++        Store4(t + 32, Mul4(stretched_inv, q));
++        std::memcpy(w, t, 48 * 4);
++    }
++}
++
++/// Research (BB_DC_BLUR_CAMERA=1): the frame constants' camera movement stretched by k instead.
++/// Frame constants 0..15 are that movement (view now -> view before, row vectors), 16..31 its
++/// product with a fixed matrix Q and 48..63 the inverse movement's.
++void DcScaleCameraMotion(float* f0, double k) {
++    static const bool on = std::getenv("BB_DC_BLUR_CAMERA") != nullptr;
++    if (!on || std::abs(k - 1.0) < 0.05) {
++        return;
++    }
++    const Mat4 move = Load4(f0);
++    Mat4 move_inv, q;
++    if (!Inverse4(move, move_inv)) {
++        return;
++    }
++    q = Mul4(move_inv, Load4(f0 + 16));
++    Mat4 stretched{};
++    for (int i = 0; i < 4; ++i)
++        for (int j = 0; j < 4; ++j) {
++            const double id = i == j ? 1.0 : 0.0;
++            stretched[i][j] = id + k * (move[i][j] - id);
++        }
++    Mat4 stretched_inv;
++    if (!Inverse4(stretched, stretched_inv)) {
++        return;
++    }
++    Store4(f0, stretched);
++    Store4(f0 + 16, Mul4(stretched, q));
++    Store4(f0 + 48, Mul4(stretched_inv, q));
++}
+ } // namespace
+ 
+ void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
+@@ -440,6 +628,10 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
      return tid == liverpool->GetGpuCommandProcessorThreadId();
  }
  
@@ -1503,7 +2267,7 @@ index c941f6b..c4a52ca 100644
  void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
      if (!draw_pipe || !size) {
          return;
-@@ -960,6 +988,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
+@@ -960,6 +1152,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
      // target is that frame.
      if (camera_motion->Enabled() && regs.color_buffers[0] &&
          FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
@@ -1513,7 +2277,7 @@ index c941f6b..c4a52ca 100644
          scene_started = false;
          camera_motion->OnDisplayPass(cb_descs[0].first);
          if (upscaler->OnFrameStart()) {
-@@ -1108,7 +1139,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
+@@ -1108,7 +1303,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
      // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
      // full-screen quad leaves an edge column unwritten).
      draw_jitter = {};
@@ -1524,7 +2288,7 @@ index c941f6b..c4a52ca 100644
          (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
          draw_jitter = upscaler->Jitter();
      }
-@@ -1240,7 +1273,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
+@@ -1240,7 +1437,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
      push_data.yoffset *= target_scale[1];
      pipeline->BindResources(set_writes, push_data);
      draw_jitter = {};
@@ -1535,7 +2299,7 @@ index c941f6b..c4a52ca 100644
          draw_jitter = upscaler->Jitter();
      }
      UpdateDynamicState(pipeline, is_indexed);
-@@ -1315,6 +1350,114 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
+@@ -1315,6 +1514,153 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
      if (upscaler->Enabled()) {
          upscaler->OnDispatch(cs.pgm_hash);
      }
@@ -1547,7 +2311,21 @@ index c941f6b..c4a52ca 100644
 +        cs.buffers.size() >= 2) {
 +        static std::unordered_map<u64, int> dumps;
 +        const int dumped = dumps[cs.pgm_hash]++;
-+        if (dumped < 3) {
++        // BB_DC_TAA_DUMP=<n>: every n-th resolve in full (all constant buffers), else the first 3.
++        static const int every = std::atoi(std::getenv("BB_DC_TAA_DUMP"));
++        if (every > 0 && dumped % every == 0) {
++            std::string line = fmt::format("DC TAA FULL {:08x} #{}", cs.pgm_hash, dumped);
++            for (size_t bi = 0; bi < cs.buffers.size(); ++bi) {
++                const auto sharp = cs.buffers[bi].GetSharp(cs);
++                if (!sharp.base_address || sharp.GetSize() > 1024) {
++                    continue;
++                }
++                const auto* f = reinterpret_cast<const float*>(sharp.base_address);
++                line += fmt::format(" | b{}:", bi);
++                for (u32 i = 0; i < sharp.GetSize() / 4; ++i) line += fmt::format(" {:.6g}", f[i]);
++            }
++            std::printf("%s\n", line.c_str());
++        } else if (every <= 0 && dumped < 3) {
 +            const auto b0 = cs.buffers[0].GetSharp(cs);
 +            const auto b1 = cs.buffers[1].GetSharp(cs);
 +            const auto* f0 = reinterpret_cast<const float*>(b0.base_address);
@@ -1561,8 +2339,7 @@ index c941f6b..c4a52ca 100644
 +            std::printf("%s\n", line.c_str());
 +        }
 +    }
-+    // Driveclub: motion blur off in the TAA resolve itself (its strength, frame constant 96, is
-+    // 0 in scenes without blur), so the resolve and the upscaler keep running.
++    // Driveclub: camera motion blur scaled to the frame rate (DcScaleCameraMotion).
 +    // BB_DC_TAA_ZERO=<i>,<j>...: frame constants zeroed as well (finding others, e.g. DOF).
 +    if (TemporalUpscaler::IsDcTaa(cs.pgm_hash) && !cs.buffers.empty()) {
 +        static const std::vector<int> zero_extra = [] {
@@ -1581,12 +2358,10 @@ index c941f6b..c4a52ca 100644
 +        const auto b0 = cs.buffers[0].GetSharp(cs);
 +        if (b0.base_address && b0.GetSize() >= 104 * 4) {
 +            auto* f0 = reinterpret_cast<float*>(b0.base_address);
-+            if (!BbSettings::Get().motion_blur) {
-+                f0[96] = 0.0f;
-+            }
 +            for (const int i : zero_extra) {
 +                f0[i] = 0.0f;
 +            }
++            DcScaleCameraMotion(f0, DcBlurScale());
 +        }
 +    }
 +    // BB_FG_STATS=1: how often the TAA resolve runs and reaches the upscaler.
@@ -1635,7 +2410,10 @@ index c941f6b..c4a52ca 100644
 +        if (ok) {
 +            auto* frame = reinterpret_cast<float*>(cs.buffers[0].GetSharp(cs).base_address);
 +            inputs.tan_half_fov_y = frame[93];
-+            if (upscaler->RunDriveclub(inputs)) {
++            Breadcrumbs::Begin(scheduler.CommandBuffer(), Breadcrumbs::DcUpscale);
++            const bool upscaled = upscaler->RunDriveclub(inputs);
++            Breadcrumbs::End(scheduler.CommandBuffer(), Breadcrumbs::DcUpscale);
++            if (upscaled) {
 +                frame[98] = 0.0f; // the resolve's history weight: the upscaled scene passes through
 +                BbStats::dc_upscaled_frames.fetch_add(1, std::memory_order_relaxed);
 +                // Each variant of the resolve once in the log, when the upscaler first runs on it.
@@ -1647,9 +2425,130 @@ index c941f6b..c4a52ca 100644
 +            }
 +        }
 +    }
++    // Driveclub: motion blur scaled to the frame rate, after the upscaler took its motion from
++    // the same transforms (its copy is already recorded).
++    if (TemporalUpscaler::IsDcTaa(cs.pgm_hash) && cs.buffers.size() >= 3) {
++        const auto b0 = cs.buffers[0].GetSharp(cs);
++        const auto b2 = cs.buffers[2].GetSharp(cs);
++        const double k = DcBlurScale();
++        static const bool blur_debug = std::getenv("BB_DC_BLUR_DEBUG") != nullptr;
++        static int blur_calls = 0;
++        if (blur_debug && b0.base_address && b2.base_address && blur_calls++ % 60 == 0) {
++            const auto* f = reinterpret_cast<const float*>(b0.base_address);
++            const auto* o = reinterpret_cast<const float*>(b2.base_address);
++            std::string line = fmt::format("DC BLUR k={:.3f} size={} | f0 32..47:", k, b2.GetSize());
++            for (int i = 32; i < 48; ++i) line += fmt::format(" {:.6g}", f[i]);
++            for (int obj = 0; obj < 3; ++obj) {
++                line += fmt::format(" | obj{} 0..47:", obj);
++                for (int i = 0; i < 48; ++i) line += fmt::format(" {:.6g}", o[obj * 48 + i]);
++            }
++            std::printf("%s\n", line.c_str());
++        }
++        if (b0.base_address && b0.GetSize() >= 104 * 4 && b2.base_address &&
++            std::abs(k - 1.0) >= 0.05) {
++            DcScaleObjectMotion(reinterpret_cast<float*>(b2.base_address),
++                                u32(b2.GetSize() / (48 * 4)), k);
++        }
++    }
      if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
          return;
      }
+@@ -1336,6 +1682,34 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
+     if (FrameCapture::Active()) {
+         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
+     }
++    // DCport: BB_DC_RES_SCAN=1 lists each compute shader once per dispatch size with the area
++    // it covers (groups x threads), to find work sized for 1080p in a session rendering above.
++    static const bool res_scan = std::getenv("BB_DC_RES_SCAN") != nullptr;
++    if (res_scan) {
++        static std::mutex scan_mutex;
++        static std::unordered_set<u64> seen;
++        const u32 tx = cs_program.num_thread_x.full, ty = cs_program.num_thread_y.full;
++        const u64 key = cs.pgm_hash ^ (u64(dim_x) << 40) ^ (u64(dim_y) << 52);
++        std::scoped_lock lock{scan_mutex};
++        if (seen.insert(key).second) {
++            std::string images;
++            for (u32 i = 0; i < image_bindings.size(); ++i) {
++                const auto& [image_id, desc] = image_bindings[i];
++                if (!image_id) {
++                    continue;
++                }
++                const auto& image = texture_cache.GetImage(image_id);
++                images += fmt::format(" {}{}x{}",
++                                      desc->type == VideoCore::TextureCache::BindingType::Storage
++                                          ? "w:" : "r:",
++                                      image.info.size.width, image.info.size.height);
++            }
++            std::printf("Res scan: dispatch %016llx groups %ux%ux%u threads %ux%u covers %ux%u "
++                        "images%s\n",
++                        (unsigned long long)cs.pgm_hash, dim_x, dim_y, dim_z, tx, ty, dim_x * tx,
++                        dim_y * ty, images.c_str());
++        }
++    }
+     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+         cmdbuf.dispatch(dim_x, dim_y, dim_z);
+@@ -2388,6 +2762,24 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
+             bound_images.emplace_back(image_id);
+ 
+             auto& image = texture_cache.GetImage(image_id);
++            // DCport: BB_DC_RES_SCAN=1 lists shaders loading texels (integer coordinates) of a
++            // 1920x1080 image: unscaled ones read only its top-left in a session above 1080p.
++            static const bool res_scan = std::getenv("BB_DC_RES_SCAN") != nullptr;
++            if (res_scan && !is_storage && binding_index < stage.images.size() &&
++                stage.images[binding_index].needs_native && image.info.size.width == 1920 &&
++                image.info.size.height == 1080) {
++                static std::mutex scan_mutex;
++                static std::unordered_set<u64> seen;
++                std::scoped_lock lock{scan_mutex};
++                if (seen.insert(stage.pgm_hash * 64 + binding_index).second) {
++                    std::printf("Res scan: texel load of 1920x1080 image %#llx (%s) by stage %d "
++                                "shader %016llx binding %u\n",
++                                (unsigned long long)image.info.guest_address,
++                                vk::to_string(image.info.pixel_format).c_str(),
++                                int(stage.hw_stage), (unsigned long long)stage.pgm_hash,
++                                binding_index);
++                }
++            }
+             auto& image_view = texture_cache.FindTexture(
+                 image_id, desc, memo_entry ? &memo_entry->view_memo : nullptr, !on_helper);
+             const auto binding = image.binding;
+@@ -2971,6 +3363,35 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
+         state.num_layers = 1;
+     }
+ 
++    // DCport: BB_DC_RES_SCAN=1 lists passes on targets wider than 1920 whose viewport or
++    // scissor covers less than the target (once per target, viewport and scissor).
++    static const bool res_scan = std::getenv("BB_DC_RES_SCAN") != nullptr;
++    if (res_scan && state.width > 1920 && target_scale[0] == 1.0f) {
++        const auto& vp = regs.viewports[0];
++        const u32 vw = u32(std::lround(std::abs(vp.xscale) * 2.0f));
++        const u32 vh = u32(std::lround(std::abs(vp.yscale) * 2.0f));
++        const u32 sw = regs.screen_scissor.bottom_right_x, sh = regs.screen_scissor.bottom_right_y;
++        const u32 gw = regs.generic_scissor.bottom_right_x, gh = regs.generic_scissor.bottom_right_y;
++        if (vw < state.width || vh < state.height || sw < state.width || gw < state.width) {
++            static std::mutex scan_mutex;
++            static std::unordered_set<u64> seen;
++            const VideoCore::ImageId cb0 = cb_descs[0].first;
++            const u64 address = cb0 ? texture_cache.GetImage(cb0).info.guest_address : 0;
++            const u64 key = address ^ (u64(vw) << 32) ^ (u64(vh) << 44) ^ (u64(sw) << 20) ^
++                            (u64(gw) << 8) ^ state.width;
++            std::scoped_lock lock{scan_mutex};
++            if (seen.insert(key).second) {
++                std::printf("Res scan: pass target %ux%u color0 %#llx (%u targets, depth %d) "
++                            "viewport %ux%u at %.0f,%.0f screen scissor %ux%u generic %ux%u "
++                            "clip %s\n",
++                            state.width, state.height, (unsigned long long)address,
++                            state.num_color_attachments, int(bool(db_desc.first)), vw, vh,
++                            vp.xoffset - std::abs(vp.xscale), vp.yoffset - std::abs(vp.yscale),
++                            sw, sh, gw, gh, regs.IsClipDisabled() ? "off" : "on");
++            }
++        }
++    }
++
+     if (reduced) {
+         // Half-resolution passes keep the scene's factor (proxy / native = scene / 1920).
+         const auto size = scene_targets->Size();
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.h b/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.h
 index b1ff8b9..ac1f992 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.h
@@ -1712,8 +2611,177 @@ index df4887d..34e428d 100644
      }
  }
  
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.cpp
+index c72df59..ca738d9 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -20,6 +20,7 @@
+ #include "imgui/renderer/texture_manager.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
+ #include "bbport_threads.h"
+ 
+ namespace Vulkan {
+@@ -38,6 +39,8 @@ Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
+ #if TRACY_GPU_ENABLED
+     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
+ #endif
++    static std::atomic<u32> schedulers{0};
++    marker_index = std::min(schedulers.fetch_add(1), 3u);
+     AllocateWorkerCommandBuffers();
+     priority_pending_ops_thread =
+         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
+@@ -383,6 +386,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
+ 
+     current_cmdbuf = command_pool.Commit();
+     Check(current_cmdbuf.begin(begin_info));
++    Breadcrumbs::Begin(current_cmdbuf, Breadcrumbs::Submit0 + marker_index);
+ 
+     // Invalidate dynamic state so it gets applied to the new command buffer.
+     dynamic_state.Invalidate();
+@@ -421,6 +425,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
+     SyncRecording();
+     // Guest memory copies into staging read by this submission (copy threads).
+     WaitHostCopies();
++    Breadcrumbs::End(current_cmdbuf, Breadcrumbs::Submit0 + marker_index);
+     Check(current_cmdbuf.end());
+ 
+     const vk::Semaphore timeline = work_semaphore.Handle();
+@@ -451,6 +456,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
+ 
+     ImGui::Core::TextureManager::Submit();
+     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
++    if (submit_result == vk::Result::eErrorDeviceLost) {
++        Breadcrumbs::Report();
++    }
+     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+ 
+     work_semaphore.Refresh();
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.h b/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.h
+index 9fc90ce..abe8708 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.h
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.h
+@@ -881,6 +881,7 @@ public:
+     static std::mutex submit_mutex;
+ 
+ private:
++    u32 marker_index = 0; ///< bbport: GPU breadcrumbs site (Breadcrumbs::Submit0 + index)
+     void AllocateWorkerCommandBuffers();
+ 
+     std::unique_ptr<RecordChunk> AcquireChunk();
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 089c503..05df9ea 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -107,6 +107,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
+ }
+ 
+ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool deferred) {
++    std::scoped_lock lk{large_mutex};
+     auto& cache = large_caches[u32(type)];
+     const u64 max_size = std::max(size + size / 4, RoundAllocationSize(size));
+ 
+@@ -150,6 +151,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
+ }
+ 
+ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
++    std::scoped_lock lk{large_mutex};
+     auto& cache = large_caches[u32(ref.type)];
+     const auto it = std::ranges::find_if(
+         cache, [&](const LargeBuffer& entry) { return entry.buffer.get() == ref.buffer; });
+@@ -164,8 +166,11 @@ void StagingBufferPool::TickFrame() {
+     for (Ring& ring : rings) {
+         TrimRing(ring);
+     }
+-    for (auto& cache : large_caches) {
+-        TrimLarge(cache);
++    {
++        std::scoped_lock lk{large_mutex};
++        for (auto& cache : large_caches) {
++            TrimLarge(cache);
++        }
+     }
+     PublishStats();
+ }
+@@ -210,6 +215,7 @@ void StagingBufferPool::PublishStats() const {
+         for (const Block& block : rings[i].blocks) {
+             bytes += block.buffer->SizeBytes();
+         }
++        std::scoped_lock lk{large_mutex};
+         for (const LargeBuffer& entry : large_caches[i]) {
+             bytes += entry.buffer->SizeBytes();
+         }
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index 1ca0873..01761ae 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -5,6 +5,7 @@
+ 
+ #include <array>
+ #include <memory>
++#include <mutex>
+ #include <vector>
+ 
+ #include "common/types.h"
+@@ -78,6 +79,10 @@ private:
+ 
+     void PublishStats() const;
+ 
++    // bbport: FreeDeferred runs on the scheduler's priority pending-ops thread (downloads written
++    // back once the GPU is done) while the GPU thread requests and trims; guards large_caches.
++    mutable std::mutex large_mutex;
++
+     const Instance& instance;
+     Scheduler& scheduler;
+ 
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_swapchain.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_swapchain.cpp
+index f2d6bba..a1bca2f 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_swapchain.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_swapchain.cpp
+@@ -8,6 +8,7 @@
+ #include "core/emulator_settings.h"
+ #include "imgui/renderer/imgui_core.h"
+ #include "sdl_window.h"
++#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_swapchain.h"
+ 
+@@ -118,6 +119,10 @@ bool Swapchain::AcquireNextImage() {
+         needs_recreation = true;
+         break;
+     default:
++        // DCport: a device loss can show here first (no submit noticed it yet).
++        if (result == vk::Result::eErrorDeviceLost) {
++            Breadcrumbs::Report();
++        }
+         LOG_CRITICAL(Render_Vulkan, "Swapchain acquire returned unknown result {}",
+                      vk::to_string(result));
+         UNREACHABLE();
+@@ -144,7 +149,7 @@ bool Swapchain::Present() {
+                    vk::to_string(result));
+     }
+ 
+-    frame_index = (frame_index + 1) % image_count;
++    frame_index = (frame_index + 1) % static_cast<u32>(image_acquired.size());
+ 
+     return !needs_recreation;
+ }
+@@ -283,7 +288,11 @@ void Swapchain::Destroy() {
+ 
+ void Swapchain::RefreshSemaphores() {
+     const vk::Device device = instance.GetDevice();
+-    image_acquired.resize(image_count);
++    // bbport: frame generation presents twice per frame while as many frames as there are
++    // images can be in flight, so up to twice that many acquires wait at once. A ring of
++    // image_count reused a semaphore a submission still waited on (device lost on RX 6000).
++    image_acquired.resize(image_count * 2 + 2);
++    frame_index = 0;
+     present_ready.resize(image_count);
+ 
+     for (vk::Semaphore& semaphore : image_acquired) {
 diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp
-index 3cf4558..61ba5bb 100644
+index 3cf4558..7ba02a8 100644
 --- a/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp
 +++ b/gpu/shadps4/video_core/renderer_vulkan/vk_temporal_upscaler.cpp
 @@ -6,6 +6,7 @@
@@ -1747,7 +2815,7 @@ index 3cf4558..61ba5bb 100644
      if (const char* hash = std::getenv("BB_UPSCALE_BEFORE_CS")) {
          trigger_hash = std::strtoull(hash, nullptr, 16);
      }
-@@ -291,7 +301,8 @@ bool TemporalUpscaler::OnFrameStart() {
+@@ -291,12 +301,16 @@ bool TemporalUpscaler::OnFrameStart() {
      const auto& settings = BbSettings::Get();
      // The guest's startup resolution patch remains in effect until restart. Keep the FSR
      // model at the applied preset while the menu saves the requested one for run.sh.
@@ -1757,7 +2825,16 @@ index 3cf4558..61ba5bb 100644
      if (applied_preset != preset || settings.upscaler == BbSettings::UpscalerOff) failed = false;
      const bool active = Active();
      const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(1u << 25);
-@@ -311,7 +322,11 @@ bool TemporalUpscaler::OnFrameStart() {
+     const int upscaler = settings.upscaler.load();
+-    const int output = settings.output_res.load();
++    // Driveclub: the scene stays 1920x1080 (the window's FSR 1 pass scales the finished frame
++    // to the screen); Bloodborne's live output resolution resized the game's targets mid-race
++    // and lost the device.
++    const int output = dc_mode ? BbSettings::OutputDefault : settings.output_res.load();
+     // Ultrawide outputs apply after a restart (startup patch), not live.
+     const bool output_changed = !scaled_session && applied_output != output &&
+                                 !BbSettings::Ultrawide(output);
+@@ -311,7 +325,11 @@ bool TemporalUpscaler::OnFrameStart() {
                           jitter_on != last_jitter || applied_upscaler != upscaler;
      if (applied_upscaler != upscaler) {
          // A failed provider keeps a fatal flag internally; a user retry gets a fresh context.
@@ -1770,7 +2847,7 @@ index 3cf4558..61ba5bb 100644
          fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
          if (BbSettings::IsFsr4(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
      }
-@@ -342,6 +357,12 @@ bool TemporalUpscaler::OnFrameStart() {
+@@ -342,6 +360,12 @@ bool TemporalUpscaler::OnFrameStart() {
      done_this_frame = false;
      ldr_target = {};
      scene_color = {};
@@ -1783,7 +2860,7 @@ index 3cf4558..61ba5bb 100644
      snapshot_taken = false;
      opaque_valid = false;
      mask_ready = false;
-@@ -360,6 +381,9 @@ bool TemporalUpscaler::OnFrameStart() {
+@@ -360,6 +384,9 @@ bool TemporalUpscaler::OnFrameStart() {
  }
  
  void TemporalUpscaler::OnDispatch(u64 cs_hash) {
@@ -1793,7 +2870,7 @@ index 3cf4558..61ba5bb 100644
      if (cs_hash != trigger_hash || done_this_frame || failed || Scaled()) {
          return;
      }
-@@ -413,9 +437,12 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
+@@ -413,9 +440,12 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
      FfxVkPortableUpscaleCreateInfo create_info{};
      create_info.structSize = sizeof(create_info);
      // Native AA runs on the HDR scene color; scaled presets on the game's tonemapped frame.
@@ -1809,7 +2886,7 @@ index 3cf4558..61ba5bb 100644
      create_info.maxRenderSize = {w, h};
      create_info.maxOutputSize = {ow, oh};
      // FSR 4 has its own model context (vk_fsr4); the images below are shared.
-@@ -444,7 +471,9 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
+@@ -444,7 +474,9 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
          .arrayLayers = 1,
          .samples = vk::SampleCountFlagBits::e1,
          .tiling = vk::ImageTiling::eOptimal,
@@ -1820,7 +2897,7 @@ index 3cf4558..61ba5bb 100644
          .initialLayout = vk::ImageLayout::eUndefined,
      });
      output_image = VideoCore::UniqueImage(device, allocator);
-@@ -472,6 +501,27 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
+@@ -472,6 +504,27 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
          .format = vk::Format::eR16G16Sfloat,
          .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
      }));
@@ -1848,7 +2925,7 @@ index 3cf4558..61ba5bb 100644
      const auto make_image = [&](VideoCore::UniqueImage& image, vk::UniqueImageView& view,
                                  vk::Format format, vk::ImageUsageFlags usage, u32 iw = 0,
                                  u32 ih = 0, vk::ImageAspectFlags aspect =
-@@ -1987,9 +2037,9 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image
+@@ -1987,9 +2040,9 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image
          .preset = applied_preset,
          .jitter = {sign * jitter[0], sign * jitter[1]},
          .frame_ms = frame_ms,
@@ -1861,7 +2938,7 @@ index 3cf4558..61ba5bb 100644
          .sharpness = std::min(settings.sharpness.load(), 1.0f),
          .sharpen = settings.sharpen,
          .reset = reset,
-@@ -2063,4 +2113,462 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
+@@ -2063,4 +2116,463 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
      return ok;
  }
  
@@ -1887,7 +2964,8 @@ index 3cf4558..61ba5bb 100644
 +void TemporalUpscaler::OnDcDisplayDraw(VideoCore::ImageId display) {
 +    ++display_draws;
 +    // Only frames with a scene still waiting for the flip, and only while generating frames.
-+    if (!dc_mode || !fg_ready || !display || !BbSettings::Get().frame_gen) {
++    if (!dc_mode || !fg_ready || !display || !BbSettings::Get().frame_gen ||
++        BbSettings::Get().frame_gen_image_only) {
 +        return;
 +    }
 +    if (++fg_display_draws != 2) {
@@ -2722,7 +3800,7 @@ index 494d151..85c8231 100644
      g_window_thread = std::thread([title, width, height] {
          Common::SetCurrentThreadName("bb:window");
 diff --git a/gpu/shim/bbport_overlay.cpp b/gpu/shim/bbport_overlay.cpp
-index c6f7c9a..0323c0c 100644
+index c6f7c9a..f102515 100644
 --- a/gpu/shim/bbport_overlay.cpp
 +++ b/gpu/shim/bbport_overlay.cpp
 @@ -7,10 +7,12 @@
@@ -2761,29 +3839,67 @@ index c6f7c9a..0323c0c 100644
                        ImGuiWindowFlags_NoCollapse)) {
          ImGui::End();
          return;
-@@ -176,6 +185,12 @@ void Menu() {
+@@ -176,13 +185,27 @@ void Menu() {
      ImGui::Text("%.0f FPS  (%.1f ms)", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
                  frame_ms_avg);
  
+-    ImGui::SeparatorText("Temporal upscaling");
 +    // DCport without FSR (BB_UPSCALER=none): no upscaler, preset or output resolution options.
 +    static const bool no_upscaler = [] {
 +        const char* env = std::getenv("BB_UPSCALER");
 +        return env && std::strcmp(env, "none") == 0;
 +    }();
++    // DCport: the scene stays 1920x1080 (FSR as anti-aliasing; the window's FSR 1 pass scales
++    // the finished frame to the screen): no preset, output or live resolution options.
++    static const bool dc_menu = [] {
++        const char* env = std::getenv("BB_DC_UPSCALE");
++        return env && env[0] == '1';
++    }();
 +    if (!no_upscaler) {
-     ImGui::SeparatorText("Temporal upscaling");
++    ImGui::SeparatorText(dc_menu ? "Anti-aliasing (FSR)" : "Temporal upscaling");
      static const char* upscalers[] = {"Off", "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
                                       "TAA (native anti-aliasing)", "DLSS (NVIDIA RTX)"};
-@@ -217,7 +232,7 @@ void Menu() {
+-    static const char* later[] = {"XeSS"};
+     int upscaler = s.upscaler;
+-    if (ImGui::BeginCombo("Upscaler", upscalers[upscaler])) {
++    if (ImGui::BeginCombo(dc_menu ? "Anti-aliasing" : "Upscaler", upscalers[upscaler])) {
+         for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
++            if (i == BbSettings::UpscalerDlss) {
++                continue; // DCport: Driveclub's upscaler path has no DLSS
++            }
+             const bool supported = i == BbSettings::UpscalerFsr4 ? s.fsr4_supported.load()
+                 : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
+                 : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load() : true;
+@@ -196,15 +219,11 @@ void Menu() {
+                 ImGui::TextDisabled("- unsupported by this GPU");
+             }
+         }
+-        for (const char* name : later) {
+-            ImGui::BeginDisabled();
+-            ImGui::Selectable(name, false);
+-            ImGui::EndDisabled();
+-            ImGui::SameLine();
+-            ImGui::TextDisabled("- in development");
+-        }
+         ImGui::EndCombo();
+     }
++    if (dc_menu) {
++        ImGui::TextDisabled("FSR works as the game's anti-aliasing at 1080p, not as an upscaler.");
++    }
+     if (const char* problem = s.dlss_problem.load(); problem && upscaler == BbSettings::UpscalerDlss) {
+         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "DLSS: %s", problem);
+     }
+@@ -217,17 +236,22 @@ void Menu() {
      }
      if (BbSettings::IsFsr4(s.upscaler)) {
          if (s.upscaler == BbSettings::UpscalerFsr411) {
 -            Hint("FSR 4.1.1 INT8: AMD 4.1.1 DLL model reproduced in Vulkan. One model covers Native through Performance, with another for Ultra Performance. Assets: tools/fsr4cap/build_assets.sh (requires the DLL and Proton).");
 +            Hint("FSR 4.1.1 INT8: AMD 4.1.1 DLL model reproduced in Vulkan. One model covers Native through Performance, with another for Ultra Performance. Set it up once in the launcher (SETUP, Set up FSR 4.1.1) from your own amd_fidelityfx_upscaler_dx12.dll.");
          } else {
-             Hint("FSR 4 INT8 uses the v07 model from the AMD FidelityFX SDK. Higher quality than FSR 3.1, with more GPU work. Changing presets rebuilds the model and may pause briefly. Assets: tools/fetch_fsr4_assets.sh.");
+-            Hint("FSR 4 INT8 uses the v07 model from the AMD FidelityFX SDK. Higher quality than FSR 3.1, with more GPU work. Changing presets rebuilds the model and may pause briefly. Assets: tools/fetch_fsr4_assets.sh.");
++            Hint("FSR 4 INT8 uses the v07 model from the AMD FidelityFX SDK. Higher quality than FSR 3.1, with more GPU work. Its files come with the FSR edition (fsr4_shaders folder).");
          }
-@@ -225,6 +240,10 @@ void Menu() {
+         Checkbox("FSR 4: auto exposure", s.fsr4_auto_exposure);
          Checkbox("FSR 4: invert jitter", s.fsr4_invert_jitter);
          Hint("Ghosting diagnostics: FSR 4 uses exposure to normalize color and decide when to discard history. These options apply immediately.");
      }
@@ -2794,17 +3910,49 @@ index c6f7c9a..0323c0c 100644
      const bool upscaler_on = s.upscaler != BbSettings::UpscalerOff;
      const bool taa = s.upscaler == BbSettings::UpscalerTaa;
      ImGui::BeginDisabled(!upscaler_on);
-@@ -334,6 +353,9 @@ void Menu() {
++    if (!dc_menu) {
+     ImGui::BeginDisabled(taa);
+     int preset = taa ? BbSettings::NativeAA : s.preset.load();
+     char preset_label[64];
+@@ -265,6 +289,7 @@ void Menu() {
+     } else {
+         Hint("Native AA uses the upscaler for anti-aliasing. Other presets reduce scene resolution relative to the output. The HUD is drawn at output resolution. Preset changes apply on the next frame in a live session.");
+     }
++    } // !dc_menu
+     Checkbox("Sharpening (RCAS)", s.sharpen);
+     ImGui::BeginDisabled(!s.sharpen);
+     Slider("Sharpness", s.sharpness, 0.0f, 2.0f);
+@@ -287,8 +312,10 @@ void Menu() {
+     }
+     ImGui::EndDisabled();
+     ImGui::EndDisabled();
++    if (!dc_menu) {  // DCport: off in Driveclub mode (the game's TAA data gives the motion)
+     Checkbox("Object motion vectors", s.object_motion);
+     Hint("Accurate vectors for animated objects reduce breakup on clothing and weapons during movement. Static geometry receives no extra pass. Changes require a restart.");
++    }
+     bool show_motion = s.debug_view == BbSettings::DebugMotion;
+     if (ImGui::Checkbox("Show motion vectors (debug)", &show_motion)) {
+         s.debug_view = show_motion ? BbSettings::DebugMotion : BbSettings::DebugNone;
+@@ -296,6 +323,7 @@ void Menu() {
+     Hint("Red/green: horizontal/vertical motion (8 pixels = full brightness). Blue: the pixel has accurate object motion, beyond camera motion. A moving object with no blue or red/green is treated as stationary and may leave trails.");
+     ImGui::EndDisabled(); // upscaler off
+ 
++    if (!dc_menu) {
+     ImGui::SeparatorText("Output resolution");
+     static const char* outputs[] = {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160",
+                                     "2560 x 1080 (21:9)", "3440 x 1440 (21:9)",
+@@ -334,6 +362,10 @@ void Menu() {
          ImGui::EndCombo();
      }
      Hint("On: output and presets change without restarting, while game post-processing stays at 1080p. Off: the scene is patched to the preset resolution at startup. Auto enables the live path on capable discrete GPUs. Changes apply after restarting the game.");
++    } // !dc_menu
 +    // Driveclub: the effects, cheats and model detail below are Bloodborne 1.09 patches.
 +    static const bool bloodborne_menu = std::getenv("BB_BLOODBORNE_MENU") != nullptr;
 +    if (bloodborne_menu) {
      ImGui::SeparatorText("Game effects (restart required)");
      static const char* lods[] = {"Highest (-2)", "Original", "Lower (1)", "Lowest (2)"};
      static constexpr int lod_values[] = {-2, 0, 1, 2};
-@@ -354,6 +376,7 @@ void Menu() {
+@@ -354,6 +386,7 @@ void Menu() {
      }
      Hint("Effects are applied through game patches at startup (patches/Bloodborne.xml). Motion blur and dynamic shadows can increase GPU load.");
      Hint("Free camera: hold Cross and press L3 (keyboard: Space + Z). Debug menu: left touchpad / Tab. Requires DbgFont14h.ccm and DbgFont14h.tpf in dvdroot_ps4/font from the debug-font mod. Right touchpad: Backspace.");
@@ -2812,26 +3960,15 @@ index c6f7c9a..0323c0c 100644
  
      bool restart = s.object_motion != s.startup_object_motion ||
                     s.model_lod != s.startup_model_lod ||
-@@ -371,8 +394,18 @@ void Menu() {
+@@ -371,6 +404,7 @@ void Menu() {
          }
      }
  
-+    if (std::getenv("BB_DC_UPSCALE") && std::getenv("BB_DC_UPSCALE")[0] == '1') {
-+        ImGui::SeparatorText("Frame generation");
-+        Checkbox("FSR 3 frame generation", s.frame_gen);
-+        ImGui::TextDisabled("A generated frame between each two: twice the frames shown.");
-+        if (s.frame_gen && s.upscaler == BbSettings::UpscalerOff) {
-+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Needs an upscaler (FSR 3.1 or FSR 4)");
-+        }
-+    }
 +    } // !no_upscaler
      ImGui::SeparatorText("Other");
      Checkbox("Show FPS counter", s.show_fps);
-+    Checkbox("Motion blur", s.motion_blur);
  
-     ImGui::Spacing();
-     if (ImGui::Button("Close")) {
-@@ -397,7 +430,7 @@ void Menu() {
+@@ -397,7 +431,7 @@ void Menu() {
          quit_armed = false;
      }
      ImGui::SameLine();
@@ -2840,7 +3977,7 @@ index c6f7c9a..0323c0c 100644
      ImGui::End();
      if (!keep_open) {
          SetOpen(false);
-@@ -440,14 +473,39 @@ void FpsCounter() {
+@@ -440,14 +474,39 @@ void FpsCounter() {
                       ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                       ImGuiWindowFlags_NoFocusOnAppearing);
      const auto& s = BbSettings::Get();
@@ -2888,7 +4025,7 @@ index c6f7c9a..0323c0c 100644
      ImGui::End();
  }
  
-@@ -464,14 +522,54 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count)
+@@ -464,14 +523,54 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count)
      io.IniFilename = nullptr; // window positions are not kept
      io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
      io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
@@ -2945,7 +4082,7 @@ index c6f7c9a..0323c0c 100644
  
      ImFontConfig font_config;
      font_config.FontDataOwnedByAtlas = false;
-@@ -633,7 +731,7 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
+@@ -633,7 +732,7 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
      text_entry_text = text;
  }
  
@@ -2954,7 +4091,7 @@ index c6f7c9a..0323c0c 100644
      // Present interval for the FPS readout (measured also while nothing is drawn).
      const auto now = std::chrono::steady_clock::now();
      const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
-@@ -641,6 +739,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+@@ -641,6 +740,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
      if (ms > 0.0f && ms < 1000.0f) {
          frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
      }
@@ -2988,7 +4125,7 @@ index acc89b0..7f8ede9 100644
  /// The menu is open or a text entry is shown: the game's input is held neutral.
  bool CapturesInput();
 diff --git a/gpu/shim/bbport_settings.cpp b/gpu/shim/bbport_settings.cpp
-index 7743165..cf0a78d 100644
+index 7743165..800d3ed 100644
 --- a/gpu/shim/bbport_settings.cpp
 +++ b/gpu/shim/bbport_settings.cpp
 @@ -14,7 +14,7 @@ namespace {
@@ -3000,18 +4137,57 @@ index 7743165..cf0a78d 100644
  }
  
  float Clamp(float v, float lo, float hi) {
-@@ -52,6 +52,10 @@ void Set(Values& v, const std::string& key, const std::string& value) {
+@@ -52,6 +52,11 @@ void Set(Values& v, const std::string& key, const std::string& value) {
          v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
      } else if (key == "show_fps") {
          v.show_fps = i != 0;
-+    } else if (key == "frame_gen") {
-+        v.frame_gen = i != 0;
++    } else if (key == "frame_gen" || key == "frame_gen_image_only") {
++        // DCport: frame generation is removed (FSR 3.1 interpolation lost the device on
++        // RX 6000); older dcport.ini files keep the keys, which stay off.
 +    } else if (key == "motion_blur") {
-+        v.motion_blur = i != 0;
++        v.motion_blur = Clamp(f, 0.0f, 2.0f); // older files: 1 (on) or 0 (off)
      } else if (key == "fsr4_auto_exposure") {
          v.fsr4_auto_exposure = i != 0;
      } else if (key == "fsr4_invert_jitter") {
-@@ -191,15 +195,15 @@ void Save() {
+@@ -183,23 +188,54 @@ bool ResolutionNeedsRestart() {
+          (v.upscaler == UpscalerTaa) != (v.startup_upscaler == UpscalerTaa));
+ }
+ 
++// Lines of the current file whose keys Save() does not write itself (the launcher's
++// threaded_recording, for one), so a menu save keeps them.
++std::string ForeignLines() {
++    static constexpr const char* own[] = {
++        "upscaler", "preset", "sharpen", "sharpness", "jitter", "reactive", "object_motion",
++        "reactive_scale", "reactive_threshold", "reactive_max", "debug_view", "show_fps",
++        "frame_gen", "frame_gen_image_only", "motion_blur", "fsr4_auto_exposure", "fsr4_invert_jitter", "model_lod",
++        "output_res", "hud_position", "live_resolution"};
++    std::string kept;
++    FILE* file = std::fopen(Path(), "r");
++    if (!file) return kept;
++    char line[512];
++    while (std::fgets(line, sizeof(line), file)) {
++        const std::string_view text(line);
++        const auto eq = text.find('=');
++        if (text.starts_with('#') || eq == std::string_view::npos) continue;
++        const std::string_view key = text.substr(0, eq);
++        bool mine = std::any_of(std::begin(own), std::end(own),
++                                [&](const char* k) { return key == k; });
++        for (int e = 0; e < EffectCount && !mine; ++e) mine = key == Effects[e].key;
++        if (!mine) {
++            kept += line;
++            if (!text.ends_with('\n')) kept += '\n';
++        }
++    }
++    std::fclose(file);
++    return kept;
++}
++
+ void Save() {
+     const auto& v = Get();
++    const std::string kept = ForeignLines();
+     FILE* file = std::fopen(Path(), "w");
+     if (!file) {
+         std::printf("Settings: cannot write %s\n", Path());
          return;
      }
      std::fprintf(file,
@@ -3020,29 +4196,41 @@ index 7743165..cf0a78d 100644
                   "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                   "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
 -                 "debug_view=%d\nshow_fps=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
-+                 "debug_view=%d\nshow_fps=%d\nframe_gen=%d\nmotion_blur=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
++                 "debug_view=%d\nshow_fps=%d\nframe_gen=%d\nframe_gen_image_only=%d\nmotion_blur=%.2f\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
                   UpscalerName(v.upscaler), v.preset.load(), int(v.sharpen.load()),
                   v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),
                   int(v.object_motion.load()),
                   v.reactive_scale.load(), v.reactive_threshold.load(), v.reactive_max.load(),
 -                 v.debug_view.load(), int(v.show_fps.load()),
-+                 v.debug_view.load(), int(v.show_fps.load()), int(v.frame_gen.load()), int(v.motion_blur.load()),
++                 v.debug_view.load(), int(v.show_fps.load()), int(v.frame_gen.load()),
++                 int(v.frame_gen_image_only.load()), double(v.motion_blur.load()),
                   int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()));
      // Read by patches.py at start.
      for (int e = 0; e < EffectCount; ++e) {
+@@ -212,6 +248,7 @@ void Save() {
+     // Read by run.sh at start.
+     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
+                                                   : v.live_resolution ? "1" : "0");
++    std::fputs(kept.c_str(), file);
+     std::fclose(file);
+ }
+ 
 diff --git a/gpu/shim/bbport_settings.h b/gpu/shim/bbport_settings.h
-index 254cfcb..ca9474c 100644
+index 254cfcb..eb05b9f 100644
 --- a/gpu/shim/bbport_settings.h
 +++ b/gpu/shim/bbport_settings.h
-@@ -74,6 +74,11 @@ struct Values {
+@@ -74,6 +74,14 @@ struct Values {
      std::atomic<float> reactive_max{0.9f};
      std::atomic<int> debug_view{DebugNone};
      std::atomic<bool> show_fps{false};
 +    /// Driveclub: FSR 3 frame generation, one generated frame before each real one (needs FSR).
 +    std::atomic<bool> frame_gen{false};
-+    /// Driveclub: the TAA resolve's motion blur (off: its strength constant set to 0, so the
-+    /// resolve, its anti-aliasing and the upscaler keep running).
-+    std::atomic<bool> motion_blur{true};
++    /// Frame generation from the finished pictures only: no depth,
++    /// motion or HUD-less copy from the game (flat depth, zero motion).
++    std::atomic<bool> frame_gen_image_only{false};
++    /// Driveclub research (BB_DC_BLUR_AUTO=1, not in the menu): motion blur strength, 1 = the
++    /// game's 30 FPS look at any frame rate, 0 = none, up to 2 (vk_rasterizer.cpp DcBlurScale).
++    std::atomic<float> motion_blur{1.0f};
      // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
      std::atomic<bool> fsr4_auto_exposure{true};
      std::atomic<bool> fsr4_invert_jitter{false};
@@ -3083,6 +4271,19 @@ index 57a9486..c458a76 100644
  struct WaitTimer {
      std::atomic<std::uint64_t>& total;
      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+diff --git a/gpu/shim/core/user_manager.h b/gpu/shim/core/user_manager.h
+index 2e19d49..d234bb3 100644
+--- a/gpu/shim/core/user_manager.h
++++ b/gpu/shim/core/user_manager.h
+@@ -35,7 +35,7 @@ public:
+             return std::string{value && value[0] ? value : fallback};
+         };
+         user.user_id = RuntimeUserId;
+-        user.user_name = text("BB_USER_NAME", "Hunter");
++        user.user_name = text("BB_USER_NAME", "Player");
+         user.player_index = 1;
+         user.logged_in = true;
+         user.shadnet_npid = text("BB_SHADNET_NPID", "");
 diff --git a/gpu/third_party/fsr-vulkan b/gpu/third_party/fsr-vulkan
 --- a/gpu/third_party/fsr-vulkan
 +++ b/gpu/third_party/fsr-vulkan
@@ -4445,10 +5646,10 @@ index 045f3c0..4da5a08 100644
      if (!strcmp(name,"fMP5NHUOaMk#M#N")) return (uintptr_t)module_loaded;
 diff --git a/src/runtime_dc.c b/src/runtime_dc.c
 new file mode 100644
-index 0000000..4ee4f87
+index 0000000..d3a122d
 --- /dev/null
 +++ b/src/runtime_dc.c
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,384 @@
 +/* Driveclub (CUSA00003): system library functions the Bloodborne runtime never needed.
 + *
 + * Resolved last (after the shadPS4 HLE table), so nothing here shadows an existing
@@ -4479,6 +5680,7 @@ index 0000000..4ee4f87
 +#define POSIX_EINVAL 22
 +#define POSIX_EBUSY 16
 +#define POSIX_EAGAIN 35
++#define POSIX_EPERM 1
 +
 +static int dc_trace = -1;
 +static void trace(const char *what) {
@@ -4583,39 +5785,100 @@ index 0000000..4ee4f87
 +    return 0;
 +}
 +
++/* PS4 (FreeBSD libthr) rwlocks: a thread that already holds a read lock gets another one even
++ * while a writer waits; other new readers queue behind the writer. MinGW's pthread_rwlock makes
++ * every reader wait for a waiting writer, so a recursive read deadlocked against a writer
++ * (Driveclub froze mid-race: the main thread in wrlock, a worker holding the lock in rdlock). */
++typedef struct DcRwlock {
++    pthread_mutex_t m;
++    pthread_cond_t readers_cv, writers_cv;
++    unsigned readers, writers_waiting;
++    int writer;
++} DcRwlock;
++static _Thread_local unsigned read_locks_held; /* libthr's curthread->rdlock_count */
 +static pthread_mutex_t rwlock_init_lock = PTHREAD_MUTEX_INITIALIZER;
 +/* Static initializers leave the guest handle NULL: create the host lock on first use. */
-+static pthread_rwlock_t *rwlock(pthread_rwlock_t **handle) {
++static DcRwlock *rwlock(DcRwlock **handle) {
 +    if (!handle) return NULL;
-+    pthread_rwlock_t *l = __atomic_load_n(handle, __ATOMIC_ACQUIRE);
++    DcRwlock *l = __atomic_load_n(handle, __ATOMIC_ACQUIRE);
 +    if (l) return l;
 +    pthread_mutex_lock(&rwlock_init_lock);
 +    if (!*handle) {
-+        l = malloc(sizeof(*l));
-+        if (l) pthread_rwlock_init(l, NULL);
++        l = calloc(1, sizeof(*l));
++        if (l) {
++            pthread_mutex_init(&l->m, NULL);
++            pthread_cond_init(&l->readers_cv, NULL);
++            pthread_cond_init(&l->writers_cv, NULL);
++        }
 +        __atomic_store_n(handle, l, __ATOMIC_RELEASE);
 +    }
 +    l = *handle;
 +    pthread_mutex_unlock(&rwlock_init_lock);
 +    return l;
 +}
-+static ABI int32_t posix_rwlock_init(pthread_rwlock_t **handle, const void *attr) {
++static ABI int32_t posix_rwlock_init(DcRwlock **handle, const void *attr) {
++    (void)attr;
 +    if (!handle) return POSIX_EINVAL;
 +    *handle = NULL;
 +    return rwlock(handle) ? 0 : POSIX_EINVAL;
 +}
-+static ABI int32_t posix_rwlock_destroy(pthread_rwlock_t **handle) {
++static ABI int32_t posix_rwlock_destroy(DcRwlock **handle) {
 +    if (!handle || !*handle) return 0;
-+    pthread_rwlock_destroy(*handle);
-+    free(*handle);
++    DcRwlock *l = *handle;
++    pthread_cond_destroy(&l->readers_cv);
++    pthread_cond_destroy(&l->writers_cv);
++    pthread_mutex_destroy(&l->m);
++    free(l);
 +    *handle = NULL;
 +    return 0;
 +}
-+static ABI int32_t posix_rwlock_rdlock(pthread_rwlock_t **h) { pthread_rwlock_t *l = rwlock(h); return l ? pthread_rwlock_rdlock(l) : POSIX_EINVAL; }
-+static ABI int32_t posix_rwlock_wrlock(pthread_rwlock_t **h) { pthread_rwlock_t *l = rwlock(h); return l ? pthread_rwlock_wrlock(l) : POSIX_EINVAL; }
-+static ABI int32_t posix_rwlock_tryrdlock(pthread_rwlock_t **h) { pthread_rwlock_t *l = rwlock(h); return l ? (pthread_rwlock_tryrdlock(l) ? POSIX_EBUSY : 0) : POSIX_EINVAL; }
-+static ABI int32_t posix_rwlock_trywrlock(pthread_rwlock_t **h) { pthread_rwlock_t *l = rwlock(h); return l ? (pthread_rwlock_trywrlock(l) ? POSIX_EBUSY : 0) : POSIX_EINVAL; }
-+static ABI int32_t posix_rwlock_unlock(pthread_rwlock_t **h) { pthread_rwlock_t *l = rwlock(h); return l ? pthread_rwlock_unlock(l) : POSIX_EINVAL; }
++static int32_t rw_read(DcRwlock **h, int attempt) {
++    DcRwlock *l = rwlock(h);
++    if (!l) return POSIX_EINVAL;
++    pthread_mutex_lock(&l->m);
++    while (l->writer || (l->writers_waiting && !read_locks_held)) {
++        if (attempt) { pthread_mutex_unlock(&l->m); return POSIX_EBUSY; }
++        pthread_cond_wait(&l->readers_cv, &l->m);
++    }
++    ++l->readers;
++    ++read_locks_held;
++    pthread_mutex_unlock(&l->m);
++    return 0;
++}
++static int32_t rw_write(DcRwlock **h, int attempt) {
++    DcRwlock *l = rwlock(h);
++    if (!l) return POSIX_EINVAL;
++    pthread_mutex_lock(&l->m);
++    if (attempt && (l->writer || l->readers)) { pthread_mutex_unlock(&l->m); return POSIX_EBUSY; }
++    ++l->writers_waiting;
++    while (l->writer || l->readers) pthread_cond_wait(&l->writers_cv, &l->m);
++    --l->writers_waiting;
++    l->writer = 1;
++    pthread_mutex_unlock(&l->m);
++    return 0;
++}
++static ABI int32_t posix_rwlock_rdlock(DcRwlock **h) { return rw_read(h, 0); }
++static ABI int32_t posix_rwlock_wrlock(DcRwlock **h) { return rw_write(h, 0); }
++static ABI int32_t posix_rwlock_tryrdlock(DcRwlock **h) { return rw_read(h, 1); }
++static ABI int32_t posix_rwlock_trywrlock(DcRwlock **h) { return rw_write(h, 1); }
++static ABI int32_t posix_rwlock_unlock(DcRwlock **h) {
++    DcRwlock *l = rwlock(h);
++    if (!l) return POSIX_EINVAL;
++    pthread_mutex_lock(&l->m);
++    if (l->writer) {
++        l->writer = 0;
++    } else if (l->readers) {
++        --l->readers;
++        if (read_locks_held) --read_locks_held;
++    } else {
++        pthread_mutex_unlock(&l->m);
++        return POSIX_EPERM;
++    }
++    if (!l->readers && l->writers_waiting) pthread_cond_signal(&l->writers_cv);
++    pthread_cond_broadcast(&l->readers_cv);
++    pthread_mutex_unlock(&l->m);
++    return 0;
++}
 +
 +/* pthread_detach: scePthreadDetach's contract with a POSIX error number. */
 +static ABI int32_t posix_detach(void *thread) {
@@ -4772,7 +6035,7 @@ index 0000000..4ee4f87
 +    return found;
 +}
 diff --git a/src/runtime_file.c b/src/runtime_file.c
-index c64c0f9..84b2c53 100644
+index c64c0f9..4bff266 100644
 --- a/src/runtime_file.c
 +++ b/src/runtime_file.c
 @@ -105,11 +105,13 @@ void runtime_file_unmount(const char *guest) {
@@ -4790,7 +6053,17 @@ index c64c0f9..84b2c53 100644
      runtime_file_mount("/app0",app0);
      runtime_file_mount("/hostapp",app0);
      const char *writable[]={"temp0","download0","data"};
-@@ -267,6 +269,13 @@ static int game_path(const char *p) {
+@@ -140,7 +142,8 @@ static int translate(const char *guest,char *out,size_t size) {
+     else if ((size_t)snprintf(out,size,"%s%s",m->host,buffer+best)>=size) result=ENAMETOOLONG;
+     pthread_mutex_unlock(&lock);
+     if (!result && strstr(out,"/dvdroot_ps4/")) {
+-        const char *language=getenv("BB_LANGUAGE");
++        const char *language=getenv("DC_LANGUAGE");
++        if (!language || !*language) language=getenv("BB_LANGUAGE");
+         if (language && !strcmp(language,"17")) {
+             /* Some game paths use the Portuguese or English fallback directory. */
+             const char *folders[]={"/msg/porpt/","/menu/porpt/","/msg/engus/","/menu/engus/"};
+@@ -267,6 +270,13 @@ static int game_path(const char *p) {
      return (!strncmp(p,"/app0",5) && (!p[5] || p[5]=='/')) ||
             (!strncmp(p,"/hostapp",8) && (!p[8] || p[8]=='/'));
  }
@@ -4804,7 +6077,7 @@ index c64c0f9..84b2c53 100644
  /* BB_SAVE_TRACE=1: every operation on save files (/savedataN). */
  static int save_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_SAVE_TRACE"); v=e && e[0]=='1'; } return v; }
  /* Saves (/savedataN): see File. The copy starts as the old file unless the open truncates. */
-@@ -383,7 +392,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
+@@ -383,7 +393,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
          if (!(dir=list_directory(path))) return -EACCES;
      } else if (flags&0x20000) {
          e=errno==ENOENT ? ENOENT : ENOTDIR;
@@ -4813,7 +6086,7 @@ index c64c0f9..84b2c53 100644
          return -e;
      } else {
          if (save_path(guest) && (flags&3)) {
-@@ -400,7 +409,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
+@@ -400,7 +410,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
              printf("Save trace: open(%s, flags 0x%x) -> host %d%s%s\n",guest,flags,host,temp ? ", copy " : "",temp ? temp : "");
          if (host<0) {
              e=errno;
@@ -4822,7 +6095,7 @@ index c64c0f9..84b2c53 100644
              return -e;
          }
          if (host_fstat(host,&s)) memset(&s,0,sizeof(s));
-@@ -421,7 +430,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
+@@ -421,7 +431,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
          printf("Save trace: open(%s, flags 0x%x) -> host %d%s%s\n",guest,flags,host,temp ? ", copy " : "",temp ? temp : "");
      if (host<0) {
          e=errno;
@@ -5163,6 +6436,107 @@ index 8e359d6..b202c5b 100644
  "# A shadPS4 input config (user/input_config/CUSA03173.ini) can be copied over this file.\n" \
  "# F7 toggles the mouse, F8 reloads this file.\n" \
  "\n"
+diff --git a/src/runtime_rwlock.c b/src/runtime_rwlock.c
+index 418035f..283cdb7 100644
+--- a/src/runtime_rwlock.c
++++ b/src/runtime_rwlock.c
+@@ -82,6 +82,12 @@ static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time
+         pthread_mutex_unlock(&registry_lock); return error(attempt ? EBUSY : EDEADLK);
+     }
+     if (h && h->readers==UINT_MAX) { pthread_mutex_unlock(&registry_lock); return error(EAGAIN); }
++    /* PS4 (FreeBSD libthr): a thread holding a read lock reads again even while a writer
++       waits. The native lock would queue it behind that writer (deadlock): count it here. */
++    if (!writer && h && h->readers) {
++        ++h->readers; ++reads;
++        pthread_mutex_unlock(&registry_lock); return 0;
++    }
+     if (!h) {
+         h=calloc(1,sizeof(*h));
+         if (!h) { pthread_mutex_unlock(&registry_lock); return error(ENOMEM); }
+@@ -122,7 +128,8 @@ static ABI int32_t rw_unlock(Rwlock **handle) {
+     Holder *h=r->holders;
+     while (h && !pthread_equal(h->thread,pthread_self())) h=h->next;
+     if (!h || (!h->readers && !h->writer)) { pthread_mutex_unlock(&registry_lock); return error(EPERM); }
+-    int e=pthread_rwlock_unlock(&r->native);
++    /* Nested reads (see acquire) hold the native lock once: only the last one releases it. */
++    int e=!h->writer && h->readers>1 ? 0 : pthread_rwlock_unlock(&r->native);
+     if (!e) { if (h->writer) h->writer=0; else --h->readers; ++unlocks; }
+     prune_locked(r,h);
+     pthread_mutex_unlock(&registry_lock); return error(e);
+diff --git a/src/runtime_savedata.c b/src/runtime_savedata.c
+index 9a16a9a..cde9c7d 100644
+--- a/src/runtime_savedata.c
++++ b/src/runtime_savedata.c
+@@ -111,8 +111,28 @@ static int make_dirs(const char *path) {
+     for (char *p=buffer+1;*p;++p) if (*p=='/') { *p=0; mkdir(buffer,0755); *p='/'; }
+     return mkdir(buffer,0755) && errno!=EEXIST ? -1 : 0;
+ }
++/* Driveclub's regional releases (same 01.28 game): saves made with one are used by another
++ * when the game's own folder does not exist yet. */
++static const char *const driveclub_ids[]={"CUSA00003","CUSA00064","CUSA00066","CUSA00093","CUSA00879"};
++static int is_driveclub(const char *id) {
++    for (size_t i=0;i<sizeof(driveclub_ids)/sizeof(*driveclub_ids);++i) if (!strcmp(id,driveclub_ids[i])) return 1;
++    return 0;
++}
++static int is_dir(const char *path) { struct stat st; return !stat(path,&st) && S_ISDIR(st.st_mode); }
+ static void root(int32_t user, const char *title, char *out, size_t size) {
+-    snprintf(out,size,"%s/savedata/%d/%s",runtime_file_user_dir(),user,title && *title ? title : title_id);
++    const char *id=title && *title ? title : title_id;
++    snprintf(out,size,"%s/savedata/%d/%s",runtime_file_user_dir(),user,id);
++    if (!is_driveclub(id) || is_dir(out)) return;
++    char other[700];
++    for (size_t i=0;i<sizeof(driveclub_ids)/sizeof(*driveclub_ids);++i) {
++        snprintf(other,sizeof(other),"%s/savedata/%d/%s",runtime_file_user_dir(),user,driveclub_ids[i]);
++        if (is_dir(other)) {
++            static int told;
++            if (!told++) printf("Runtime: %s has no save folder; using the %s saves\n",id,driveclub_ids[i]);
++            snprintf(out,size,"%s",other);
++            return;
++        }
++    }
+ }
+ static int valid_name(const char *name, size_t max) {
+     size_t n=strnlen(name,max);
+diff --git a/src/runtime_services.c b/src/runtime_services.c
+index e75ed89..6db97ad 100644
+--- a/src/runtime_services.c
++++ b/src/runtime_services.c
+@@ -57,7 +57,7 @@ static ABI int32_t user_list(int32_t *ids) {
+ }
+ static ABI int32_t user_name(int32_t id,char *name,uint64_t size) {
+     if (id!=USER_ID || !name) return USER_INVALID_ARGUMENT;
+-    const char *value=getenv("BB_USER_NAME") ? getenv("BB_USER_NAME") : "Hunter";
++    const char *value=getenv("BB_USER_NAME") ? getenv("BB_USER_NAME") : "Player";
+     if (strlen(value)+1>size) return (int32_t)0x8096000a; /* BUFFER_TOO_SHORT */
+     strcpy(name,value); return 0;
+ }
+@@ -72,7 +72,12 @@ static ABI int32_t user_event(int32_t *event) {
+ }
+ 
+ /* ---- SystemService ---- */
+-static int language(void) { const char *v=getenv("BB_LANGUAGE"); return v ? atoi(v) : 1; }
++/* DC_LANGUAGE (the launcher's SETUP > Language), else BB_LANGUAGE: a PS4 language code. */
++static int language(void) {
++    const char *v=getenv("DC_LANGUAGE");
++    if (!v || !*v) v=getenv("BB_LANGUAGE");
++    return v && *v ? atoi(v) : 1;
++}
+ static ABI int32_t system_param(int32_t id,int32_t *value) {
+     if (!value) return SYSTEM_PARAMETER;
+     switch (id) {
+@@ -311,10 +316,10 @@ static ABI int32_t ime_init(const ImeParam *param, const void *extended) {
+     utf16_to_utf8(param->title,128,prompt,sizeof(prompt));
+     const char *preset=getenv("BB_IME_TEXT");
+     if (preset) { ime_complete(0,preset); return 0; }
+-    /* An empty field starts with the player name (launcher) or "Hunter": a controller alone
++    /* An empty field starts with the player name (launcher) or "Player": a controller alone
+      * can accept it (the port has no on-screen keyboard). */
+     const char *name=getenv("BB_USER_NAME");
+-    const char *start=initial[0] ? initial : name && *name ? name : "Hunter";
++    const char *start=initial[0] ? initial : name && *name ? name : "Player";
+     if (!bbgpu_text_input_begin(start,prompt[0] ? prompt : "Text")) ime_complete(0,start);
+     else printf("Runtime: ImeDialog opened: shown on screen; keyboard Enter or Cross accepts, Esc or Circle cancels\n");
+     return 0;
 diff --git a/tools/fsr4cap/extract.py b/tools/fsr4cap/extract.py
 index 3e4c88f..6e4d9c6 100644
 --- a/tools/fsr4cap/extract.py

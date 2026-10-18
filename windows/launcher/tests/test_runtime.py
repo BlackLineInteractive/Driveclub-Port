@@ -70,19 +70,44 @@ def test_env_window_and_render_resolution(tmp_path):
     paths = AppPaths.for_root(tmp_path)
     s = LauncherSettings(window_size="2560x1440", render_res="2160p")
     e = game_env(paths, s, fsr=True, base={})
-    assert e["BB_WINDOW_SIZE"] == "2560x1440" and e["BB_DMEM_MB"] == str(5056 + 5000)
+    assert e["BB_WINDOW_SIZE"] == "2560x1440" and e["BB_DMEM_MB"] == "5056"
+    assert e["BB_FSR1"] == "1" and "BB_FSR1" not in game_env(paths, s, fsr=False, base={})
     e = game_env(paths, LauncherSettings(window_size="99x1", render_res="8k"), fsr=True, base={})
     assert e["BB_WINDOW_SIZE"] == "1920x1080" and e["BB_DMEM_MB"] == "5056"
 
 
-def test_frame_gen_halves_the_game_frame_rate(tmp_path):
+def test_player_name(tmp_path):
     paths = AppPaths.for_root(tmp_path)
     paths.ini.parent.mkdir(parents=True, exist_ok=True)
-    paths.ini.write_text("upscaler=fsr4\nframe_gen=1\n", encoding="utf-8")
-    e = game_env(paths, LauncherSettings(fps=120), fsr=True, base={})
-    assert (e["BB_VBLANK_HZ"], e["BB_FPS_LIMIT"]) == ("60", "60")
-    # the no-FSR edition has no frame generation
-    e = game_env(paths, LauncherSettings(fps=120), fsr=False, base={})
-    assert e["BB_FPS_LIMIT"] == "120"
-    paths.ini.write_text("frame_gen=0\n", encoding="utf-8")
-    assert game_env(paths, LauncherSettings(fps=120), fsr=True, base={})["BB_FPS_LIMIT"] == "120"
+    assert game_env(paths, LauncherSettings(), fsr=True, base={})["BB_USER_NAME"] == "Player"
+    paths.ini.write_text("player_name= qnfn " + chr(10), encoding="utf-8")
+    assert game_env(paths, LauncherSettings(), fsr=True, base={})["BB_USER_NAME"] == "qnfn"
+    paths.ini.write_text("player_name=" + "x" * 30 + chr(10), encoding="utf-8")
+    assert game_env(paths, LauncherSettings(), fsr=True, base={})["BB_USER_NAME"] == "x" * 16
+
+
+def test_threaded_recording_setting(tmp_path):
+    paths = AppPaths.for_root(tmp_path)
+    paths.ini.parent.mkdir(parents=True, exist_ok=True)
+    for value, expected in (("0", "0"), ("1", "1"), ("auto", None), ("", None)):
+        paths.ini.write_text(f"threaded_recording={value}" + chr(10), encoding="utf-8")
+        e = game_env(paths, LauncherSettings(), fsr=True, base={"BB_THREADED_RECORDING": "1"})
+        assert e.get("BB_THREADED_RECORDING") == expected
+
+
+def test_language(tmp_path):
+    paths = AppPaths.for_root(tmp_path)
+    paths.ini.parent.mkdir(parents=True, exist_ok=True)
+    assert game_env(paths, LauncherSettings(), fsr=True, base={})["DC_LANGUAGE"] == "1"
+    paths.ini.write_text("language=2" + chr(10), encoding="utf-8")
+    assert game_env(paths, LauncherSettings(), fsr=True, base={})["DC_LANGUAGE"] == "2"
+    paths.ini.write_text("language=99" + chr(10), encoding="utf-8")
+    assert game_env(paths, LauncherSettings(), fsr=True, base={})["DC_LANGUAGE"] == "1"
+
+
+def test_languages_per_region():
+    from dcport.runtime import LANGUAGES, languages_for
+    eu, us = dict(languages_for("CUSA00003")), dict(languages_for("CUSA00093"))
+    assert len(eu) == 14 and "19" in eu and "17" not in eu
+    assert set(us) == {"1", "2", "17", "20"}
+    assert set(dict(LANGUAGES)) == set(eu) | set(us)

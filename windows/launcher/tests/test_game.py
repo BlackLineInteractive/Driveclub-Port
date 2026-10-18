@@ -50,8 +50,8 @@ def test_ready_checks_other_version(tmp_path):
     game = fake_game(tmp_path / "Drive Club é", title_id="CUSA00093", app_ver="01.00")
     checks = ready_checks(game, AppPaths.for_root(tmp_path / "port"), gpu=None, prepared=False)
     assert [c.state for c in checks] == ["warn", "warn", "warn", "warn"]
-    assert "patches need 1.28" in checks[0].label
-    assert checks[0].label == "Game CUSA00093 v01.00: patches need 1.28"
+    assert "patches need v01.28" in checks[0].label
+    assert checks[0].label == "Game CUSA00093 v01.00: patches need v01.28"
     assert checks[2].label == "Graphics card: checking…"
     assert checks[3].label == "Game files will be prepared on PLAY"
 
@@ -69,4 +69,24 @@ def test_ready_checks_all_ok(tmp_path):
     checks = ready_checks(game, paths, gpu="RX 6750 XT", prepared=True)
     assert [c.state for c in checks] == ["ok"] * 4
     assert [c.label for c in checks] == [
-        "DRIVECLUB 1.28", "Saves found", "RX 6750 XT", "Game files prepared"]
+        "DRIVECLUB CUSA00003 v01.28", "Saves found", "RX 6750 XT", "Game files prepared"]
+
+
+def test_other_region_at_0128_is_ready(tmp_path):
+    game = fake_game(tmp_path / "g", title_id="CUSA00093", app_ver="01.28")
+    checks = ready_checks(game, AppPaths.for_root(tmp_path / "app"), None, False)
+    assert (checks[0].label, checks[0].state) == ("DRIVECLUB CUSA00093 v01.28", "ok")
+
+
+def test_update_only_folder_is_refused(tmp_path):
+    from dcport.game import is_update_only, ready_checks
+    from dcport.paths import AppPaths
+    from tests.helpers import fake_game
+    update = fake_game(tmp_path / "CUSA00093-patch", title_id="CUSA00093", base_game=False)
+    full = fake_game(tmp_path / "CUSA00093", title_id="CUSA00093")
+    assert is_update_only(update) and not is_update_only(full)
+    assert not is_update_only(tmp_path / "empty")
+    paths = AppPaths.for_root(tmp_path / "port")
+    game = ready_checks(update, paths, "GPU", prepared=False)[0]
+    assert game.state == "bad" and "Update only" in game.label
+    assert ready_checks(full, paths, "GPU", prepared=False)[0].state == "ok"

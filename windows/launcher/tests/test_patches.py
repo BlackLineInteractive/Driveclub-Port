@@ -36,30 +36,12 @@ def test_unknown_names_and_keys_are_ignored():
     assert patches.patch_names(s) == ["60 FPS with deltatime", "Barrier Disable"]
 
 
-def test_render_resolution_adds_its_group_and_memory():
+def test_an_older_render_resolution_falls_back_to_1080p():
     s = LauncherSettings(patch_timing="fixed", render_res="1440p")
-    assert patches.patch_names(s) == [
-        "60 FPS with fixed tickrate",
-        "1440p [2560x1440] Internal resolution [DEPTH BUG]",
-        "1440p [2560x1440] Output resolution",
-        "Memory for up to 1440p",
-    ]
-    assert patches.dmem_mb(s) == 5056 + 3000
+    assert patches.patch_names(s) == ["60 FPS with fixed tickrate"]
+    assert patches.dmem_mb(s) == 5056
 
 
 def test_window_size():
     assert patches.window_size("2560x1440") == (2560, 1440)
     assert patches.window_size("1234x567") == (1920, 1080)
-
-
-def test_frame_gen_notes():
-    from dcport.ui.setup import FRAMEGEN_ON, framegen_note
-    s = LauncherSettings()
-    assert framegen_note(s, "fsr4", False) == ""
-    assert framegen_note(s, "fsr4", True) == FRAMEGEN_ON
-    assert "needs FSR" in framegen_note(s, "off", True)
-    blur = LauncherSettings(patches=[patches.MOTION_BLUR])
-    assert "motion blur" in framegen_note(blur, "fsr4", True)
-    big = LauncherSettings(render_res="1440p", window_size="1920x1080")
-    assert framegen_note(big, "fsr4", True).startswith(FRAMEGEN_ON) and "heavy" in \
-        framegen_note(big, "fsr4", True)

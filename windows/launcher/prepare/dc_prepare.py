@@ -13,6 +13,7 @@ made from); intermediate files are removed.
 import os
 import sys
 import traceback
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -37,10 +38,15 @@ def main():
     data.mkdir(parents=True, exist_ok=True)
     for name in ('eboot.bin', 'sce_sys/param.sfo', 'sce_module/libc.prx', 'sce_module/libSceFios2.prx'):
         if not (game / name).is_file():
-            print(f'Missing {name} in {game}: choose the DRIVECLUB folder (CUSA00003)')
+            print(f'Missing {name} in {game}: choose the DRIVECLUB folder')
             return 1
     prepare.prepare(game, data)
-    link_modules.link(game, data, MODULES)
+    patched = []
+    if xml.is_file():  # no red-zone site may hold an address a community patch writes
+        patched = [int(line.get('Address'), 16) - dc_patches.EBOOT_BASE
+                   for meta in ET.parse(xml).iter('Metadata') if meta.get('AppVer') == '01.28'
+                   for line in meta.iter('Line') if line.get('Address')]
+    link_modules.link(game, data, MODULES, patched)
     content_profile.prepare(game, data, 'full')
     respell.respell(data / 'boot-linked.bin', runtime)
     if xml.is_file():

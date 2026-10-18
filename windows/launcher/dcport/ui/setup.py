@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""SETUP page: game folder, frame rate, window, FPS counter, upscaling, prepare again."""
+"""SETUP page: game folder, frame rate, window, FPS counter, anti-aliasing, prepare again."""
 
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog
 
 from dcport import fsr411, patches
-from dcport.game import ready_checks
+from dcport.game import game_info, ready_checks
 from dcport.prepare_state import is_prepared
-from dcport.runtime import FPS_PRESETS, fps_note, parse_fps
+from dcport.runtime import (FPS_PRESETS, LANGUAGES, fps_note, game_language, languages_for,
+                            parse_fps, player_name)
 from dcport.ui import theme
 
 FPS_ERROR = "Enter a whole number from 30 to 240"
@@ -21,31 +22,25 @@ GLYPHS = {"ok": "✓", "warn": "⚠", "bad": "✕"}
 DEFAULT_SHARPNESS = 0.30  # the runtime's value when dcport.ini has none
 WINDOW_CHOICES = tuple((f"{w}x{h}", "4K" if h == 2160 else f"{h}p")
                        for w, h in patches.WINDOW_SIZES)
-RENDER_CHOICES = tuple((r.key, r.label) for r in patches.RESOLUTIONS)
-BLUR_NOTE = ("FSR and frame generation do not run with the PATCHES page's 'No motion blur or "
+THREADING_CHOICES = (("auto", "Auto"), ("1", "On"), ("0", "Off"))
+THREADING_NOTE = ("Threading: the game's GPU work is prepared on extra threads. It gives more FPS "
+                  "but can crash mid-race, so Auto keeps it off (as Off does); On turns it on. "
+                  "Applies on the next PLAY.")
+AA_NOTE = ("FSR is DRIVECLUB's anti-aliasing at 1080p (native AA), not an upscaler: the game's "
+           "effects and HUD after it stay at 1080p, so there are no Quality, Balanced or "
+           "Performance modes.")
+BLUR_NOTE = ("FSR does not run with the PATCHES page's 'No motion blur or "
              "depth of field': the game's anti-aliasing is in that shader.")
-FRAMEGEN_ON = ("A generated frame between each two: the game runs at half the frame rate "
-               "and shows the full one (120 FPS = 60 + 60).")
 
 
-def framegen_note(s, upscaler: str, on: bool) -> str:
-    """What stops frame generation with these settings, else what it does (when on)."""
-    if not on:
-        return ""
-    if upscaler == "off":
-        return "Frame generation needs FSR 3.1 or FSR 4."
-    if patches.MOTION_BLUR in s.patches:
-        return ("Frame generation and FSR do not run with the PATCHES page's 'No motion blur "
-                "or depth of field': the game's anti-aliasing is in that shader.")
-    if s.render_res != patches.DEFAULT_RESOLUTION:
-        return (FRAMEGEN_ON + " Above 1080p Render it is heavy: 1440p ran at about 70 FPS "
-                "(35 + 35) on an RX 6750 XT.")
-    return FRAMEGEN_ON
+def threading_value(ini: dict) -> str:
+    """dcport.ini threaded_recording: "1", "0", or anything else (or missing) for Auto."""
+    value = ini.get("threaded_recording", "auto").strip()
+    return value if value in ("0", "1") else "auto"
 
 
-RENDER_NOTE = ("Above 1080p the game renders more pixels: sharper, but heavier on the GPU "
-               "(1440p with FSR 4 ran at about 65 FPS on an RX 6750 XT). The community "
-               "resolution patches are known to cause depth glitches in some scenes.")
+RENDER_NOTE = ("The game renders at 1080p; on a bigger window or screen the picture is scaled "
+               "up to it with FSR 1 and sharpened (FSR edition).")
 
 
 class SetupPage(tk.Frame):
@@ -61,7 +56,7 @@ class SetupPage(tk.Frame):
         self._build_display(self.board.add(1, 0, title="Display"))
         self.upscaler_choice = None
         if app.fsr:
-            self._build_upscaling(self.board.add(1, 1, title="Upscaling"))
+            self._build_upscaling(self.board.add(1, 1, title="Anti-aliasing (FSR)"))
         self._error = ""
         self._phase = app.phase
         self._checks: list[tuple[tk.Label, str]] = []
@@ -99,6 +94,11 @@ class SetupPage(tk.Frame):
                                                font=app.fonts["button"], height=app.px(40),
                                                padx=app.px(22))
         self.prepare_button.pack(side="right")
+        self.update_check_button = theme.PillButton(bar, app, "Check for updates",
+                                                    self.check_updates, kind="secondary",
+                                                    font=app.fonts["button"], height=app.px(40),
+                                                    padx=app.px(22))
+        self.update_check_button.pack(side="right", padx=(0, app.px(10)))
         self.status = theme.text_label(bar, app, HINT, fg="muted", bg="bg")
         self.status.pack(side="left", fill="x", expand=True)
 
@@ -116,6 +116,25 @@ class SetupPage(tk.Frame):
         self.game_check.pack(fill="x", pady=(app.px(12), 0))
         self.files_check = theme.text_label(card, app)
         self.files_check.pack(fill="x", pady=(app.px(4), 0))
+        row = self._row(card)
+        row.pack(fill="x", pady=(app.px(14), 0))
+        theme.text_label(row, app, "Player name").pack(side="left")
+        self.player_name = theme.Field(row, app, width=app.px(160))
+        self.player_name.pack(side="left", padx=(app.px(12), app.px(8)))
+        theme.text_label(row, app, "shown in the game, then Enter", font="small",
+                         fg="muted").pack(side="left", padx=(app.px(6), 0))
+        entry = self.player_name.entry
+        for key in ("<Return>", "<KP_Enter>", "<FocusOut>"):
+            entry.bind(key, lambda e: self.set_player_name(entry.get()), add="+")
+        row = self._row(card)
+        row.pack(fill="x", pady=(app.px(10), 0))
+        theme.text_label(row, app, "Language").pack(side="left")
+        self.language_box = theme.Dropdown(row, app, self._open_language_menu)
+        self.language_box.configure(width=app.px(220))
+        self.language_box.pack(side="left", padx=(app.px(12), app.px(8)))
+        theme.text_label(row, app, "the game's text", font="small",
+                         fg="muted").pack(side="left", padx=(app.px(6), 0))
+        self._language_menu = None
 
     def _build_fps(self, card) -> None:
         app = self.app
@@ -153,18 +172,21 @@ class SetupPage(tk.Frame):
         self.size_choice = theme.Segmented(grid, app, WINDOW_CHOICES, self.set_window_size,
                                            min_label="1080p")
         self.size_choice.grid(row=1, column=1, sticky="w", pady=(app.px(10), 0))
-        theme.text_label(grid, app, "Render").grid(row=2, column=0, sticky="w",
-                                                   pady=(app.px(10), 0))
-        self.render_choice = theme.Segmented(grid, app, RENDER_CHOICES, self.set_render_res,
-                                             min_label="1440p")
-        self.render_choice.grid(row=2, column=1, sticky="w", pady=(app.px(10), 0))
-        theme.text_label(grid, app, "FPS counter").grid(row=3, column=0, sticky="w",
+        theme.text_label(grid, app, "FPS counter").grid(row=2, column=0, sticky="w",
                                                         pady=(app.px(10), 0))
         self.counter_choice = theme.Segmented(grid, app, ((True, "On"), (False, "Off")),
                                               self.set_fps_counter, min_label="Fullscreen")
-        self.counter_choice.grid(row=3, column=1, sticky="w", pady=(app.px(10), 0))
-        self.render_note = theme.text_label(card, app, font="small", fg="muted")
-        self._wrapping(self.render_note, card)
+        self.counter_choice.grid(row=2, column=1, sticky="w", pady=(app.px(10), 0))
+        theme.text_label(grid, app, "Threading").grid(row=3, column=0, sticky="w",
+                                                      pady=(app.px(10), 0))
+        self.threading_choice = theme.Segmented(grid, app, THREADING_CHOICES, self.set_threading,
+                                                min_label="Fullscreen")
+        self.threading_choice.grid(row=3, column=1, sticky="w", pady=(app.px(10), 0))
+        self.threading_note = theme.text_label(card, app, THREADING_NOTE, font="small",
+                                               fg="muted")
+        self._wrapping(self.threading_note, card).pack(fill="x", pady=(app.px(12), 0))
+        self.render_note = theme.text_label(card, app, RENDER_NOTE, font="small", fg="muted")
+        self._wrapping(self.render_note, card).pack(fill="x", pady=(app.px(12), 0))
         self.display_hint = theme.text_label(card, app, "More settings in game: press Insert, "
                                              "or L3 + R3 on a controller.", font="small",
                                              fg="muted")
@@ -173,7 +195,7 @@ class SetupPage(tk.Frame):
     def _build_upscaling(self, card) -> None:
         app = self.app
         grid = self._settings_grid(card)
-        theme.text_label(grid, app, "Upscaler").grid(row=0, column=0, sticky="w")
+        theme.text_label(grid, app, "Mode").grid(row=0, column=0, sticky="w")
         self.upscaler_choice = theme.Segmented(grid, app, UPSCALERS, self.set_upscaler,
                                                min_label="FSR 4.1.1", pad=app.px(10))
         self.upscaler_choice.grid(row=0, column=1, sticky="w")
@@ -188,15 +210,8 @@ class SetupPage(tk.Frame):
                                       on_change=self._sharpness_moved,
                                       on_commit=self.set_sharpness)
         self.sharpness.pack(side="left", fill="x", expand=True, padx=(0, app.px(10)))
-        theme.text_label(grid, app, "Frame gen").grid(row=2, column=0, sticky="w",
-                                                      pady=(app.px(10), 0))
-        self.framegen_choice = theme.Segmented(grid, app, ((True, "On"), (False, "Off")),
-                                               self.set_frame_gen, min_label="FSR 3.1")
-        self.framegen_choice.grid(row=2, column=1, sticky="w", pady=(app.px(10), 0))
         self.upscaler_note = theme.text_label(card, app, font="small", fg="muted")
         self._wrapping(self.upscaler_note, card)
-        self.framegen_note = theme.text_label(card, app, font="small", fg="muted")
-        self._wrapping(self.framegen_note, card)
         row = self._row(card)
         row.pack(fill="x", pady=(app.px(14), 0))
         self.fsr411_button = theme.PillButton(row, app, "Set up FSR 4.1.1…", self.setup_fsr411,
@@ -239,6 +254,13 @@ class SetupPage(tk.Frame):
         """
         app, s = self.app, self.app.settings
         self.folder.set(s.game_dir or "No folder chosen")
+        try:
+            typing_name = self.focus_get() is self.player_name.entry
+        except (KeyError, tk.TclError):
+            typing_name = False
+        if not typing_name:
+            self.player_name.set(player_name(app.paths))
+        self.language_box.set(dict(LANGUAGES)[game_language(app.paths)])
         if not self._typing():
             if s.fps in FPS_PRESETS:
                 self.fps_choice.set(s.fps)
@@ -256,12 +278,8 @@ class SetupPage(tk.Frame):
         self.size_choice.set(f"{w}x{h}")
         for value, _ in WINDOW_CHOICES:  # fullscreen covers the monitor
             self.size_choice.set_enabled(value, not s.fullscreen)
-        render = patches.resolution(s.render_res)
-        self.render_choice.set(render.key)
-        self.render_note.configure(text=RENDER_NOTE)
-        self._pack_if(self.render_note, render.key != patches.DEFAULT_RESOLUTION,
-                      pady=(app.px(12), 0), before=self.display_hint)
         self.counter_choice.set(app.fps_counter_on())
+        self.threading_choice.set(threading_value(app.game_ini()))
         if self.upscaler_choice is not None:
             self._refresh_upscaling()
         self._show_status()
@@ -402,10 +420,6 @@ class SetupPage(tk.Frame):
         self.app.settings.window_size = value
         self._saved(self.app.save_settings())
 
-    def set_render_res(self, value: str) -> None:
-        self.app.settings.render_res = value
-        self._saved(self.app.save_settings())
-
     def set_fps_counter(self, on: bool) -> None:
         self._show_status(self.app.update_game_ini({"show_fps": "1" if on else "0"}) or "")
         self.refresh_session()
@@ -448,6 +462,8 @@ class SetupPage(tk.Frame):
         blur = current != "off" and patches.MOTION_BLUR in self.app.settings.patches
         if blur and not note:
             note, role = BLUR_NOTE, "warn"
+        if current != "off" and not note:
+            note = AA_NOTE
         self.upscaler_note.configure(text=note, fg=self.app.palette[role])
         self._pack_if(self.upscaler_note, bool(note), pady=(self.app.px(12), 0))
         try:
@@ -457,15 +473,6 @@ class SetupPage(tk.Frame):
         self.sharpness.set(sharpness)
         self.sharpness.set_enabled(current != "off")  # as in the game's menu
         self._sharpness_moved(self.sharpness.value)
-        on = ini.get("frame_gen", "0").strip() == "1"
-        self.framegen_choice.set(on)
-        note, role = framegen_note(self.app.settings, current, on), "muted"
-        if on and not note.startswith(FRAMEGEN_ON):
-            role = "warn"
-        if blur:
-            note = ""  # the upscaler's note above says it
-        self.framegen_note.configure(text=note, fg=self.app.palette[role])
-        self._pack_if(self.framegen_note, bool(note), pady=(self.app.px(12), 0))
 
     def setup_fsr411(self) -> None:
         """Builds fsr4_411/ from the player's DLL (dcport.fsr411), then selects FSR 4.1.1."""
@@ -509,12 +516,54 @@ class SetupPage(tk.Frame):
     def fsr411_status_text(self) -> str:
         return self.fsr411_status.cget("text")
 
-    def set_frame_gen(self, on: bool) -> None:
-        self._show_status(self.app.update_game_ini({"frame_gen": "1" if on else "0"}) or "")
-        self._refresh_upscaling()
+    def check_updates(self) -> None:
+        """SETUP > Check for updates: the result shows in the status line."""
+        def report(text: str, role: str) -> None:
+            self.status.configure(text=text, fg=self.app.palette[role])
+        report("Checking for updates…", "muted")
+        self.app.check_for_updates(report)
 
-    def framegen_note_text(self) -> str:
-        return self.framegen_note.cget("text") if self.framegen_note.winfo_manager() else ""
+    def set_threading(self, value: str) -> None:
+        self._show_status(self.app.update_game_ini({"threaded_recording": value}) or "")
+        self.threading_choice.set(threading_value(self.app.game_ini()))
+
+    def set_player_name(self, text: str) -> None:
+        name = "".join(c for c in text if c.isprintable()).strip()[:16]
+        if not name or name == player_name(self.app.paths):
+            self.player_name.set(player_name(self.app.paths))
+            return
+        self._show_status(self.app.update_game_ini({"player_name": name}) or
+                          f"Player name: {name} (from the next start)")
+        self.player_name.set(name)
+
+    def _open_language_menu(self) -> None:
+        if self._language_menu is not None:  # the previous popup; its command has run by now
+            self._language_menu.destroy()
+        menu = self._language_menu = theme.styled_menu(self, self.app)
+        var = tk.StringVar(menu, value=game_language(self.app.paths))
+        game_dir = self.app.settings.game_dir
+        info = game_info(Path(game_dir)) if game_dir else None
+        for code, name in languages_for(info.title_id if info else ""):
+            menu.add_radiobutton(label=name, variable=var, value=code,
+                                 command=lambda c=code: self.set_language(c))
+        menu.update_idletasks()
+        box = self.language_box
+        try:
+            menu.tk_popup(box.winfo_rootx(), box.winfo_rooty() + box.winfo_height() +
+                          self.app.px(4))
+        finally:
+            menu.grab_release()
+
+    def set_language(self, code: str) -> None:
+        name = dict(LANGUAGES).get(code)
+        if name is None or code == game_language(self.app.paths):
+            return
+        self._show_status(self.app.update_game_ini({"language": code}) or
+                          f"Language: {name} (from the next start)")
+        self.language_box.set(name)
+
+    def language_text(self) -> str:
+        return self.language_box.text
 
     def upscaler_note_text(self) -> str:
         if self.upscaler_choice is None or not self.upscaler_note.winfo_manager():

@@ -28,10 +28,13 @@ def make_sfo(values: dict) -> bytes:
 
 
 def fake_game(dir: Path, title_id: str = "CUSA00003", app_ver: str = "01.28",
-              title: str = "DRIVECLUB") -> Path:
+              title: str = "DRIVECLUB", base_game: bool = True) -> Path:
+    """base_game=False: an unpacked update package (no game.chc)."""
     dir = Path(dir)
     (dir / "sce_sys").mkdir(parents=True, exist_ok=True)
     (dir / "eboot.bin").write_bytes(b"\x7fELF")
+    if base_game:
+        (dir / "game.chc").write_bytes(b"chc")
     (dir / "sce_sys" / "param.sfo").write_bytes(
         make_sfo({"TITLE_ID": title_id, "APP_VER": app_ver, "TITLE": title}))
     return dir

@@ -5,16 +5,18 @@ import dataclasses
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
+import webbrowser
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
 
-from dcport import patches, profiles, sysinfo
-from dcport.game import art_path, game_info, has_eboot, ready_checks
+from dcport import __version__, patches, profiles, sysinfo, updater
+from dcport.game import UPDATE_ONLY, art_path, game_info, has_eboot, is_update_only, ready_checks
 from dcport.ini import read_ini, update_ini
 from dcport.paths import AppPaths
 from dcport.prepare_state import is_prepared, prepare_command
@@ -99,6 +101,7 @@ class App(tk.Tk):
         self.configure(bg=self.palette["bg"])
 
         self._build_top()
+        self._build_update_bar()
         self.body = tk.Frame(self)
         self.paint(self.body, bg="bg")
         self.body.pack(fill="both", expand=True)
@@ -116,6 +119,7 @@ class App(tk.Tk):
 
         self.refresh_game()
         self._start_recovery()
+        self._start_update_check()
         threading.Thread(target=_lookup_gpu, args=(self._results,), daemon=True).start()
         self.after(120, self._poll)
 
@@ -385,6 +389,125 @@ class App(tk.Tk):
         switch.bind("<Enter>", lambda e: switch.configure(fg=self.palette["accent"]))
         switch.bind("<Leave>", lambda e: switch.configure(fg=self.palette["text"]))
 
+    # ------------------------------------------------------------ updates
+
+    def _build_update_bar(self) -> None:
+        """Shown once a newer release is downloaded: restart to install it."""
+        self.update_ready: "tuple | None" = None  # (Release, zip path)
+        self.update_checking = False
+        bar = self.update_bar = tk.Frame(self)
+        self.paint(bar, bg="panel")
+        inner = tk.Frame(bar)
+        self.paint(inner, bg="panel")
+        inner.pack(fill="x", padx=self.px(24), pady=self.px(8))
+        self.update_label = theme.text_label(inner, self, "", bg="panel")
+        self.update_label.pack(side="left")
+        self.update_button = theme.PillButton(inner, self, "Restart to update", self.apply_update,
+                                              font=self.fonts["button"], height=self.px(32),
+                                              padx=self.px(18), bg_role="panel")
+        self.update_button.pack(side="right")
+        self.notes_button = theme.PillButton(inner, self, "What's new", self._open_notes,
+                                             kind="secondary", font=self.fonts["button"],
+                                             height=self.px(32), padx=self.px(18),
+                                             bg_role="panel")
+        self.notes_button.pack(side="right", padx=(0, self.px(10)))
+
+    @staticmethod
+    def updates_possible() -> bool:
+        """Only the packaged launcher updates itself (never a source tree)."""
+        return getattr(sys, "frozen", False) or os.environ.get("DCPORT_UPDATE_TEST") == "1"
+
+    def _start_update_check(self) -> None:
+        """Once per start: the newest release of this edition is downloaded in the background
+        (DCPORT_NO_UPDATES=1 turns it off)."""
+        if not self.updates_possible() or os.environ.get("DCPORT_NO_UPDATES") == "1":
+            return
+        updater.clean_up(self.paths.root)
+        self.check_for_updates()
+
+    def check_for_updates(self, report=None) -> None:
+        """Looks for a newer release and downloads it; the update bar then offers the restart.
+        report(text, role), when given, hears the outcome (SETUP's Check for updates)."""
+        if self.update_ready:
+            self.update_bar.pack(fill="x", before=self.body)
+            if report:
+                report(f"DCport {self.update_ready[0].version} is ready: Restart to update above.",
+                       "ok")
+            return
+        if not self.updates_possible():
+            if report:
+                report("Updates work in the released DCport only.", "warn")
+            return
+        if self.update_checking:
+            return
+        self.update_checking = True
+        root, fsr = self.paths.root, self.fsr
+
+        def work():
+            release = updater.check(__version__, fsr)
+            if release is None:
+                return None
+            if report:
+                self._results.put(("task", lambda r, e: report(
+                    f"Downloading DCport {release.version}…", "muted"), None, None))
+            return release, updater.download(release, root / "updates", fsr)
+
+        def done(result, error) -> None:
+            self.update_checking = False
+            if error is not None:
+                print(f"Update check: {_reason(error)}", file=sys.stderr)
+                if report:
+                    report(f"Could not check for updates: {_reason(error)}", "bad")
+            elif result is None:
+                if report:
+                    report(f"DCport {__version__} is up to date.", "ok")
+            else:
+                self.update_ready = result
+                self.update_label.configure(
+                    text=f"DCport {result[0].version} is ready to install (you have {__version__}).")
+                self.update_bar.pack(fill="x", before=self.body)
+                if report:
+                    report(f"DCport {result[0].version} is ready: Restart to update above.", "ok")
+
+        self.run_task(work, done)
+
+    def update_text(self) -> str:
+        return self.update_label.cget("text") if self.update_bar.winfo_manager() else ""
+
+    def _open_notes(self) -> None:
+        if self.update_ready and self.update_ready[0].notes_url:
+            webbrowser.open(self.update_ready[0].notes_url)
+
+    def apply_update(self) -> None:
+        """Installs the downloaded release over this folder and starts the new launcher."""
+        if not self.update_ready:
+            return
+        if self.saves_locked():
+            self.update_label.configure(text="Close the game first, then update.")
+            return
+        release, zip_path = self.update_ready
+        root = self.paths.root
+        running = Path(sys.executable) if getattr(sys, "frozen", False) else None
+        self.update_button.set(enabled=False)
+        self.update_label.configure(text=f"Installing DCport {release.version}…")
+
+        def work():
+            return updater.install(updater.stage(zip_path, root), root, running)
+
+        def done(result, error) -> None:
+            if error is not None:
+                self.update_button.set(enabled=True)
+                self.update_label.configure(
+                    text=f"Update failed: {_reason(error)}. DCport {__version__} is unchanged.")
+                return
+            launcher = root / "DriveClub.exe"
+            if running is not None and launcher.is_file():
+                subprocess.Popen([str(launcher)], cwd=root, close_fds=True,
+                                 creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+            self.destroy()
+
+        self.run_task(work, done)
+
     def _draw_logo(self, pal: dict) -> None:
         c, font = self._logo, self.fonts["logo"]
         c.delete("all")
@@ -479,7 +602,10 @@ class App(tk.Tk):
         if not has_eboot(folder):
             messagebox.showwarning(
                 "DCport", f"There is no eboot.bin in\n{folder}\n\n"
-                "Choose the DRIVECLUB folder (CUSA00003) that contains eboot.bin.", parent=self)
+                "Choose the DRIVECLUB folder that contains eboot.bin.", parent=self)
+            return False
+        if is_update_only(folder):
+            messagebox.showwarning("DCport", f"{folder}\n\n{UPDATE_ONLY}", parent=self)
             return False
         self.settings.game_dir = str(folder)
         self.save_settings()
@@ -542,6 +668,9 @@ class App(tk.Tk):
             if not self.ask_game_folder():
                 return None
             gd = self.game_dir()
+        if gd is not None and is_update_only(gd):
+            race.show_message(UPDATE_ONLY, "bad")
+            return None
         race.clear_message()
         return gd
 

@@ -308,7 +308,8 @@ def test_setup_fsr4_greyed_without_model_files(tmp_path):
         assert page.fsr4_available() is False             # a folder without models is not enough
         (paths.fsr4_dir / "fsr4_model_v07_i8_balanced_1080_pass1.spv").write_bytes(b"spv")
         app.show("race"); app.show("setup")
-        assert page.fsr4_available() is True and page.upscaler_note_text() == ""
+        from dcport.ui.setup import AA_NOTE
+        assert page.fsr4_available() is True and page.upscaler_note_text() == AA_NOTE
     finally:
         app.destroy()
 
@@ -370,7 +371,7 @@ def test_run_task_reports_on_the_ui_thread(tmp_path):
 
 
 def test_version_and_bundled_resources(monkeypatch, tmp_path):
-    assert dcport.__version__ == "0.3.0"
+    assert dcport.__version__ == "0.3.7"
     assert theme.default_controls() == DEFAULT_INPUT.resolve()
     assert theme.assets_dir() == DEFAULT_INPUT.resolve().parent / "assets"
     monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
@@ -1060,5 +1061,93 @@ def test_startup_recovery_locks_saves_and_reports_on_garage(tmp_path):
         pump(app, lambda: not app.recovering)
         assert (paths.user / "savedata" / "f").read_bytes() == b"1"
         assert "Moved your saves back" in app.pages["garage"].status_text()
+    finally:
+        app.destroy()
+
+
+def test_setup_threading_switch_shows_the_choice(tmp_path):
+    paths, _ = configured_port(tmp_path, prepared=True)
+    app = App(paths, fsr=False)
+    try:
+        app.show("setup"); page = app.pages["setup"]
+        assert page.threading_choice.value == "auto"
+        for value in ("1", "0", "auto"):
+            page.set_threading(value)
+            assert page.threading_choice.value == value
+            assert read_ini(paths.ini)["threaded_recording"] == value
+    finally:
+        app.destroy()
+
+
+# ---------------------------------------------------------------- updates
+
+def test_update_downloads_in_the_background_and_installs_on_restart(tmp_path, monkeypatch):
+    from dcport import updater
+    from tests.test_updater import RELEASE, make_install, make_zip
+    root = tmp_path / "DCport"
+    make_install(root)
+    zip_path = make_zip(tmp_path / "u.zip", RELEASE)
+    rel = updater.Release("0.4.0", "https://dl/DCport-0.4.0-windows-fsr.zip", 1, "", "")
+    monkeypatch.setenv("DCPORT_UPDATE_TEST", "1")
+    monkeypatch.delenv("DCPORT_NO_UPDATES", raising=False)
+    monkeypatch.setattr(updater, "check", lambda current, fsr: rel)
+    monkeypatch.setattr(updater, "download", lambda release, folder, fsr: zip_path)
+    app = App(AppPaths.for_root(root), fsr=True)
+    destroyed = []
+    real_destroy = app.destroy
+    monkeypatch.setattr(app, "destroy", lambda: destroyed.append(True))
+    try:
+        pump(app, lambda: app.update_text() != "")
+        assert "DCport 0.4.0 is ready" in app.update_text()
+        app.apply_update()
+        pump(app, lambda: destroyed)
+        assert (root / "DriveClub.exe").read_text() == "new launcher"
+        assert (root / "dcport.ini").read_text().startswith("upscaler=fsr411")  # the player's
+        assert (root / "user" / "savedata" / "PROFILE").read_text() == "my save"
+    finally:
+        real_destroy()
+
+
+def test_no_update_check_outside_the_packaged_launcher(tmp_path, monkeypatch):
+    from dcport import updater
+    monkeypatch.delenv("DCPORT_UPDATE_TEST", raising=False)
+    called = []
+    monkeypatch.setattr(updater, "check", lambda current, fsr: called.append(1))
+    app = App(AppPaths.for_root(tmp_path), fsr=True)
+    try:
+        app.update()
+        assert called == [] and app.update_text() == ""
+    finally:
+        app.destroy()
+
+
+def test_check_for_updates_button_reports(tmp_path, monkeypatch):
+    from dcport import updater
+    from tests.test_updater import RELEASE, make_install, make_zip
+    root = tmp_path / "DCport"
+    make_install(root)
+    monkeypatch.setenv("DCPORT_UPDATE_TEST", "1")
+    monkeypatch.setenv("DCPORT_NO_UPDATES", "1")  # no check at start; only the button
+    found = []
+    monkeypatch.setattr(updater, "check", lambda current, fsr: found[0] if found else None)
+    monkeypatch.setattr(updater, "download",
+                        lambda release, folder, fsr: make_zip(tmp_path / "u.zip", RELEASE))
+    app = App(AppPaths.for_root(root), fsr=True)
+    try:
+        app.show("setup"); page = app.pages["setup"]
+        page.check_updates()
+        pump(app, lambda: "up to date" in page.status.cget("text"))
+        assert app.update_text() == ""
+        found.append(updater.Release("0.9.0", "https://dl/x.zip", 1, "", ""))
+        page.check_updates()
+        pump(app, lambda: "0.9.0 is ready" in page.status.cget("text"))
+        assert "DCport 0.9.0 is ready to install" in app.update_text()
+
+        def fail(current, fsr):
+            raise OSError("offline")
+        monkeypatch.setattr(updater, "check", fail)
+        app.update_ready = None
+        page.check_updates()
+        pump(app, lambda: "Could not check" in page.status.cget("text"))
     finally:
         app.destroy()

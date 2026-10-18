@@ -21,6 +21,7 @@ import struct
 from prepare import parse_self, span, unpack
 from link_libc import encode_id
 from cpu_compat import atomic_output, patch_image, patch_libc
+import extrq
 
 DEFAULT_MODULES = ('libc.prx', 'libSceFios2.prx')
 FS_LOAD = bytes.fromhex('64488b042500000000')  # mov rax, fs:[0]
@@ -135,17 +136,22 @@ def protect_red_zones(image, sites, base, skip=()):
     return bytes(code), applied
 
 
-def protect_image(image, segments, untranslated, relocs, path=RED_ZONE_SITES):
+def protect_image(image, segments, untranslated, relocs, path=RED_ZONE_SITES, sites=None):
     """Apply the red-zone sites to the linked image in place, after the CPU translations.
 
     A site is left alone when any byte within an instruction's reach of it differs from
     `untranslated` (the image before cpu_compat): a translated instruction overlaps it."""
     report = dict(enabled=red_zones_enabled(), sites=0, available=0, sites_sha256=None,
                   cpu_overlaps=[], trampoline_bytes=0, segment=None)
-    if not report['enabled'] or not path.is_file():
+    if not report['enabled']:
         return report
-    raw = path.read_bytes()
-    sites = json.loads(raw)['sites']
+    if sites is None:  # a reviewed table (Bloodborne's); DCport finds its sites (redzone.py)
+        if not path.is_file():
+            return report
+        raw = path.read_bytes()
+        sites = json.loads(raw)['sites']
+    else:
+        raw = json.dumps(sites, separators=(',', ':')).encode('ascii')
     clear = []
     for site in sites:
         start, end = max(0, site[0] - (MAX_INSTRUCTION - 1)), site[0] + len(site[1]) // 2
@@ -165,7 +171,8 @@ def protect_image(image, segments, untranslated, relocs, path=RED_ZONE_SITES):
     return report
 
 
-def link(game, out, module_names=DEFAULT_MODULES):
+def link(game, out, module_names=DEFAULT_MODULES, patched=()):
+    """patched: eboot offsets the community patches write (no red-zone site holds one)."""
     main = module(game / 'eboot.bin')
     raw = (out / 'boot.bin').read_bytes()
     magic, size, entry, ns, nr, ni, flags = unpack('<8s6Q', raw, 0)
@@ -204,8 +211,10 @@ def link(game, out, module_names=DEFAULT_MODULES):
     base = (size + 65535) & ~65535
     fs_patched = patch_fs_loads(image, main['ph'], 0)
     tls_module = 2
+    units = [(0, main['ph'])]  # (base, program headers) of the eboot and each module
     for filename in module_names:
         m = module(game / 'sce_module' / filename)
+        units.append((base, m['ph']))
         if filename == 'libc.prx':
             libc_changes = patch_libc(m)
         loads = [p for p in m['ph'] if p['type'] in (1, 0x61000010)]
@@ -295,7 +304,18 @@ def link(game, out, module_names=DEFAULT_MODULES):
     untranslated = bytes(image)
     image, segments, cpu_compat = patch_image(image, segments, main, table, relocs)
     cpu_compat['libc'] = libc_changes
-    red_zone = protect_image(image, segments, untranslated, relocs)
+    main_size = min((t['base'] for t in table), default=len(image))
+    image, segments, cpu_compat['extrq'] = extrq.patch(image, segments, main_size, relocs)
+    sites, analysis = None, None
+    if red_zones_enabled():
+        try:
+            import redzone
+        except ImportError as e:  # a source tree without capstone: no red-zone protection
+            analysis = dict(error=f'capstone not available ({e})')
+        else:
+            sites, analysis = redzone.find_sites(untranslated, units, patched)
+    red_zone = protect_image(image, segments, untranslated, relocs, sites=sites)
+    red_zone['analysis'] = analysis
     with atomic_output(out / 'boot-linked.bin') as f:
         f.write(struct.pack('<8s6Q', b'BBPROBE5', len(image), entry, len(segments), len(relocs), len(names), flags))
         f.write(struct.pack('<Q', procparam['vaddr']))
@@ -333,8 +353,11 @@ def link(game, out, module_names=DEFAULT_MODULES):
         if cpu_compat['semantic_risk_sites']:
             print(f"CPU compatibility EXPERIMENTAL: {cpu_compat['semantic_risk_sites']} count instructions "
                   'can still have incorrect semantics; this is not a complete compatibility profile.')
+    if cpu_compat['extrq']['sites']:
+        print(f"CPU compatibility: {cpu_compat['extrq']['sites']} SSE4a EXTRQ sites translated "
+              f"for a CPU without SSE4a ({cpu_compat['extrq']['by_form']})")
     if red_zone['enabled']:
-        print(f"Red zone: {red_zone['sites']}/{red_zone['available']} guest store sites run red-zone-safe "
+        print(f"Red zone: {red_zone['sites']}/{red_zone['available']} guest access sites run red-zone-safe "
               f"({len(red_zone['cpu_overlaps'])} left to CPU translations; BB_RED_ZONE=0 disables)")
     summary =', '.join(f"{t['file']}@{t['base']:#x}" for t in table)
     print(f'Linked modules: {summary}; {len(bindings)} native bindings, {len(unresolved)} imports left to the host runtime, '

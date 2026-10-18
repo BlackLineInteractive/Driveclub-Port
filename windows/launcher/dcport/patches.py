@@ -26,7 +26,7 @@ MOTION_BLUR = "Disable motion blur and depth of field"
 TOGGLES = (
     Toggle(MOTION_BLUR, "No motion blur or depth of field",
            "A sharper picture in motion. The game uses one shader for both, and for its "
-           "anti-aliasing: with this on, FSR and frame generation cannot run."),
+           "anti-aliasing: with this on, FSR cannot run."),
     Toggle("Barrier Disable", "No track barriers",
            "Drive off the track without the invisible walls."),
     Toggle("Reset Disable", "No reset to track",
@@ -56,17 +56,12 @@ class Resolution:
     extra_dmem_mb: int
 
 
+# The game renders at its own 1920x1080: the community render patches above it leave some of
+# its passes at 1080p (a square at x 1920 / y 1080 in the picture) and lost the device in races.
+# A bigger window or screen gets the 1080p frame scaled up with FSR 1 instead. An older saved
+# render_res (1440p, 4K) falls back to this one.
 RESOLUTIONS = (
     Resolution("1080p", "1080p", (1920, 1080), (), 0),
-    Resolution("1440p", "1440p", (2560, 1440),
-               ("1440p [2560x1440] Internal resolution [DEPTH BUG]",
-                "1440p [2560x1440] Output resolution", "Memory for up to 1440p"), 3000),
-    Resolution("1800p", "1800p", (3200, 1800),
-               ("1800p [3200x1800] Internal resolution [DEPTH BUG]",
-                "1800p [3200x1800] Output resolution", "Memory for up to 4K"), 5000),
-    Resolution("2160p", "4K", (3840, 2160),
-               ("4K [3840x2160] Internal resolution [DEPTH BUG]",
-                "4K [3840x2160] Output resolution", "Memory for up to 4K"), 5000),
 )
 DEFAULT_RESOLUTION = "1080p"
 
