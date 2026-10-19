@@ -4,9 +4,10 @@
 Usage: dc-prepare <game dir> <data dir> <runtime exe> <patches xml>
 
 The steps of run_driveclub.sh: the plaintext eboot.bin is loaded into a memory image, linked
-with the game's bundled modules (libc, Fios2, TBB, the Logitech wheel driver, iksemel), its
-imports respelled for the runtime's resolver, and the community patches compiled. Nothing here
-is copied from the game into the release: every player builds it from their own files.
+with the game's bundled modules (libc, Fios2, TBB, the Logitech wheel driver, iksemel, and
+dlcldr when the dump has it), its imports respelled for the runtime's resolver, and the
+community patches compiled. Nothing here is copied from the game into the release: every
+player builds it from their own files.
 Writes <data dir>/boot-linked.bin, content.bin, patches.bin and source.txt (the eboot it was
 made from); intermediate files are removed.
 """
@@ -26,8 +27,17 @@ import respell  # noqa: E402
 import stamp  # noqa: E402
 
 MODULES = ['libc.prx', 'libSceFios2.prx', '../libtbb.prx', '../logiWheel.prx', '../iksemelGNMm.prx']
+# Linked when the dump has them. Dumps with the DLC merged into the game folder ship dlcldr.prx:
+# their eboot takes its add-on calls (sceAppContent*) from it and it answers from its own add-on
+# table. Unlinked, those calls return 0 without filling their out-parameters, and the game builds
+# its add-on list from stack garbage (write to 0x13 at 0x6dc47b).
+OPTIONAL_MODULES = ['../dlcldr.prx']
 PATCHES = ['60 FPS with deltatime']
 KEEP = {'boot-linked.bin', 'content.bin', 'patches.bin', 'source.txt', 'prepare.log'}
+
+
+def modules(game):
+    return MODULES + [m for m in OPTIONAL_MODULES if (Path(game) / 'sce_module' / m).is_file()]
 
 
 def main():
@@ -46,7 +56,7 @@ def main():
         patched = [int(line.get('Address'), 16) - dc_patches.EBOOT_BASE
                    for meta in ET.parse(xml).iter('Metadata') if meta.get('AppVer') == '01.28'
                    for line in meta.iter('Line') if line.get('Address')]
-    link_modules.link(game, data, MODULES, patched)
+    link_modules.link(game, data, modules(game), patched)
     content_profile.prepare(game, data, 'full')
     respell.respell(data / 'boot-linked.bin', runtime)
     if xml.is_file():
